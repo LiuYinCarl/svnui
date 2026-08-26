@@ -60,11 +60,38 @@ src/
 3. SVN 操作全部异步：`Svn::status()` 等在后台线程跑 `svn`，结果经 `AsyncSvnNotification`
    回到 `App::handle_async`；`pending` 计数驱动 spinner。
 
+## 性能（超大型工作副本）
+
+目标：10 万+ 文件的项目不卡死。已落实的措施：
+
+- **`build_tree` 为 O(n)**：一次性 HashMap 建节点 + 索引装配 + 排序。
+  曾因逐层线性查找导致 10 万文件单目录下耗时 **8.8s**（卡死），现 release 约 **47ms**。
+- **虚拟化渲染**：文件树 / Diff / Blame 每次 draw 只构建可见窗口
+  （O(屏幕高度)），10 万条目绘制 ~80µs。
+- **`dir_staged_counts` 缓存**：按目录的暂存计数只在暂存集合或条目变化时重算，
+  导航/绘制时零重算。
+- 日志固定 `-l 50`，提交集为 HashSet 查找 O(1)。
+
+验证方式：
+- `cargo bench --bench tree`（criterion，release）：本地精确数据；
+- `cargo test perf`（CI 强制）：7 个带时间预算的回归测试，debug 下也运行；
+  O(n²) 回归会让 100k 用例从 ~0.2s 变成 30s+，立刻被门禁拦下。
+
+基准（release, Apple Silicon）：
+```
+status_tree/update_wide_100k     ~47 ms
+status_tree/update_deep_100k     ~83 ms
+status_tree/draw_wide_100k       ~82 µs
+parsers/parse_status_100k        ~155 ms
+parsers/parse_diff_50k           ~1.5 ms
+```
+
 ## 常用命令
 
 ```bash
 cargo build                 # 开发构建
-cargo test                  # 99 个测试（部分会创建真实临时 SVN 仓库，需要本机有 svn/svnadmin）
+cargo test                  # 112 个测试（含 7 个性能门禁；部分会创建真实临时 SVN 仓库）
+cargo bench --bench tree     # criterion 性能基准（超大型工作副本）
 cargo test <name>           # 跑单个测试
 cargo llvm-cov              # 覆盖率报告（需 cargo-llvm-cov + llvm-tools-preview）
 cargo llvm-cov --fail-under-lines 80   # 覆盖率门禁（与 CI 一致）

@@ -82,6 +82,16 @@ git push origin master --tags
 
 推送标签后，Release 工作流会自动构建并创建 Release（含自动生成的变更日志），无需任何机器人。
 
+## 性能（超大型 SVN 项目）
+
+针对 10 万+ 文件的工作副本做了针对性优化，并配套性能测试：
+
+- 文件树构建 O(n)（曾为 O(n²)，10 万文件单目录下 8.8s → 现 ~47ms）
+- 树 / Diff / Blame 渲染虚拟化：每次绘制只处理可见窗口（10 万条目 ~80µs）
+- 目录暂存计数缓存，导航时零重算
+- `cargo bench --bench tree`（criterion 基准）+ `cargo test perf`（CI 时间门禁，
+  O(n²) 回归会立刻被拦下）
+
 ## 设计说明
 
 架构参考了 gitui：

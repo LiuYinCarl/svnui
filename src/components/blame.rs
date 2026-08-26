@@ -102,13 +102,16 @@ impl DrawableComponent for BlamePopup {
             return Ok(());
         }
 
-        let mut lines: Vec<Line> = Vec::with_capacity(self.lines.len());
-        for bl in &self.lines {
+        // Virtualized rendering: only build the visible window of lines.
+        let total = self.lines.len();
+        let scroll = ui::clamp_scroll(self.scroll.get(), total, inner.height as usize);
+        self.scroll.set(scroll);
+        let end = (scroll + inner.height as usize).min(total);
+        let mut lines: Vec<Line> = Vec::with_capacity(end - scroll);
+        for bl in &self.lines[scroll..end] {
             lines.push(blame_line(bl, theme));
         }
-        let scroll = ui::clamp_scroll(self.scroll.get(), lines.len(), inner.height as usize);
-        self.scroll.set(scroll);
-        ui::render_lines(f, inner, &lines, scroll, &[]);
+        ui::render_lines(f, inner, &lines, 0, &[]);
         Ok(())
     }
 

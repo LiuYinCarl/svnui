@@ -10,3 +10,10 @@ crossbeam-channel = "0.5.16"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", features = ["underline-color"] }
 tui-textarea-2 = "0.13.2"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "tree"
+harness = false

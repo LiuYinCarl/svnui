@@ -177,10 +177,17 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
         return;
     }
 
-    let lines = view.lines(theme);
-    let scroll = ui::clamp_scroll(view.scroll.get(), lines.len(), inner.height as usize);
+    // Virtualized rendering: only the visible window of lines is built, so
+    // drawing a huge diff costs O(screen height), not O(diff size).
+    let total = view.parsed.lines.len();
+    let scroll = ui::clamp_scroll(view.scroll.get(), total, inner.height as usize);
     view.scroll.set(scroll);
-    ui::render_lines(f, inner, &lines, scroll, &[]);
+    let end = (scroll + inner.height as usize).min(total);
+    let mut lines = Vec::with_capacity(end - scroll);
+    for i in scroll..end {
+        lines.push(diff_line(&view.parsed.lines[i], theme));
+    }
+    ui::render_lines(f, inner, &lines, 0, &[]);
 }
 
 #[cfg(test)]

@@ -4,22 +4,6 @@
 //! multiplexes three channels (input, async svn results, spinner tick)
 //! using `crossbeam_channel::select`, mirroring gitui's `main.rs`.
 
-mod app;
-mod components;
-mod keys;
-mod popups;
-mod queue;
-mod status;
-mod strings;
-mod svn;
-#[cfg(test)]
-mod test_support;
-mod ui;
-
-use crate::app::App;
-use crate::components::Context;
-use crate::queue::Queue;
-use crate::ui::style::Theme;
 use clap::Parser;
 use crossbeam_channel::{Receiver, select};
 use crossterm::event::{self, Event};
@@ -33,6 +17,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use svnui::app::App;
+use svnui::components::Context;
+use svnui::queue::Queue;
+use svnui::svn;
+use svnui::ui::style::Theme;
 
 type Terminal = ratatui::Terminal<CrosstermBackend<Stdout>>;
 
@@ -190,13 +179,13 @@ fn select_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
-    use crate::components::Context;
-    use crate::svn::models::StatusEntry;
-    use crate::test_support::TestRepo;
     use crossbeam_channel::unbounded;
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
+    use svnui::app::App;
+    use svnui::components::Context;
+    use svnui::svn::models::StatusEntry;
+    use svnui::test_support::TestRepo;
 
     #[test]
     fn cli_args_default_and_explicit() {

@@ -405,3 +405,39 @@ Index: Cargo.toml
         assert_eq!(d.lines[6].new, Some(2));
     }
 }
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn perf_parse_status_100k_lines() {
+        let mut out = String::with_capacity(100_000 * 24);
+        for i in 0..100_000 {
+            out.push_str(&format!("M       src/file_{i:06}.rs\n"));
+        }
+        let t = Instant::now();
+        let entries = parse_status(&out);
+        let el = t.elapsed();
+        assert_eq!(entries.len(), 100_000);
+        assert!(
+            el < Duration::from_secs(10),
+            "parse_status(100k) took {el:?}"
+        );
+    }
+
+    #[test]
+    fn perf_parse_diff_50k_lines() {
+        let mut out = String::with_capacity(50_000 * 24);
+        out.push_str("Index: big.rs\n=== ===\n@@ -1 +1,50_000 @@\n");
+        for i in 0..50_000 {
+            out.push_str(&format!("+line {i}\n"));
+        }
+        let t = Instant::now();
+        let d = parse_diff(&out);
+        let el = t.elapsed();
+        assert_eq!(d.lines.len(), 50_003);
+        assert!(el < Duration::from_secs(10), "parse_diff(50k) took {el:?}");
+    }
+}

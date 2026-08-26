@@ -1,6 +1,7 @@
-//! Test support: temp SVN repositories and helpers (only compiled in tests).
-
-#![cfg(test)]
+//! Test support: temp SVN repositories and helpers.
+//!
+//! Compiled unconditionally so that both the library tests and the binary's
+//! tests can use it; it is only referenced from `#[cfg(test)]` code.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -138,4 +139,28 @@ pub fn key(code: crossterm::event::KeyCode) -> crossterm::event::Event {
         code,
         crossterm::event::KeyModifiers::NONE,
     ))
+}
+
+/// Generate synthetic status entries for performance tests.
+///
+/// `wide`: `n` files in a single directory (worst case for tree building);
+/// `deep`: files nested under shared directories (more realistic layout).
+pub fn gen_status_entries(n: usize, wide: bool) -> Vec<crate::svn::models::StatusEntry> {
+    use crate::svn::models::StatusEntry;
+    (0..n)
+        .map(|i| {
+            let path = if wide {
+                format!("file_{i:06}.rs")
+            } else {
+                format!("src/d{}/d{}/d{}/mod_{i:06}.rs", i % 40, i % 20, i % 10)
+            };
+            StatusEntry {
+                status: if i % 3 == 0 { 'M' } else { '?' },
+                props_status: ' ',
+                tree_conflict: ' ',
+                path,
+                is_dir: false,
+            }
+        })
+        .collect()
 }
