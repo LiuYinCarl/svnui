@@ -392,7 +392,7 @@ impl App {
             AsyncSvnNotification::Commit(result) => match result {
                 Ok(out) => {
                     self.status.clear_staged();
-                    self.status.commit.text.clear();
+                    self.status.commit.clear();
                     self.status.commit.unfocus();
                     self.show_output("svn commit".to_string(), &out);
                     self.refresh_after_op();
@@ -476,13 +476,8 @@ impl App {
             popup.draw(f, rect)?;
         }
 
-        // cursor for the commit input
-        // only shown when the commit input is focused; otherwise the
-        // cursor stays hidden automatically.
-        if self.active_tab == Tab::Status && self.status.commit.focused {
-            let (x, y) = self.status.commit.cursor_pos.get();
-            f.set_cursor_position((x, y));
-        }
+        // The commit input renders its own unicode-width aware cursor via
+        // tui-textarea; the terminal caret stays hidden.
         Ok(())
     }
 

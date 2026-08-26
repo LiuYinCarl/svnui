@@ -33,7 +33,7 @@ src/
 │   ├── mod.rs        DrawableComponent trait、EventState、Context
 │   ├── status_tree.rs  文件树（目录折叠、暂存、过滤）——最大的组件
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用）
-│   ├── commit.rs     提交信息输入栏
+│   ├── commit.rs     提交信息输入栏（基于 tui-textarea-2，unicode-width 光标）
 │   ├── log.rs        日志标签页（修订列表 + 详情）
 │   ├── blame.rs      blame 弹窗
 │   └── help.rs       帮助弹窗
@@ -76,6 +76,7 @@ cargo fmt --all --check     # 格式门禁
 
 - 错误处理：内部使用 `Result<_, String>`（svn stderr 文本），UI 层显示在消息弹窗。
 - 组件实现 `DrawableComponent`（`draw(&self, ...)` + `event(&mut self, ...)`）。
+- 文本输入用 `tui-textarea-2`（与 gitui 同思路）：光标按 unicode 单元格渲染、退格按字符安全删除、自带横向滚动。不要手写字符宽度计算。
   注意 `draw` 是 `&self`——需要可变状态（滚动偏移等）用 `Cell`。
 - 组件不应直接持有 `Svn`；通过 `Context.queue` push `InternalEvent`，由 App 执行命令。
 - 新增快捷键：在 `keys.rs` 加 `KeyAction` 变体 + `key_match` 分支，并更新 `all_bindings()`（帮助页）。

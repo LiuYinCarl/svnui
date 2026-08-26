@@ -317,7 +317,7 @@ mod tests {
         let _ = t
             .event(&ts::key(crossterm::event::KeyCode::Char('x')))
             .unwrap();
-        assert_eq!(t.commit.text, "x");
+        assert_eq!(t.commit.text(), "x");
         // Esc in commit unfocuses and returns focus to tree
         let _ = t.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
         assert!(!t.commit.focused);
