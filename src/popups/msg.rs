@@ -51,9 +51,11 @@ impl DrawableComponent for MsgPopup {
             .collect();
         f.render_widget(Paragraph::new(msg_lines).wrap(Wrap { trim: false }), inner);
         // footer hint
-        let y = area.y + area.height - 1;
-        f.buffer_mut()
-            .set_string(area.x + 1, y, "press any key to close", Style::default());
+        if area.height > 0 {
+            let y = area.y + area.height.saturating_sub(1);
+            f.buffer_mut()
+                .set_string(area.x + 1, y, "press any key to close", Style::default());
+        }
         Ok(())
     }
 

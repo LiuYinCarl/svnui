@@ -8,6 +8,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use std::hint::black_box;
+use std::path::Path;
 use svnui::components::status_tree::StatusTreeComponent;
 use svnui::components::{Context, DrawableComponent};
 use svnui::queue::Queue;
@@ -59,7 +60,12 @@ fn bench_parsers(c: &mut Criterion) {
         status_out.push_str(&format!("M       src/file_{i:06}.rs\n"));
     }
     group.bench_function("parse_status_100k", |b| {
-        b.iter(|| black_box(parse_status(black_box(&status_out))))
+        b.iter(|| {
+            black_box(parse_status(
+                black_box(&status_out),
+                black_box(Path::new("/")),
+            ))
+        })
     });
 
     let mut diff_out = String::with_capacity(50_000 * 16);

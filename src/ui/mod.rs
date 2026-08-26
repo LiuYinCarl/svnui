@@ -61,8 +61,11 @@ pub fn render_line_at(f: &mut Frame, x: u16, y: u16, width: u16, line: &Line) {
 
 /// Compute a centered popup rect with the given width/height constraints.
 pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let width = (area.width * percent_x / 100).max(20);
-    let height = (area.height * percent_y / 100).max(5);
+    // u32 intermediates: `width * percent` overflows u16 on wide terminals
+    let width = (u32::from(area.width) * u32::from(percent_x) / 100) as u16;
+    let height = (u32::from(area.height) * u32::from(percent_y) / 100) as u16;
+    let width = width.max(20).min(area.width);
+    let height = height.max(5).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
@@ -114,6 +117,16 @@ mod tests {
         let small = popup_area(Rect::new(0, 0, 30, 8), 10, 10);
         assert!(small.width >= 20);
         assert!(small.height >= 5);
+        // very wide terminals: u16 multiplication must not overflow
+        let wide = popup_area(Rect::new(0, 0, 1000, 300), 92, 92);
+        assert_eq!(wide.width, 920);
+        assert_eq!(wide.height, 276);
+        assert!(wide.x + wide.width <= 1000);
+        assert!(wide.y + wide.height <= 300);
+        // popup larger than the area is clamped to it
+        let clamped = popup_area(Rect::new(0, 0, 10, 4), 50, 50);
+        assert!(clamped.width <= 10);
+        assert!(clamped.height <= 4);
     }
 
     #[test]

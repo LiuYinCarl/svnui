@@ -46,7 +46,13 @@ impl StatusTab {
         self.focus = focus;
         self.tree.set_focused(focus == PaneFocus::Tree);
         self.diff.focused = focus == PaneFocus::Diff;
-        self.commit.focused = focus == PaneFocus::Commit;
+        // go through focus()/unfocus() so the textarea's cursor render
+        // mode stays in sync with the focus flag
+        if focus == PaneFocus::Commit {
+            self.commit.focus();
+        } else {
+            self.commit.unfocus();
+        }
     }
 
     pub fn cycle_focus(&mut self, forward: bool) {

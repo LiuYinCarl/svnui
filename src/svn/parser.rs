@@ -5,48 +5,45 @@ use super::models::{BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, Sta
 /// Parse the plain-text output of `svn status`.
 ///
 /// Layout (verified against svn 1.14): seven single-character columns
-/// (text, props, locked, copied+add, switched, unused, tree-conflict)
-/// followed by the path.
-pub fn parse_status(output: &str) -> Vec<StatusEntry> {
+/// (text, props, locked, copied+add, switched, unused, tree-conflict),
+/// one separating space, then the path starting at byte 8 — the path may
+/// itself begin with spaces, so no extra spaces may be skipped.
+///
+/// `root` is the working copy root: svn reports paths relative to it, so
+/// `is_dir` must be probed against `root`, not the process CWD.
+pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
     let mut entries = Vec::new();
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
-        // Skip continuation lines of move operations (" >   path")
-        if line.starts_with('>') {
+        // Skip continuation lines (tree-conflict descriptions, move
+        // sources): indented text starting with '>'
+        if line.trim_start().starts_with('>') {
             continue;
         }
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        let mut cols = [b' '; 7];
-        for col in cols.iter_mut() {
-            if i < bytes.len() {
-                *col = bytes[i];
-                i += 1;
-            }
-        }
-        // Skip the space between columns and path
-        while i < bytes.len() && bytes[i] == b' ' {
-            i += 1;
-        }
-        let path = line[i..].to_string();
+        let Some(path) = line.get(8..) else {
+            continue;
+        };
         if path.is_empty() {
             continue;
         }
+        let bytes = line.as_bytes();
+        let mut cols = [b' '; 7];
+        cols.copy_from_slice(&bytes[..7]);
         let text = cols[0] as char;
         let props = cols[1] as char;
         let tree_conflict = cols[6] as char;
         if text == ' ' && props == ' ' && tree_conflict == ' ' {
             continue;
         }
-        let is_dir = std::path::Path::new(&path).is_dir();
+        let is_dir = root.join(path).is_dir();
         entries.push(StatusEntry {
             status: text,
             props_status: props,
             tree_conflict,
-            path,
+            path: path.to_string(),
             is_dir,
         });
     }
@@ -100,16 +97,19 @@ pub fn parse_log(output: &str) -> Vec<LogEntry> {
         // Changed path line: "   M /trunk/foo.txt" (3 leading spaces, '/')
         if !in_message && line.starts_with("   ") {
             let trimmed = line.trim_start();
-            let chars: Vec<char> = trimmed.chars().collect();
-            if chars.len() > 2 && chars[1] == ' ' && trimmed[2..].starts_with('/') {
-                let action = chars[0];
-                if matches!(action, 'M' | 'A' | 'D' | 'R' | 'I' | 'X' | 'C' | '?') {
-                    let path = trimmed[2..].trim().trim_start_matches('/').to_string();
-                    if let Some(e) = current.as_mut() {
-                        e.changed.push((action, path));
-                    }
-                    continue;
+            let mut chars = trimmed.chars();
+            let (action, sep, rest) = (chars.next(), chars.next(), chars.as_str());
+            // `rest` is taken via `chars.as_str()` so slicing stays on char
+            // boundaries even when the line starts with CJK text
+            if let (Some(action), Some(' ')) = (action, sep)
+                && matches!(action, 'M' | 'A' | 'D' | 'R' | 'I' | 'X' | 'C' | '?')
+                && rest.starts_with('/')
+            {
+                let path = rest.trim().trim_start_matches('/').to_string();
+                if let Some(e) = current.as_mut() {
+                    e.changed.push((action, path));
                 }
+                continue;
             }
         }
 
@@ -153,18 +153,21 @@ fn parse_log_header(line: &str) -> Option<LogEntry> {
 ///
 /// Format (verified against svn 1.14): `%6s %10s %s`
 /// revision right-justified in 6, author right-justified in 10, content.
+/// Those are *minimum* widths: a long author (e.g. CJK, where 10 chars
+/// exceed 10 bytes) or a 7-digit revision pushes the content right, so
+/// parse by whitespace-separated tokens instead of fixed byte offsets.
 pub fn parse_blame(output: &str) -> Vec<BlameLine> {
     let mut lines = Vec::new();
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
-        if line.len() < 18 {
+        let (rev_str, rest) = next_token(line);
+        if rev_str.is_empty() {
             continue;
         }
-        let rev_str = line[0..6].trim();
-        let author = line[7..17].trim().to_string();
-        // position 17 is the single separator space; keep the file's own
-        // leading indentation in the content
-        let content = line[18..].to_string();
+        let (author, rest) = next_token(rest);
+        // exactly one separator space follows the author field; the file's
+        // own leading indentation stays in the content
+        let content = rest.strip_prefix(' ').unwrap_or(rest).to_string();
         let revision = if rev_str == "-" {
             None
         } else {
@@ -172,11 +175,20 @@ pub fn parse_blame(output: &str) -> Vec<BlameLine> {
         };
         lines.push(BlameLine {
             revision,
-            author,
+            author: author.to_string(),
             content,
         });
     }
     lines
+}
+
+/// Split off the first space-delimited token, skipping leading spaces.
+fn next_token(s: &str) -> (&str, &str) {
+    let s = s.trim_start_matches(' ');
+    match s.find(' ') {
+        Some(end) => (&s[..end], &s[end..]),
+        None => (s, ""),
+    }
 }
 
 /// Parse `svn diff` output into line-numbered, colorizable lines.
@@ -198,7 +210,14 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
             });
             continue;
         }
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
+        // "--- "/"+++ " are file headers only right after an Index:/===
+        // header line; inside a hunk they are content lines ("-- foo" is a
+        // removed "- foo", "++ bar" an added "+ bar")
+        let after_header = matches!(
+            lines.last(),
+            Some(l) if matches!(l.kind, DiffLineKind::Header | DiffLineKind::FileHeader)
+        );
+        if after_header && (line.starts_with("--- ") || line.starts_with("+++ ")) {
             lines.push(DiffLine {
                 old: None,
                 new: None,
@@ -300,11 +319,17 @@ pub fn parse_new_file_content(content: &str) -> ParsedDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// A root that matches nothing on disk (is_dir always false).
+    fn no_root() -> &'static Path {
+        Path::new("/svnui-test-no-such-dir")
+    }
 
     #[test]
     fn test_parse_status() {
         let out = "M       Cargo.toml\n?       newfile.txt\nA  +    src/foo.rs\n";
-        let entries = parse_status(out);
+        let entries = parse_status(out, no_root());
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].status, 'M');
         assert_eq!(entries[0].path, "Cargo.toml");
@@ -317,10 +342,43 @@ mod tests {
     #[test]
     fn test_parse_status_missing_dir() {
         // path with missing dir: is_dir should be false without panicking
-        let entries = parse_status("!       gone/dir\n");
+        let entries = parse_status("!       gone/dir\n", no_root());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, '!');
         assert!(!entries[0].is_dir);
+    }
+
+    #[test]
+    fn test_parse_status_is_dir_relative_to_root() {
+        let dir = std::env::temp_dir().join(format!("svnui-parse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("adir")).unwrap();
+        let entries = parse_status("A       adir\nM       adir/f.txt\n", &dir);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_dir, "adir exists as a dir under root");
+        assert!(!entries[1].is_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_status_skips_tree_conflict_continuation() {
+        // Real svn output for a tree conflict: the description continues on
+        // an indented line starting with '>'
+        let out = "A  +  C d\n      >   local dir edit, incoming dir delete upon update\n";
+        let entries = parse_status(out, no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].status, 'A');
+        assert_eq!(entries[0].tree_conflict, 'C');
+        assert_eq!(entries[0].path, "d");
+    }
+
+    #[test]
+    fn test_parse_status_path_with_leading_space() {
+        // The path starts at byte 8 and may itself begin with spaces
+        let out = format!("?       {}\n", " leading.txt");
+        let entries = parse_status(&out, no_root());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, " leading.txt");
     }
 
     #[test]
@@ -372,6 +430,22 @@ just a message
     }
 
     #[test]
+    fn test_parse_log_indented_cjk_message() {
+        // An indented CJK first message line must not be mistaken for a
+        // changed-path line (nor panic on a mid-char slice)
+        let out = "\
+------------------------------------------------------------------------
+r7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 1 line
+   中文说明
+------------------------------------------------------------------------
+";
+        let entries = parse_log(out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "中文说明");
+        assert!(entries[0].changed.is_empty());
+    }
+
+    #[test]
     fn test_parse_blame() {
         let out = "     3    kenshin fn main() {\n     -          -     indented\n";
         let lines = parse_blame(out);
@@ -382,6 +456,21 @@ just a message
         assert_eq!(lines[1].revision, None);
         assert_eq!(lines[1].author, "-");
         assert_eq!(lines[1].content, "    indented");
+    }
+
+    #[test]
+    fn test_parse_blame_cjk_and_long_author() {
+        // CJK author exceeds 10 bytes; 7-digit revision overflows its
+        // 6-wide field — neither may break the column parsing
+        let out = "     3 张三李四王五 fn main() {\n1234567 verylongauthorname x = 1\n";
+        let lines = parse_blame(out);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].revision, Some(3));
+        assert_eq!(lines[0].author, "张三李四王五");
+        assert_eq!(lines[0].content, "fn main() {");
+        assert_eq!(lines[1].revision, Some(1234567));
+        assert_eq!(lines[1].author, "verylongauthorname");
+        assert_eq!(lines[1].content, "x = 1");
     }
 
     #[test]
@@ -404,6 +493,36 @@ Index: Cargo.toml
         assert_eq!(d.lines[6].kind, DiffLineKind::Added);
         assert_eq!(d.lines[6].new, Some(2));
     }
+
+    #[test]
+    fn test_parse_diff_dash_prefixed_content_lines() {
+        // "-- foo" / "++ bar" inside a hunk are content lines, not file
+        // headers; misreading them shifts the line numbers afterwards
+        let out = "\
+Index: a.txt
+===================================================================
+--- a.txt\t(revision 1)
++++ a.txt\t(working copy)
+@@ -1,2 +1,2 @@
+-- foo
+++ bar
+ tail
+";
+        let d = parse_diff(out);
+        assert_eq!(d.lines.len(), 8);
+        assert_eq!(d.lines[2].kind, DiffLineKind::FileHeader);
+        assert_eq!(d.lines[3].kind, DiffLineKind::FileHeader);
+        assert_eq!(d.lines[4].kind, DiffLineKind::Hunk);
+        assert_eq!(d.lines[5].kind, DiffLineKind::Removed);
+        assert_eq!(d.lines[5].old, Some(1));
+        assert_eq!(d.lines[5].content, "- foo");
+        assert_eq!(d.lines[6].kind, DiffLineKind::Added);
+        assert_eq!(d.lines[6].new, Some(1));
+        assert_eq!(d.lines[6].content, "+ bar");
+        assert_eq!(d.lines[7].kind, DiffLineKind::Context);
+        assert_eq!(d.lines[7].old, Some(2));
+        assert_eq!(d.lines[7].new, Some(2));
+    }
 }
 
 #[cfg(test)]
@@ -418,7 +537,7 @@ mod perf_tests {
             out.push_str(&format!("M       src/file_{i:06}.rs\n"));
         }
         let t = Instant::now();
-        let entries = parse_status(&out);
+        let entries = parse_status(&out, std::path::Path::new("/svnui-test-no-such-dir"));
         let el = t.elapsed();
         assert_eq!(entries.len(), 100_000);
         assert!(

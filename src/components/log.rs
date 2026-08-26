@@ -53,6 +53,8 @@ impl LogComponent {
             return;
         }
         self.selection = ui::clamp_index((self.selection as isize + delta).max(0) as usize, len);
+        // the detail pane shows the newly selected revision from the top
+        self.detail_scroll.set(0);
     }
 
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
@@ -125,6 +127,16 @@ impl DrawableComponent for LogComponent {
         let inner = block.inner(chunks[0]);
         f.render_widget(block, chunks[0]);
 
+        // ---- right: details frame ----
+        // always drawn (even while loading/empty): ratatui only diffs
+        // cells, so a missing border would leave stale content behind
+        let block2 = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_unfocused))
+            .title(TITLE.log_detail);
+        let inner2 = block2.inner(chunks[1]);
+        f.render_widget(block2, chunks[1]);
+
         if self.pending {
             f.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(Span::styled("Loading...", theme.dim))),
@@ -162,14 +174,7 @@ impl DrawableComponent for LogComponent {
         let highlights = vec![(self.selection, Style::default().bg(theme.selection_bg))];
         ui::render_lines(f, inner, &lines, scroll, &highlights);
 
-        // ---- right: details ----
-        let block2 = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border_unfocused))
-            .title(TITLE.log_detail);
-        let inner2 = block2.inner(chunks[1]);
-        f.render_widget(block2, chunks[1]);
-
+        // ---- right: details content ----
         if let Some(e) = self.entries.get(self.selection) {
             let detail = detail_lines(e, theme);
             let mut dscroll = self.detail_scroll.get();
@@ -370,12 +375,25 @@ mod tests {
         let t1 = ts::render(80, 10, |f| {
             c.draw(f, Rect::new(0, 0, 80, 10)).unwrap();
         });
-        assert!(ts::dump(&t1).contains("Loading"));
+        let s1 = ts::dump(&t1);
+        assert!(s1.contains("Loading"), "{s1}");
+        // the detail frame is drawn even while loading (no stale content)
+        assert!(s1.contains("Revision details"), "{s1}");
         c.update(vec![]);
         let t2 = ts::render(80, 10, |f| {
             c.draw(f, Rect::new(0, 0, 80, 10)).unwrap();
         });
-        assert!(ts::dump(&t2).contains("No revisions"));
+        let s2 = ts::dump(&t2);
+        assert!(s2.contains("No revisions"), "{s2}");
+        assert!(s2.contains("Revision details"), "{s2}");
+    }
+
+    #[test]
+    fn move_selection_resets_detail_scroll() {
+        let (mut c, _q) = comp();
+        c.detail_scroll.set(5);
+        c.move_selection(1);
+        assert_eq!(c.detail_scroll.get(), 0);
     }
 
     #[test]

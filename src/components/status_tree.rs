@@ -7,7 +7,7 @@ use crate::queue::{ConfirmAction, InternalEvent};
 use crate::strings::{self, TITLE};
 use crate::svn::models::{StatusEntry, TreeItem, TreeItemKind};
 use crate::ui;
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -248,7 +248,12 @@ impl StatusTreeComponent {
                     self.filter.pop();
                     self.rebuild_visible();
                 }
-                KeyCode::Char(c) => {
+                // ignore control/alt combos (Ctrl+C must not filter 'c')
+                KeyCode::Char(c)
+                    if !k
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.filter.push(c);
                     self.rebuild_visible();
                 }
@@ -457,8 +462,8 @@ impl DrawableComponent for StatusTreeComponent {
         }
 
         // Filter input row
-        if filter_row {
-            let y = inner.y + inner.height - 1;
+        if filter_row && inner.height > 0 {
+            let y = inner.y + inner.height.saturating_sub(1);
             ui::render_line_at(
                 f,
                 inner.x,
@@ -927,10 +932,26 @@ mod interaction_tests {
         c.event(&key(KeyCode::Backspace)).unwrap();
         assert_eq!(c.filter, "a");
         assert_eq!(c.visible.len(), 2);
+        // control combos are not text input
+        let ctrl_c = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+        c.event(&ctrl_c).unwrap();
+        assert_eq!(c.filter, "a");
         // Esc exits filter mode
         c.event(&key(KeyCode::Esc)).unwrap();
         assert!(!c.filter_active);
         assert_eq!(c.visible.len(), 2);
+    }
+
+    #[test]
+    fn draw_with_zero_height_area_does_not_panic() {
+        let (mut c, _q) = comp_with(vec![entry('M', "a.txt")]);
+        c.event(&key(KeyCode::Char('/'))).unwrap(); // filter row visible
+        let _t = ts::render(40, 5, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 0)).unwrap();
+        });
     }
 
     #[test]

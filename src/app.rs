@@ -13,7 +13,6 @@ use crate::ui;
 use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -348,7 +347,13 @@ impl App {
                         self.show_diff_popup(path.clone(), &content);
                     }
                 }
-                Err(e) => self.show_error(format!("svn diff {path}: {e}")),
+                Err(e) => {
+                    if matches!(&self.pending_fullscreen, Some(PendingFullscreen::File(p)) if *p == path)
+                    {
+                        self.pending_fullscreen = None;
+                    }
+                    self.show_error(format!("svn diff {path}: {e}"));
+                }
             },
             AsyncSvnNotification::Log(result) => match result {
                 Ok(entries) => self.log.update(entries),
@@ -363,11 +368,28 @@ impl App {
                         self.show_diff_popup(format!("Diff r{revision}"), &content);
                     }
                 }
-                Err(e) => self.show_error(format!("svn diff -c {revision}: {e}")),
+                Err(e) => {
+                    if matches!(&self.pending_fullscreen, Some(PendingFullscreen::Revision(r)) if *r == revision)
+                    {
+                        self.pending_fullscreen = None;
+                    }
+                    self.show_error(format!("svn diff -c {revision}: {e}"));
+                }
             },
             AsyncSvnNotification::Blame { path, result } => match result {
                 Ok(lines) => self.update_blame_popup(&path, lines),
-                Err(e) => self.show_error(format!("svn blame {path}: {e}")),
+                Err(e) => {
+                    // leave no popup stuck on "Loading..."
+                    for popup in self.popups.iter_mut().rev() {
+                        if let Popup::Blame(blame) = popup
+                            && blame.path == path
+                        {
+                            blame.pending = false;
+                            break;
+                        }
+                    }
+                    self.show_error(format!("svn blame {path}: {e}"));
+                }
             },
             AsyncSvnNotification::Update(result) => match result {
                 Ok(out) => {
@@ -400,8 +422,9 @@ impl App {
                 Err(e) => self.show_error(format!("svn commit: {e}")),
             },
             AsyncSvnNotification::Add(result) => match result {
-                Ok(paths) => {
-                    self.status.set_staged(&paths);
+                Ok(_) => {
+                    // no set_staged write-back: the tree's staged set is
+                    // authoritative (the user may have unstaged meanwhile)
                     self.show_info(MSG.add_done.to_string());
                     self.refresh_after_op();
                 }
@@ -505,9 +528,6 @@ impl App {
         f.buffer_mut().set_line(area.x, area.y, &line, area.width);
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_: Style) {}
 
 #[cfg(test)]
 mod tests {
@@ -740,9 +760,10 @@ mod tests {
         assert_eq!(app.status.tree.staged_count(), 1);
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
 
-        // add ok → staged + refresh; add err → error
+        // add ok → info + refresh (the tree's staged set is authoritative,
+        // no write-back); add err → error
         app.handle_async(AsyncSvnNotification::Add(Ok(vec!["b.txt".into()])));
-        assert!(app.status.tree.staged.contains("b.txt"));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
         app.handle_async(AsyncSvnNotification::Add(Err("E155010".into())));
 
@@ -960,6 +981,36 @@ mod tests {
     }
 
     #[test]
+    fn async_errors_clear_pending_state() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        // a failed fullscreen diff clears the pending request
+        app.pending_fullscreen = Some(PendingFullscreen::File("a.txt".into()));
+        app.handle_async(AsyncSvnNotification::Diff {
+            path: "a.txt".into(),
+            result: Err("boom".into()),
+        });
+        assert!(app.pending_fullscreen.is_none());
+        app.pending_fullscreen = Some(PendingFullscreen::Revision(3));
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            result: Err("boom".into()),
+        });
+        assert!(app.pending_fullscreen.is_none());
+        // a failed blame un-pends the matching popup (no endless Loading)
+        app.push_popup(Popup::blame(&app.ctx.clone(), "f.rs"));
+        app.handle_async(AsyncSvnNotification::Blame {
+            path: "f.rs".into(),
+            result: Err("boom".into()),
+        });
+        let still_pending = app
+            .popups
+            .iter()
+            .any(|p| matches!(p, Popup::Blame(b) if b.pending));
+        assert!(!still_pending);
+    }
+
+    #[test]
     fn maybe_request_diff_only_in_status_tab() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
@@ -1044,7 +1095,4 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ))
     }
-
-    #[allow(dead_code)]
-    fn _unused(_: &mut App) {}
 }

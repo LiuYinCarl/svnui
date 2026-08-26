@@ -79,7 +79,7 @@ impl Svn {
         let cwd = self.cwd.clone();
         self.spawn(move || {
             let result = Self::run_in(&cwd, &["status", "--ignore-externals"])
-                .map(|text| parser::parse_status(&text));
+                .map(|text| parser::parse_status(&text, &cwd));
             AsyncSvnNotification::Status(result)
         });
     }
@@ -120,9 +120,11 @@ impl Svn {
     pub fn log(&self, limit: usize) {
         let cwd = self.cwd.clone();
         self.spawn(move || {
+            // HEAD:0 so an empty (r0) repository yields no output instead
+            // of an E160006 error
             let result = Self::run_in(
                 &cwd,
-                &["log", "-v", "-r", "HEAD:1", "-l", &limit.to_string()],
+                &["log", "-v", "-r", "HEAD:0", "-l", &limit.to_string()],
             )
             .map(|out| parser::parse_log(&out));
             AsyncSvnNotification::Log(result)
@@ -141,7 +143,8 @@ impl Svn {
         let cwd = self.cwd.clone();
         let path = path.to_string();
         self.spawn(move || {
-            let result = Self::run_in(&cwd, &["blame", &path]).map(|out| parser::parse_blame(&out));
+            let result =
+                Self::run_in(&cwd, &["blame", "--", &path]).map(|out| parser::parse_blame(&out));
             AsyncSvnNotification::Blame { path, result }
         });
     }
@@ -150,7 +153,7 @@ impl Svn {
         let cwd = self.cwd.clone();
         let paths = paths.to_vec();
         self.spawn(move || {
-            let mut args: Vec<String> = vec!["add".into()];
+            let mut args: Vec<String> = vec!["add".into(), "--".into()];
             args.extend(paths.iter().cloned());
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
@@ -162,7 +165,7 @@ impl Svn {
         let cwd = self.cwd.clone();
         let paths = paths.to_vec();
         self.spawn(move || {
-            let mut args: Vec<String> = vec!["revert".into(), "-R".into()];
+            let mut args: Vec<String> = vec!["revert".into(), "-R".into(), "--".into()];
             args.extend(paths.iter().cloned());
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
@@ -174,7 +177,7 @@ impl Svn {
         let cwd = self.cwd.clone();
         let path = path.to_string();
         self.spawn(move || {
-            let result = Self::run_in(&cwd, &["resolve", "--accept=working", &path]);
+            let result = Self::run_in(&cwd, &["resolve", "--accept=working", "--", &path]);
             AsyncSvnNotification::Resolve(result.map(|_| path.clone()))
         });
     }
@@ -207,6 +210,7 @@ impl Svn {
             }
             args.push("-m".into());
             args.push(message);
+            args.push("--".into());
             args.extend(paths.iter().cloned());
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let result = Self::run_in(&cwd, &arg_refs);

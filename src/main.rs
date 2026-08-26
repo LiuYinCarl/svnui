@@ -84,11 +84,27 @@ fn main() -> Result<(), String> {
 
     // terminal setup
     enable_raw_mode().map_err(|e| format!("failed to enable raw mode: {e}"))?;
+    // a panic must not leave the terminal in raw mode / alternate screen
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        default_hook(info);
+    }));
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .map_err(|e| format!("failed to enter alternate screen: {e}"))?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        disable_raw_mode().ok();
+        return Err(format!("failed to enter alternate screen: {e}"));
+    }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| format!("terminal init: {e}"))?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            disable_raw_mode().ok();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            return Err(format!("terminal init: {e}"));
+        }
+    };
     terminal.hide_cursor().ok();
 
     let queue = Queue::new();

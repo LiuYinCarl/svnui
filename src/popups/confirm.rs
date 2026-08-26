@@ -32,23 +32,28 @@ impl DrawableComponent for ConfirmPopup {
         let theme = &self.ctx.theme;
         f.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .split(area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.popup_border))
             .title(crate::strings::TITLE.confirm);
         let inner = block.inner(area);
-        f.render_widget(block, chunks[0]);
+        f.render_widget(block, area);
+
+        // message + footer both live inside the border
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
 
         let msg_lines: Vec<Line> = self
             .message
             .lines()
             .map(|l| Line::from(Span::styled(l.to_string(), theme.text)))
             .collect();
-        f.render_widget(Paragraph::new(msg_lines).wrap(Wrap { trim: false }), inner);
+        f.render_widget(
+            Paragraph::new(msg_lines).wrap(Wrap { trim: false }),
+            chunks[0],
+        );
 
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -58,7 +63,7 @@ impl DrawableComponent for ConfirmPopup {
                 Span::styled("no", theme.text),
             ]))
             .alignment(Alignment::Center),
-            Rect::new(area.x, chunks[1].y, area.width, 1),
+            chunks[1],
         );
         Ok(())
     }

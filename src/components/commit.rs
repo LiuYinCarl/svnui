@@ -8,7 +8,7 @@
 use super::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
 use crate::queue::{ConfirmAction, InternalEvent};
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -111,15 +111,24 @@ impl DrawableComponent for CommitComponent {
                         }));
                     return Ok(EventState::consumed());
                 }
+                // ignore control/alt combos (Ctrl+C must not insert 'c')
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    return Ok(EventState::not_consumed());
+                }
                 self.textarea.insert_char(c);
             }
             KeyCode::Enter => {
-                self.ctx
-                    .queue
-                    .push(InternalEvent::Confirm(ConfirmAction::Commit {
-                        message: self.text(),
-                        paths: Vec::new(),
-                    }));
+                // same check as the Char branch: Shift+Enter must not commit
+                if key_match(k, KeyAction::CommitConfirm) {
+                    self.ctx
+                        .queue
+                        .push(InternalEvent::Confirm(ConfirmAction::Commit {
+                            message: self.text(),
+                            paths: Vec::new(),
+                        }));
+                }
             }
             KeyCode::Backspace => {
                 self.textarea.delete_char();
@@ -291,6 +300,34 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn modifier_keys_do_not_insert_or_commit() {
+        let (mut c, q) = comp();
+        c.focus();
+        // Ctrl+C is not text input
+        let ctrl_c = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let state = c.event(&ctrl_c).unwrap();
+        assert!(!state.consumed);
+        assert_eq!(c.text(), "");
+        // Shift+Enter does not commit
+        let shift_enter = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::SHIFT,
+        ));
+        let state = c.event(&shift_enter).unwrap();
+        assert!(state.consumed);
+        assert!(q.pop().is_none(), "Shift+Enter must not commit");
+        // plain Enter still commits
+        c.event(&ev(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::Confirm(ConfirmAction::Commit { .. }))
+        ));
     }
 
     #[test]
