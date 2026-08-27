@@ -160,6 +160,37 @@ impl StatusTreeComponent {
         self.staged.len()
     }
 
+    /// All changed files as (status char, path), sorted by path.
+    pub fn changed_files(&self) -> Vec<(char, String)> {
+        let mut v: Vec<(char, String)> = self
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| (e.status, e.path.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    /// Status char of a path, ' ' when the path has no status entry.
+    pub fn status_char(&self, path: &str) -> char {
+        self.entry_for_path(path).map(|e| e.status).unwrap_or(' ')
+    }
+
+    /// Staged files as (status char, path), sorted by path.
+    pub fn staged_files(&self) -> Vec<(char, String)> {
+        let mut v: Vec<(char, String)> = self
+            .staged
+            .iter()
+            .map(|p| {
+                let s = self.entry_for_path(p).map(|e| e.status).unwrap_or('?');
+                (s, p.clone())
+            })
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
     }
@@ -358,6 +389,12 @@ impl StatusTreeComponent {
                 && !e.is_dir
             {
                 self.ctx.queue.push(InternalEvent::RequestBlame);
+            }
+        } else if key_match(k, KeyAction::FileHistory) {
+            if let Some(e) = self.selection_entry()
+                && !e.is_dir
+            {
+                self.ctx.queue.push(InternalEvent::RequestFileHistory);
             }
         } else if key_match(k, KeyAction::Refresh) {
             self.ctx.queue.push(InternalEvent::RefreshStatus);

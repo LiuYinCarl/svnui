@@ -59,6 +59,9 @@ pub enum KeyAction {
     CommitConfirm,
     OpenRevisionDiff,
     UpdateToRevision,
+    FileHistory,
+    OpenFileFinder,
+    ToggleMark,
 }
 
 /// Central keybindings. `KeyAction::None` is used for unbound keys.
@@ -104,6 +107,11 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         }
         KeyAction::OpenRevisionDiff => is_key(ev, KeyCode::Enter) || is_key(ev, KeyCode::Char('d')),
         KeyAction::UpdateToRevision => is_key(ev, KeyCode::Char('o')),
+        KeyAction::FileHistory => is_key(ev, KeyCode::Char('t')),
+        KeyAction::OpenFileFinder => {
+            ev.code == KeyCode::Char('p') && ev.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        KeyAction::ToggleMark => is_key(ev, KeyCode::Char(' ')),
     }
 }
 
@@ -129,11 +137,15 @@ pub fn all_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("u", "Update working copy (svn update)"),
         KeyBinding::new("d", "Fullscreen diff"),
         KeyBinding::new("b", "Blame file (svn blame)"),
-        KeyBinding::new("/", "Filter files"),
+        KeyBinding::new("t", "File history (svn log of selected file)"),
+        KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
+        KeyBinding::new("/", "Filter files / search commits (log tab)"),
         KeyBinding::new("F5 / R", "Refresh status"),
         KeyBinding::new("Tab / Shift+Tab", "Cycle pane focus"),
+        KeyBinding::new("Tab", "Commit input: pick a recent message"),
         KeyBinding::new("1 / 2", "Switch tab: status / log"),
-        KeyBinding::new("Enter / d", "Log tab: view revision diff"),
+        KeyBinding::new("Enter / d", "Log tab: diff of selected / marked revisions"),
+        KeyBinding::new("space", "Log tab: mark / unmark revision"),
         KeyBinding::new("o", "Log tab: update to selected revision"),
         KeyBinding::new("?", "Show this help"),
         KeyBinding::new("Esc", "Close popup / cancel"),
@@ -209,6 +221,15 @@ mod tests {
             &key(KeyCode::Char('d')),
             KeyAction::OpenRevisionDiff
         ));
+        assert!(key_match(&key(KeyCode::Char('t')), KeyAction::FileHistory));
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(key_match(&ctrl_p, KeyAction::OpenFileFinder));
+        // plain 'p' must not open the finder
+        assert!(!key_match(
+            &key(KeyCode::Char('p')),
+            KeyAction::OpenFileFinder
+        ));
+        assert!(key_match(&key(KeyCode::Char(' ')), KeyAction::ToggleMark));
     }
 
     #[test]

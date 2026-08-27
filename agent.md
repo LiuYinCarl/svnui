@@ -5,7 +5,7 @@
 ## 项目概况
 
 `svnui` 是一个受 [gitui](https://github.com/gitui-org/gitui) 启发的 SVN 终端 UI 客户端，
-用 Rust + ratatui 编写，约 4200 行实现 + 约 4000 行测试（行覆盖率 ~94%）。
+用 Rust + ratatui 编写，约 5300 行实现 + 约 6800 行测试（行覆盖率 ~95%）。
 
 **关键约束（务必遵守）：**
 
@@ -19,7 +19,9 @@
 
 ```
 src/
-├── main.rs           入口：终端初始化、事件循环（crossbeam select 多路复用输入/异步/时钟）
+├── main.rs           入口：终端初始化（raw mode + alternate screen + bracketed paste）、
+│                     事件循环（crossbeam select 多路复用输入/异步/时钟；输入线程丢弃
+│                     KeyEventKind::Release 事件，避免 Windows/kitty 终端下字符重复输入）
 ├── app.rs            App 状态机：标签页、弹窗栈、异步通知分发、绘制入口
 ├── queue.rs          InternalEvent 队列（组件→App 的通信）+ NeedsUpdate 位标志
 ├── status.rs         Status 标签页聚合（文件树 + Diff 面板 + 提交输入栏 + 焦点切换）
@@ -33,8 +35,12 @@ src/
 │   ├── mod.rs        DrawableComponent trait、EventState、Context
 │   ├── status_tree.rs  文件树（目录折叠、暂存、过滤）——最大的组件
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用）
-│   ├── commit.rs     提交信息输入栏（基于 tui-textarea-2，unicode-width 光标）
-│   ├── log.rs        日志标签页（修订列表 + 详情）
+│   ├── commit.rs     提交信息输入栏（基于 tui-textarea-2，unicode-width 光标，
+│   │                 Tab 弹出最近 10 条提交信息快速填充，支持 bracketed paste）
+│   ├── log.rs        日志标签页（修订列表 + 详情 + `/` 关键字搜索 + space 多选合并 diff）
+│   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
+│   ├── file_finder.rs  fzf 式模糊文件搜索弹窗（数据源 svn list -R .@HEAD，
+│   │                   匹配用 fuzzy-matcher crate = skim 的 SkimMatcherV2）
 │   ├── blame.rs      blame 弹窗
 │   └── help.rs       帮助弹窗
 ├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff 弹窗（enum Popup 分发，无 downcast）
@@ -90,7 +96,7 @@ parsers/parse_diff_50k           ~1.5 ms
 
 ```bash
 cargo build                 # 开发构建
-cargo test                  # 112 个测试（含 7 个性能门禁；部分会创建真实临时 SVN 仓库）
+cargo test                  # 152 个测试（含 7 个性能门禁；部分会创建真实临时 SVN 仓库）
 cargo bench --bench tree     # criterion 性能基准（超大型工作副本）
 cargo test <name>           # 跑单个测试
 cargo llvm-cov              # 覆盖率报告（需 cargo-llvm-cov + llvm-tools-preview）
@@ -110,8 +116,21 @@ cargo fmt --all --check     # 格式门禁
 - 新增用户可见文本：加到 `strings.rs`。
 - 弹窗加进 `popups/mod.rs` 的 `enum Popup`，不要在 App 里用 downcast。
 - 解析器（`svn/parser.rs`）保持纯函数、无 IO，方便单元测试。
+- 依赖策略：简单逻辑手写，不引入新 crate；只有复杂且易错的逻辑（如 fuzzy 匹配打分，
+  用 `fuzzy-matcher`）才引入流行的纯 Rust 库——需无 unsafe、无 build script、维护活跃。
+  已刻意移除的依赖：`clap`（单个可选位置参数，`main.rs` 里手写 `parse_args` 即可）、
+  `bitflags`（`NeedsUpdate` 只有 3 个标志位，`queue.rs` 里手写位运算）。
 
 ## SVN 输出格式要点（解析器已处理，改代码前先读）
+
+- **所有 svn 子进程（含测试辅助）都固定英文消息**（`Svn::run_in` / `test_support::svn`：
+  `env_remove("LC_ALL")` + `LC_MESSAGES=C`）：svn 用 gettext 本地化输出（如中文 locale 下
+  `Path:` 变 `路径:`），解析器依赖英文文本。**不能用 `LC_ALL=C`**——那会把 native 编码
+  固定为 ASCII，导致非 ASCII 的 log 输出变成 `{U+XXXX}` 转义、中文 `-m` 提交报 E000022；
+  `LC_MESSAGES` 只控制消息目录语言，字符编码仍跟随用户 locale（LC_CTYPE/LANG）。
+  新增解析逻辑时不要绕开这两个入口直接起 svn 进程。
+- `svn commit` 必须带 `--encoding UTF-8`：`-m` 消息是 UTF-8 字节，不显式声明时 svn 按
+  native 编码解释（非 UTF-8 locale 下中文消息会被拒）。
 
 - `svn status`：7 列状态字符后接路径（路径从第 8 个字符开始，实际验证于 svn 1.14.5）。
 - `svn log`：**必须显式传范围** `-r HEAD:0 -l N`（`HEAD:1` 在 r0 空仓库上报 E160006），否则可能无输出。
@@ -119,10 +138,14 @@ cargo fmt --all --check     # 格式门禁
   （读文件内容直接显示）。
 - `svn blame` 格式：`%6s %10s %s`（修订号右对齐 6、作者右对齐 10、内容从第 18 列开始，
   前导缩进要保留）。
+- `svn info` 的 `Revision` 是工作副本根目录的 BASE 修订：SVN 是混合修订工作副本，
+  子文件提交后根目录修订在 `svn update` 前不会变。分支名取 `Relative URL`（去掉 `^/`）。
+- `svn list -R` 必须带 `.@HEAD` peg：不带时按 wc 根目录的 BASE 修订列举，
+  提交后未 update 时可能列出旧内容甚至为空。
 - `svn commit -m "docs"` 这类"像路径"的消息会报 E205005，需要 `--force-log` 或用更长文本。
 - `svn revert` 一个刚 add 的文件：取消 add，文件留在磁盘上（变成 `?`）。
 
-## 测试策略（覆盖率 ~94% 的构成）
+## 测试策略（覆盖率 ~95% 的构成）
 
 - **解析器/模型**：构造输出样本做单元测试。
 - **UI 组件**：`test_support::render` 用 `ratatui::TestBackend` 离屏绘制 + 合成 crossterm 事件。

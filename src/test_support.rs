@@ -84,9 +84,15 @@ pub fn write_file(path: &Path, content: &str) {
 }
 
 /// Run `svn` in a directory; returns stdout. Panics on failure.
+///
+/// Like the app's `run_in`, this pins English messages (LC_MESSAGES=C) so
+/// assertions on svn output hold regardless of the test runner's locale,
+/// while leaving the locale codeset (UTF-8) intact for non-ASCII data.
 pub fn svn(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("svn")
         .args(args)
+        .env_remove("LC_ALL")
+        .env("LC_MESSAGES", "C")
         .current_dir(cwd)
         .output()
         .expect("run svn");

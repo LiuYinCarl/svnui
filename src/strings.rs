@@ -8,6 +8,8 @@ pub struct Title {
     pub blame: &'static str,
     pub confirm: &'static str,
     pub message: &'static str,
+    pub file_history: &'static str,
+    pub file_finder: &'static str,
 }
 
 pub const TITLE: Title = Title {
@@ -18,6 +20,8 @@ pub const TITLE: Title = Title {
     blame: "Blame",
     confirm: "Confirm",
     message: "Message",
+    file_history: "File history",
+    file_finder: "Find file",
 };
 
 pub struct Msg {

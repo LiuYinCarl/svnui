@@ -136,6 +136,17 @@ impl StatusTab {
         };
     }
 
+    /// Files the next commit would include: the staged set when non-empty,
+    /// otherwise all changed files.
+    pub fn commit_targets(&self) -> Vec<(char, String)> {
+        let staged = self.tree.staged_files();
+        if staged.is_empty() {
+            self.tree.changed_files()
+        } else {
+            staged
+        }
+    }
+
     pub fn set_staged(&mut self, paths: &[String]) {
         self.tree.set_staged(paths);
         self.update_commit_hint();

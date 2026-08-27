@@ -1,5 +1,28 @@
 //! Data models for SVN entities.
 
+/// Working copy info from `svn info`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SvnInfo {
+    /// Full URL of the working copy root
+    pub url: String,
+    /// Branch path relative to the repository root (e.g. "trunk",
+    /// "branches/feature-x"); empty when svn reports no Relative URL
+    pub branch: String,
+    /// Current working copy revision
+    pub revision: u64,
+}
+
+impl SvnInfo {
+    /// Short label for the status bar / confirm dialogs.
+    pub fn branch_label(&self) -> &str {
+        if self.branch.is_empty() {
+            &self.url
+        } else {
+            &self.branch
+        }
+    }
+}
+
 /// A single entry from `svn status`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusEntry {
@@ -111,6 +134,22 @@ pub struct TreeItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svn_info_branch_label() {
+        let info = SvnInfo {
+            url: "file:///repo/trunk".into(),
+            branch: "trunk".into(),
+            revision: 42,
+        };
+        assert_eq!(info.branch_label(), "trunk");
+        let no_rel = SvnInfo {
+            url: "file:///repo/trunk".into(),
+            branch: String::new(),
+            revision: 1,
+        };
+        assert_eq!(no_rel.branch_label(), "file:///repo/trunk");
+    }
 
     #[test]
     fn conflicted_detection() {

@@ -7,7 +7,7 @@ use crate::popups::Popup;
 use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Queue, Tab};
 use crate::status::StatusTab;
 use crate::strings::MSG;
-use crate::svn::models::BlameLine;
+use crate::svn::models::{BlameLine, SvnInfo};
 use crate::svn::{AsyncSvnNotification, Svn};
 use crate::ui;
 use crossterm::event::Event;
@@ -22,6 +22,8 @@ use std::path::PathBuf;
 enum PendingFullscreen {
     File(String),
     Revision(u64),
+    /// Combined diff of revisions `from..=to`
+    Range(u64, u64),
 }
 
 pub struct App {
@@ -32,6 +34,8 @@ pub struct App {
     pub log: LogComponent,
     pub active_tab: Tab,
     pub popups: Vec<Popup>,
+    /// Working copy info (URL / branch / revision), loaded at startup
+    pub svn_info: Option<SvnInfo>,
     /// Number of outstanding async operations (drives the spinner)
     pub pending: usize,
     pub quitting: bool,
@@ -52,6 +56,7 @@ impl App {
             ctx,
             active_tab: Tab::Status,
             popups: Vec::new(),
+            svn_info: None,
             pending: 0,
             quitting: false,
             fatal_error: None,
@@ -140,6 +145,11 @@ impl App {
         } else if key_match(k, KeyAction::Help) {
             let ctx = self.ctx.clone();
             self.push_popup(Popup::help(&ctx));
+        } else if key_match(k, KeyAction::OpenFileFinder) {
+            let ctx = self.ctx.clone();
+            self.push_popup(Popup::file_finder(&ctx));
+            self.svn.list_files();
+            self.pending += 1;
         } else if key_match(k, KeyAction::FocusNext) {
             if self.active_tab == Tab::Status {
                 self.status.cycle_focus(true);
@@ -213,17 +223,7 @@ impl App {
                             self.show_error("Commit message is empty".to_string());
                             return;
                         }
-                        let what = if paths.is_empty() {
-                            let staged = self.status.tree.staged_count();
-                            if staged > 0 {
-                                format!("{} ({staged} files)", MSG.commit_staged)
-                            } else {
-                                MSG.commit_all.to_string()
-                            }
-                        } else {
-                            format!("{} ({} files)", MSG.commit_staged, paths.len())
-                        };
-                        format!("{what}\n\n\"{}\"", message.trim())
+                        self.commit_confirm_message(message, paths)
                     }
                     ConfirmAction::Revert(paths) => {
                         format!("{} ({})", MSG.revert_confirm, paths.join(", "))
@@ -282,7 +282,79 @@ impl App {
                 self.svn.revision_diff(rev);
                 self.pending += 1;
             }
+            InternalEvent::RequestRangeDiff(revs) => {
+                if let (Some(&from), Some(&to)) = (revs.iter().min(), revs.iter().max()) {
+                    self.pending_fullscreen = Some(PendingFullscreen::Range(from, to));
+                    self.svn.range_diff(from, to);
+                    self.pending += 1;
+                }
+            }
+            InternalEvent::RequestFileHistory => {
+                if let Some(e) = self.status.tree.selection_entry() {
+                    if !e.is_dir && e.status == '?' {
+                        self.show_error("svn log: file is not under version control".to_string());
+                    } else if !e.is_dir {
+                        let path = e.path.clone();
+                        self.open_file_history(&path);
+                    }
+                }
+            }
+            InternalEvent::OpenFileHistory(path) => {
+                self.open_file_history(&path);
+            }
+            InternalEvent::OpenFileFinder => {
+                let ctx = self.ctx.clone();
+                self.push_popup(Popup::file_finder(&ctx));
+                self.svn.list_files();
+                self.pending += 1;
+            }
         }
+    }
+
+    /// Push the file-history popup and load its log asynchronously.
+    fn open_file_history(&mut self, path: &str) {
+        let ctx = self.ctx.clone();
+        self.push_popup(Popup::file_log(&ctx, path));
+        self.svn.file_log(path, 50);
+        self.pending += 1;
+    }
+
+    /// The commit confirmation message: target branch, the files that will
+    /// be committed, and the commit message.
+    fn commit_confirm_message(&self, message: &str, paths: &[String]) -> String {
+        let branch = self
+            .svn_info
+            .as_ref()
+            .map(|i| i.branch_label().to_string())
+            .unwrap_or_else(|| "(unknown branch)".to_string());
+        // what will actually be committed mirrors `perform_confirmed`:
+        // explicit paths > staged set > all changes
+        let targets: Vec<(char, String)> = if !paths.is_empty() {
+            paths
+                .iter()
+                .map(|p| (self.status.tree.status_char(p), p.clone()))
+                .collect()
+        } else {
+            self.status.commit_targets()
+        };
+        let what = if paths.is_empty() && self.status.tree.staged_count() == 0 {
+            MSG.commit_all.to_string()
+        } else {
+            format!("{} ({} files)", MSG.commit_staged, targets.len())
+        };
+        const MAX_LISTED: usize = 8;
+        let mut out = format!("{what}\nTarget branch: {branch}\n");
+        if !targets.is_empty() {
+            out.push_str("\nFiles:\n");
+            for (status, path) in targets.iter().take(MAX_LISTED) {
+                out.push_str(&format!("  {status} {path}\n"));
+            }
+            if targets.len() > MAX_LISTED {
+                out.push_str(&format!("  … and {} more\n", targets.len() - MAX_LISTED));
+            }
+        }
+        out.push_str(&format!("\n\"{}\"", message.trim()));
+        out
     }
 
     fn perform_confirmed(&mut self, action: ConfirmAction) {
@@ -319,7 +391,8 @@ impl App {
         self.pending = self.pending.saturating_sub(1);
         match notif {
             AsyncSvnNotification::Info(result) => match result {
-                Ok(()) => {
+                Ok(info) => {
+                    self.svn_info = Some(info);
                     self.svn.status();
                     self.svn.log(50);
                     self.pending += 2;
@@ -356,8 +429,79 @@ impl App {
                 }
             },
             AsyncSvnNotification::Log(result) => match result {
-                Ok(entries) => self.log.update(entries),
+                Ok(entries) => {
+                    // keep the commit input's Tab picker stocked with the
+                    // most recent commit messages
+                    let history: Vec<String> = entries
+                        .iter()
+                        .map(|e| e.summary())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    self.status.commit.set_history(history);
+                    self.log.update(entries);
+                }
                 Err(e) => self.show_error(format!("svn log: {e}")),
+            },
+            AsyncSvnNotification::FileLog { path, result } => match result {
+                Ok(entries) => {
+                    for popup in self.popups.iter_mut().rev() {
+                        if let Popup::FileLog(fl) = popup
+                            && fl.path == path
+                        {
+                            fl.update(entries);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // leave no popup stuck on "Loading..."
+                    for popup in self.popups.iter_mut().rev() {
+                        if let Popup::FileLog(fl) = popup
+                            && fl.path == path
+                        {
+                            fl.pending = false;
+                            break;
+                        }
+                    }
+                    self.show_error(format!("svn log {path}: {e}"));
+                }
+            },
+            AsyncSvnNotification::ListFiles(result) => match result {
+                Ok(files) => {
+                    for popup in self.popups.iter_mut().rev() {
+                        if let Popup::FileFinder(ff) = popup {
+                            ff.update(files);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    for popup in self.popups.iter_mut().rev() {
+                        if let Popup::FileFinder(ff) = popup {
+                            ff.pending = false;
+                            break;
+                        }
+                    }
+                    self.show_error(format!("svn list: {e}"));
+                }
+            },
+            AsyncSvnNotification::RangeDiff { from, to, result } => match result {
+                Ok(content) => {
+                    if let Some(PendingFullscreen::Range(f, t)) = &self.pending_fullscreen
+                        && *f == from
+                        && *t == to
+                    {
+                        self.pending_fullscreen = None;
+                        self.show_diff_popup(format!("Diff r{from}..r{to}"), &content);
+                    }
+                }
+                Err(e) => {
+                    if matches!(&self.pending_fullscreen, Some(PendingFullscreen::Range(f, t)) if *f == from && *t == to)
+                    {
+                        self.pending_fullscreen = None;
+                    }
+                    self.show_error(format!("svn diff -r {from}:{to}: {e}"));
+                }
             },
             AsyncSvnNotification::RevisionDiff { revision, result } => match result {
                 Ok(content) => {
@@ -418,6 +562,13 @@ impl App {
                     self.status.commit.unfocus();
                     self.show_output("svn commit".to_string(), &out);
                     self.refresh_after_op();
+                    // the commit input's Tab picker is fed from the log —
+                    // refresh it so the new commit shows up there too
+                    // (refresh_after_op only reloads the log in the log tab)
+                    if self.active_tab != Tab::Log {
+                        self.svn.log(50);
+                        self.pending += 1;
+                    }
                 }
                 Err(e) => self.show_error(format!("svn commit: {e}")),
             },
@@ -507,6 +658,13 @@ impl App {
     fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
         let theme = &self.ctx.theme;
         let mut spans = Vec::new();
+        // current branch, always visible
+        if let Some(info) = &self.svn_info {
+            spans.push(Span::styled(
+                format!("[{}] ", ui::truncate(info.branch_label(), 40)),
+                theme.log_revision,
+            ));
+        }
         if self.pending > 0 {
             let frame = ui::spinner_frame(self.spinner_frame.get());
             spans.push(Span::styled(format!("{frame} "), theme.info));
@@ -521,7 +679,7 @@ impl App {
             ));
         }
         spans.push(Span::styled(
-            "? help  c commit  u update  F5 refresh  q quit  [1]status [2]log",
+            "? help  c commit  u update  ^P find  F5 refresh  q quit  [1]status [2]log",
             theme.dim,
         ));
         let line = Line::from(spans);
@@ -534,13 +692,21 @@ mod tests {
     use super::*;
     use crate::components::Context;
     use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Tab};
-    use crate::svn::models::{BlameLine, LogEntry, StatusEntry};
+    use crate::svn::models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
     use crate::test_support::{self, TestRepo};
     use crate::ui::style::Theme;
     use crossbeam_channel::unbounded;
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
     use std::time::Duration;
+
+    fn test_info() -> SvnInfo {
+        SvnInfo {
+            url: "file:///repo/trunk".into(),
+            branch: "trunk".into(),
+            revision: 3,
+        }
+    }
 
     fn entry(status: char, path: &str) -> StatusEntry {
         StatusEntry {
@@ -586,9 +752,9 @@ mod tests {
         let (mut app, rx) = app_with(&repo);
         app.start();
         // wait for the working-copy check
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Info(Ok(()))));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Info(Ok(_))));
         // processing it triggers status + log fetches (order not guaranteed)
-        app.handle_async(AsyncSvnNotification::Info(Ok(())));
+        app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
         let first = recv(&rx);
         let second = recv(&rx);
         assert!(matches!(
@@ -745,14 +911,23 @@ mod tests {
         ));
         app.handle_async(AsyncSvnNotification::Update(Err("network down".into())));
 
-        // commit ok → clears staged, output popup, refresh
+        // commit ok → clears staged, output popup, refresh (status + log;
+        // the failed update above also left a status result in the channel)
         app.status.set_staged(&["a.txt".into()]);
         app.handle_async(AsyncSvnNotification::Commit(Ok(
             "Committed revision 9.\n".into()
         )));
         assert_eq!(app.status.tree.staged_count(), 0);
         assert!(matches!(app.popups.last(), Some(Popup::Output(_))));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        let msgs = [recv(&rx), recv(&rx), recv(&rx)];
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AsyncSvnNotification::Status(_)))
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AsyncSvnNotification::Log(_)))
+        );
 
         // commit error → error popup, staged stays
         app.status.set_staged(&["a.txt".into()]);
@@ -1087,6 +1262,192 @@ mod tests {
             m2,
             AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
         ));
+    }
+
+    #[test]
+    fn info_stores_branch_and_status_bar_shows_it() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
+        assert_eq!(app.svn_info.as_ref().unwrap().branch, "trunk");
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f).unwrap()).unwrap();
+        let s = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(s.contains("[trunk]"), "{s}");
+    }
+
+    #[test]
+    fn commit_confirm_shows_branch_and_file_list() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
+        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
+            entry('M', "a.txt"),
+            entry('M', "src/b.rs"),
+        ])));
+        app.status.set_staged(&["src/b.rs".into()]);
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Commit {
+                message: "my commit".into(),
+                paths: vec![],
+            }));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p.message.contains("Target branch: trunk"), "{}", p.message);
+        assert!(p.message.contains("M src/b.rs"), "{}", p.message);
+        // only the staged file is listed
+        assert!(!p.message.contains("a.txt"), "{}", p.message);
+        assert!(p.message.contains("\"my commit\""), "{}", p.message);
+    }
+
+    #[test]
+    fn range_diff_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.queue
+            .push(InternalEvent::RequestRangeDiff(vec![3, 1, 2]));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RangeDiff { from: 1, to: 3, .. }
+        ));
+        app.handle_async(AsyncSvnNotification::RangeDiff {
+            from: 1,
+            to: 3,
+            result: Ok("Index: a\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
+        // error path clears the pending request
+        app.queue.push(InternalEvent::RequestRangeDiff(vec![1, 2]));
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::RangeDiff {
+            from: 1,
+            to: 2,
+            result: Err("boom".into()),
+        });
+        assert!(app.pending_fullscreen.is_none());
+    }
+
+    #[test]
+    fn file_history_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
+            'M', "main.rs",
+        )])));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
+        // request history of the selected file
+        app.queue.push(InternalEvent::RequestFileHistory);
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::FileLog(_))));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::FileLog { .. }));
+        app.handle_async(AsyncSvnNotification::FileLog {
+            path: "main.rs".into(),
+            result: Ok(vec![log_entry(3, "three")]),
+        });
+        let loaded = app
+            .popups
+            .iter()
+            .any(|p| matches!(p, Popup::FileLog(fl) if !fl.pending && fl.entries.len() == 1));
+        assert!(loaded);
+        // error path: popup leaves Loading state, error is shown
+        app.handle_async(AsyncSvnNotification::FileLog {
+            path: "main.rs".into(),
+            result: Err("boom".into()),
+        });
+        assert!(app.popups.iter().any(|p| matches!(p, Popup::Msg(_))));
+
+        // unversioned file → error message, no popup
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
+            '?', "new.txt",
+        )])));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
+        app.queue.push(InternalEvent::RequestFileHistory);
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        assert!(!app.popups.iter().any(|p| matches!(p, Popup::FileLog(_))));
+    }
+
+    #[test]
+    fn file_finder_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.queue.push(InternalEvent::OpenFileFinder);
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::FileFinder(_))));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::ListFiles(_)));
+        app.handle_async(AsyncSvnNotification::ListFiles(Ok(vec![
+            "src/main.rs".into(),
+        ])));
+        let loaded = app
+            .popups
+            .iter()
+            .any(|p| matches!(p, Popup::FileFinder(ff) if !ff.pending && ff.files.len() == 1));
+        assert!(loaded);
+        // Enter on the single file: finder closes, file history opens
+        app.handle_input(&ts_key(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.popups.last(), Some(Popup::FileLog(_))));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::FileLog { .. }));
+        // error path: finder leaves Loading state
+        app.queue.push(InternalEvent::OpenFileFinder);
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::ListFiles(Err("boom".into())));
+        let unpend = app
+            .popups
+            .iter()
+            .any(|p| matches!(p, Popup::FileFinder(ff) if !ff.pending));
+        assert!(unpend);
+    }
+
+    #[test]
+    fn ctrl_p_opens_file_finder() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let ctrl_p = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_input(&ctrl_p).unwrap();
+        assert!(matches!(app.popups.last(), Some(Popup::FileFinder(_))));
+    }
+
+    #[test]
+    fn log_load_stocks_commit_history_picker() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
+            log_entry(3, "third"),
+            log_entry(2, "second"),
+        ])));
+        // focus the commit input and press Tab → the picker opens
+        app.queue.push(InternalEvent::OpenCommit);
+        app.handle_queue_events();
+        app.handle_input(&ts_key(KeyCode::Tab)).unwrap();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f).unwrap()).unwrap();
+        let s = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(s.contains("Recent commit messages"), "{s}");
+        assert!(s.contains("third"), "{s}");
+        assert!(s.contains("second"), "{s}");
     }
 
     fn ts_key(code: crossterm::event::KeyCode) -> crossterm::event::Event {

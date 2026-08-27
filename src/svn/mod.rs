@@ -8,7 +8,7 @@ pub mod models;
 pub mod parser;
 
 use crossbeam_channel::Sender;
-use models::{BlameLine, LogEntry, StatusEntry};
+use models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,15 +16,28 @@ use std::process::Command;
 #[derive(Clone, Debug)]
 pub enum AsyncSvnNotification {
     /// Working copy check at startup
-    Info(Result<(), String>),
+    Info(Result<SvnInfo, String>),
     Status(Result<Vec<StatusEntry>, String>),
     Diff {
         path: String,
         result: Result<String, String>,
     },
     Log(Result<Vec<LogEntry>, String>),
+    /// `svn log` restricted to a single file
+    FileLog {
+        path: String,
+        result: Result<Vec<LogEntry>, String>,
+    },
+    /// All versioned files in the working copy (`svn list -R`)
+    ListFiles(Result<Vec<String>, String>),
     RevisionDiff {
         revision: u64,
+        result: Result<String, String>,
+    },
+    /// Combined diff of a revision range (`svn diff -r from-1:to`)
+    RangeDiff {
+        from: u64,
+        to: u64,
         result: Result<String, String>,
     },
     Blame {
@@ -66,11 +79,12 @@ impl Svn {
 
     // ----- async entry points -----
 
-    /// Check whether cwd is a valid working copy (`svn info`).
+    /// Check whether cwd is a valid working copy (`svn info`) and return
+    /// the parsed URL/branch/revision for display.
     pub fn check_info(&self) {
         let cwd = self.cwd.clone();
         self.spawn(move || {
-            let result = Self::run_in(&cwd, &["info"]).map(|_| ());
+            let result = Self::run_in(&cwd, &["info"]).map(|text| parser::parse_info(&text));
             AsyncSvnNotification::Info(result)
         });
     }
@@ -131,11 +145,64 @@ impl Svn {
         });
     }
 
+    /// `svn log` restricted to a single file (its history).
+    pub fn file_log(&self, path: &str, limit: usize) {
+        let cwd = self.cwd.clone();
+        let path = path.to_string();
+        self.spawn(move || {
+            let result = Self::run_in(
+                &cwd,
+                &[
+                    "log",
+                    "-v",
+                    "-r",
+                    "HEAD:0",
+                    "-l",
+                    &limit.to_string(),
+                    "--",
+                    &path,
+                ],
+            )
+            .map(|out| parser::parse_log(&out));
+            AsyncSvnNotification::FileLog { path, result }
+        });
+    }
+
+    /// List all versioned files in the working copy (`svn list -R`).
+    /// Directory entries (trailing '/') are filtered out.
+    ///
+    /// The `.@HEAD` peg is required: plain `svn list -R` lists the wc root
+    /// at its BASE revision, which in a mixed-revision working copy (e.g.
+    /// right after a commit, before update) can be stale or even empty.
+    pub fn list_files(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(move || {
+            let result = Self::run_in(&cwd, &["list", "-R", ".@HEAD"]).map(|out| {
+                out.lines()
+                    .map(|l| l.trim_end_matches('\r'))
+                    .filter(|l| !l.is_empty() && !l.ends_with('/'))
+                    .map(str::to_string)
+                    .collect()
+            });
+            AsyncSvnNotification::ListFiles(result)
+        });
+    }
+
     pub fn revision_diff(&self, revision: u64) {
         let cwd = self.cwd.clone();
         self.spawn(move || {
             let result = Self::run_in(&cwd, &["diff", "-c", &revision.to_string()]);
             AsyncSvnNotification::RevisionDiff { revision, result }
+        });
+    }
+
+    /// Combined diff of the revisions `from..=to` (`svn diff -r from-1:to`).
+    pub fn range_diff(&self, from: u64, to: u64) {
+        let cwd = self.cwd.clone();
+        self.spawn(move || {
+            let range = format!("{}:{to}", from.saturating_sub(1));
+            let result = Self::run_in(&cwd, &["diff", "-r", &range]);
+            AsyncSvnNotification::RangeDiff { from, to, result }
         });
     }
 
@@ -203,11 +270,16 @@ impl Svn {
         let message = message.to_string();
         let paths = paths.to_vec();
         self.spawn(move || {
-            let has_dir = paths.iter().any(|p| cwd.join(p).is_dir());
+            // Explicit file targets are committed exactly as listed (the
+            // obsolete -N/--non-recursive flag is deliberately not used: it
+            // is a no-op for file targets and may disappear in future svn).
             let mut args: Vec<String> = vec!["commit".into()];
-            if !paths.is_empty() && !has_dir {
-                args.push("-N".into()); // non-recursive: only listed files
-            }
+            // The message is UTF-8; say so explicitly, otherwise svn
+            // interprets -m in the "native" encoding, which is ASCII under
+            // the LC_ALL=C forced by run_in, and non-ASCII messages are
+            // rejected with E000022 ("Can't convert string ... to 'UTF-8'").
+            args.push("--encoding".into());
+            args.push("UTF-8".into());
             args.push("-m".into());
             args.push(message);
             args.push("--".into());
@@ -223,6 +295,16 @@ impl Svn {
     fn run_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
         let out = Command::new("svn")
             .arg("--non-interactive")
+            // Keep svn's messages English (the parsers match "Changed
+            // paths:", "Index:", the status columns, ...) without forcing
+            // the C *encoding*: LC_ALL=C would make ASCII the native
+            // encoding, escaping non-ASCII log output as {U+XXXX} and
+            // rejecting non-ASCII -m messages. LC_MESSAGES only selects
+            // the gettext catalog; the codeset still follows the user's
+            // locale (LC_CTYPE/LANG). Drop any inherited LC_ALL, which
+            // would override LC_MESSAGES.
+            .env_remove("LC_ALL")
+            .env("LC_MESSAGES", "C")
             .args(args)
             .current_dir(cwd)
             .output()
@@ -254,7 +336,14 @@ mod tests {
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
         c.check_info();
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Info(Ok(()))));
+        match recv(&rx) {
+            AsyncSvnNotification::Info(Ok(info)) => {
+                assert!(info.url.contains("file://"), "{info:?}");
+                // NB: the wc *root dir* revision stays at its BASE value in
+                // a mixed-revision working copy, so no assertion on it here
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
 
         // not a working copy
         let dir = std::env::temp_dir().join(format!("svnui-nonwc-{}", std::process::id()));
@@ -438,6 +527,36 @@ mod tests {
         }
     }
 
+    /// Non-ASCII (CJK) log messages must survive a round trip: the forced
+    /// LC_MESSAGES=C pins English keywords but leaves the UTF-8 codeset,
+    /// and commit passes --encoding UTF-8 so -m is not misread as ASCII.
+    /// Regression test for E000022 "Can't convert string ... to 'UTF-8'"
+    /// and for log output showing "{U+6D4B}..." escapes.
+    #[test]
+    fn commit_and_log_cjk_message() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+        c.commit("测试一下提交吧", &["Cargo.toml".to_string()]);
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(out)) => {
+                assert!(out.contains("Committed revision 2"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        c.log(1);
+        match recv(&rx) {
+            AsyncSvnNotification::Log(Ok(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].message, "测试一下提交吧");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[test]
     fn diff_missing_file_falls_back_to_empty() {
         let Some(repo) = TestRepo::new() else { return };
@@ -449,6 +568,75 @@ mod tests {
                 ..
             } => {
                 assert!(content.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_log_lists_only_touching_revisions() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+        repo.svn(&["commit", "-m", "bump cargo"]);
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.file_log("Cargo.toml", 50);
+        match recv(&rx) {
+            AsyncSvnNotification::FileLog { path, result } => {
+                assert_eq!(path, "Cargo.toml");
+                let entries = result.unwrap();
+                // both r1 (add) and r2 (bump) touched Cargo.toml
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].revision, 2);
+                assert_eq!(entries[0].message, "bump cargo");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // error path: unversioned file
+        c.file_log("no-such-file.txt", 50);
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::FileLog { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
+    fn list_files_returns_versioned_files_only() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("unversioned.txt"), "x\n");
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).list_files();
+        match recv(&rx) {
+            AsyncSvnNotification::ListFiles(Ok(files)) => {
+                assert!(files.contains(&"Cargo.toml".to_string()), "{files:?}");
+                assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
+                assert!(files.contains(&"docs/readme.md".to_string()), "{files:?}");
+                // dirs are stripped, unversioned files absent
+                assert!(!files.iter().any(|f| f.ends_with('/')));
+                assert!(!files.contains(&"unversioned.txt".to_string()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_diff_combines_revisions() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+        repo.svn(&["commit", "-m", "r2"]);
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 3\n");
+        repo.svn(&["commit", "-m", "r3"]);
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.range_diff(2, 3);
+        match recv(&rx) {
+            AsyncSvnNotification::RangeDiff { from, to, result } => {
+                assert_eq!((from, to), (2, 3));
+                let content = result.unwrap();
+                assert!(content.contains("Index: Cargo.toml"), "{content}");
+                // combined diff goes straight from r1 content to r3 content
+                assert!(content.contains("-version = 1"), "{content}");
+                assert!(content.contains("+version = 3"), "{content}");
             }
             other => panic!("unexpected: {other:?}"),
         }

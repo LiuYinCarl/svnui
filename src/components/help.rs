@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, Borders, Clear};
 use std::cell::Cell;
 
 pub struct HelpPopup {
@@ -29,6 +29,9 @@ impl HelpPopup {
 impl DrawableComponent for HelpPopup {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
+        // clear the cells behind the popup so the underlying tab content
+        // does not bleed through
+        f.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.popup_border))

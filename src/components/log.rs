@@ -6,7 +6,7 @@ use crate::queue::{ConfirmAction, InternalEvent};
 use crate::strings::TITLE;
 use crate::svn::models::LogEntry;
 use crate::ui::{self, style::Theme};
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -17,11 +17,17 @@ use std::cell::Cell;
 pub struct LogComponent {
     ctx: Context,
     pub entries: Vec<LogEntry>,
+    /// Index into the *filtered* view (see `visible_indices`)
     selection: usize,
     scroll: Cell<usize>,
     detail_scroll: Cell<usize>,
     pub pending: bool,
     pub focused: bool,
+    /// Keyword filter over revision/author/message (`/`)
+    filter: String,
+    filter_active: bool,
+    /// Marked revisions for a combined diff (`space`)
+    pub marks: std::collections::BTreeSet<u64>,
 }
 
 impl LogComponent {
@@ -34,21 +40,49 @@ impl LogComponent {
             detail_scroll: Cell::new(0),
             pending: true,
             focused: true,
+            filter: String::new(),
+            filter_active: false,
+            marks: std::collections::BTreeSet::new(),
         }
     }
 
     pub fn update(&mut self, entries: Vec<LogEntry>) {
         self.pending = false;
         self.entries = entries;
-        self.selection = self.selection.min(self.entries.len().saturating_sub(1));
+        let len = self.visible_indices().len();
+        self.selection = self.selection.min(len.saturating_sub(1));
+    }
+
+    /// Indices into `entries` that match the current filter.
+    fn visible_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        let f = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.message.to_lowercase().contains(&f)
+                    || e.author.to_lowercase().contains(&f)
+                    || e.revision.to_string().contains(&f)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn selection_entry(&self) -> Option<&LogEntry> {
+        let visible = self.visible_indices();
+        let idx = visible.get(self.selection)?;
+        self.entries.get(*idx)
     }
 
     pub fn selection_revision(&self) -> Option<u64> {
-        self.entries.get(self.selection).map(|e| e.revision)
+        self.selection_entry().map(|e| e.revision)
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.entries.len();
+        let len = self.visible_indices().len();
         if len == 0 {
             return;
         }
@@ -57,10 +91,56 @@ impl LogComponent {
         self.detail_scroll.set(0);
     }
 
+    fn toggle_mark(&mut self) {
+        if let Some(rev) = self.selection_revision()
+            && !self.marks.remove(&rev)
+        {
+            self.marks.insert(rev);
+        }
+    }
+
+    /// Request a diff: combined when ≥2 revisions are marked, otherwise
+    /// the diff of the selected revision.
+    fn request_diff(&mut self) {
+        if self.marks.len() >= 2 {
+            let revs: Vec<u64> = self.marks.iter().copied().collect();
+            self.ctx.queue.push(InternalEvent::RequestRangeDiff(revs));
+        } else if let Some(rev) = self.selection_revision() {
+            self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev));
+        }
+    }
+
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
         let Event::Key(k) = ev else {
             return Ok(EventState::not_consumed());
         };
+
+        // search input mode captures everything
+        if self.filter_active {
+            match k.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.filter_active = false;
+                    self.selection = 0;
+                }
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.selection = 0;
+                }
+                // ignore control/alt combos (Ctrl+C must not filter 'c')
+                KeyCode::Char(c)
+                    if !k.modifiers.intersects(
+                        crossterm::event::KeyModifiers::CONTROL
+                            | crossterm::event::KeyModifiers::ALT,
+                    ) =>
+                {
+                    self.filter.push(c);
+                    self.selection = 0;
+                }
+                _ => {}
+            }
+            return Ok(EventState::consumed());
+        }
+
         if key_match(k, KeyAction::MoveUp) {
             self.move_selection(-1);
         } else if key_match(k, KeyAction::MoveDown) {
@@ -72,11 +152,13 @@ impl LogComponent {
         } else if key_match(k, KeyAction::Home) {
             self.selection = 0;
         } else if key_match(k, KeyAction::End) {
-            self.selection = self.entries.len().saturating_sub(1);
+            self.selection = self.visible_indices().len().saturating_sub(1);
+        } else if key_match(k, KeyAction::ToggleMark) {
+            self.toggle_mark();
         } else if key_match(k, KeyAction::OpenRevisionDiff) {
-            if let Some(rev) = self.selection_revision() {
-                self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev));
-            }
+            self.request_diff();
+        } else if key_match(k, KeyAction::Filter) {
+            self.filter_active = true;
         } else if key_match(k, KeyAction::UpdateToRevision) {
             if let Some(rev) = self.selection_revision() {
                 self.ctx
@@ -89,7 +171,17 @@ impl LogComponent {
                 .push(InternalEvent::Update(crate::queue::NeedsUpdate::LOG));
         } else if key_match(k, KeyAction::Help) {
             self.ctx.queue.push(InternalEvent::OpenHelp);
-        } else if key_match(k, KeyAction::Escape) || key_match(k, KeyAction::SwitchTabStatus) {
+        } else if key_match(k, KeyAction::Escape) {
+            // Esc clears an active filter first, then leaves the tab
+            if !self.filter.is_empty() {
+                self.filter.clear();
+                self.selection = 0;
+            } else {
+                self.ctx
+                    .queue
+                    .push(InternalEvent::SwitchTab(crate::queue::Tab::Status));
+            }
+        } else if key_match(k, KeyAction::SwitchTabStatus) {
             self.ctx
                 .queue
                 .push(InternalEvent::SwitchTab(crate::queue::Tab::Status));
@@ -103,6 +195,24 @@ impl LogComponent {
             return Ok(EventState::not_consumed());
         }
         Ok(EventState::consumed())
+    }
+
+    /// The `search> ...` input row at the bottom of the list pane.
+    fn draw_filter_row(&self, f: &mut Frame, inner: Rect, theme: &Theme) {
+        if !self.filter_active || inner.height == 0 {
+            return;
+        }
+        let y = inner.y + inner.height - 1;
+        ui::render_line_at(
+            f,
+            inner.x,
+            y,
+            inner.width,
+            &Line::from(vec![
+                Span::styled("search> ", theme.info),
+                Span::raw(self.filter.clone()),
+            ]),
+        );
     }
 }
 
@@ -120,10 +230,17 @@ impl DrawableComponent for LogComponent {
             .split(area);
 
         // ---- left: revision list ----
+        let mut title = TITLE.log.to_string();
+        if !self.filter.is_empty() {
+            title.push_str(&format!("  filter: \"{}\"", self.filter));
+        }
+        if !self.marks.is_empty() {
+            title.push_str(&format!("  ({} marked)", self.marks.len()));
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border))
-            .title(TITLE.log);
+            .title(title);
         let inner = block.inner(chunks[0]);
         f.render_widget(block, chunks[0]);
 
@@ -144,7 +261,8 @@ impl DrawableComponent for LogComponent {
             );
             return Ok(());
         }
-        if self.entries.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             f.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(Span::styled(
                     crate::strings::MSG.empty_log,
@@ -152,15 +270,21 @@ impl DrawableComponent for LogComponent {
                 ))),
                 inner,
             );
+            self.draw_filter_row(f, inner, theme);
             return Ok(());
         }
 
-        let mut lines: Vec<Line> = Vec::with_capacity(self.entries.len());
-        for e in &self.entries {
-            lines.push(log_list_line(e, theme));
+        // reserve the last row for the search input while it is active
+        let view_h = (inner.height as usize).saturating_sub(usize::from(self.filter_active));
+        let mut lines: Vec<Line> = Vec::with_capacity(visible.len().min(view_h.max(1)));
+        for &i in &visible {
+            lines.push(log_list_line(
+                &self.entries[i],
+                self.marks.contains(&self.entries[i].revision),
+                theme,
+            ));
         }
         let mut scroll = self.scroll.get();
-        let view_h = inner.height as usize;
         if view_h > 0 {
             if self.selection < scroll {
                 scroll = self.selection;
@@ -174,8 +298,10 @@ impl DrawableComponent for LogComponent {
         let highlights = vec![(self.selection, Style::default().bg(theme.selection_bg))];
         ui::render_lines(f, inner, &lines, scroll, &highlights);
 
+        self.draw_filter_row(f, inner, theme);
+
         // ---- right: details content ----
-        if let Some(e) = self.entries.get(self.selection) {
+        if let Some(e) = self.selection_entry() {
             let detail = detail_lines(e, theme);
             let mut dscroll = self.detail_scroll.get();
             dscroll = ui::clamp_scroll(dscroll, detail.len(), inner2.height as usize);
@@ -190,8 +316,9 @@ impl DrawableComponent for LogComponent {
     }
 }
 
-fn log_list_line(e: &LogEntry, theme: &Theme) -> Line<'static> {
+fn log_list_line(e: &LogEntry, marked: bool, theme: &Theme) -> Line<'static> {
     let mut spans = vec![
+        Span::styled(if marked { "● " } else { "  " }, theme.status_added),
         Span::styled(format!("r{}", e.revision), theme.log_revision),
         Span::raw(" "),
         Span::styled(e.author.clone(), theme.log_author),
@@ -313,6 +440,68 @@ mod tests {
             q.pop(),
             Some(InternalEvent::Confirm(ConfirmAction::UpdateToRevision(3)))
         ));
+    }
+
+    #[test]
+    fn mark_and_request_combined_diff() {
+        let (mut c, q) = comp();
+        // mark r3 and r1 with space
+        c.event(&ts::key(crossterm::event::KeyCode::Char(' ')))
+            .unwrap();
+        assert!(c.marks.contains(&3));
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        c.event(&ts::key(crossterm::event::KeyCode::Char(' ')))
+            .unwrap();
+        assert!(c.marks.contains(&1));
+        // Enter with two marks → combined range diff
+        c.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RequestRangeDiff(revs)) if revs == vec![1, 3]
+        ));
+        // unmark again → single-revision diff
+        c.event(&ts::key(crossterm::event::KeyCode::Char(' ')))
+            .unwrap(); // unmark r1
+        c.event(&ts::key(crossterm::event::KeyCode::Home)).unwrap();
+        c.event(&ts::key(crossterm::event::KeyCode::Char(' ')))
+            .unwrap(); // unmark r3
+        assert!(c.marks.is_empty());
+        c.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RequestRevisionDiff(3))
+        ));
+    }
+
+    #[test]
+    fn search_filters_by_keyword() {
+        let (mut c, _q) = comp();
+        // '/' enters search mode
+        c.event(&ts::key(crossterm::event::KeyCode::Char('/')))
+            .unwrap();
+        for ch in "second".chars() {
+            c.event(&ts::key(crossterm::event::KeyCode::Char(ch)))
+                .unwrap();
+        }
+        assert_eq!(c.selection_revision(), Some(2));
+        // Enter keeps the filter and exits input mode
+        c.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
+        assert_eq!(c.selection_revision(), Some(2));
+        // Esc clears the filter
+        c.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
+        assert_eq!(c.selection_revision(), Some(3));
+        // author / revision keywords work too
+        c.event(&ts::key(crossterm::event::KeyCode::Char('/')))
+            .unwrap();
+        c.event(&ts::key(crossterm::event::KeyCode::Char('b')))
+            .unwrap();
+        assert_eq!(c.selection_revision(), Some(2)); // bob
+        c.event(&ts::key(crossterm::event::KeyCode::Backspace))
+            .unwrap();
+        c.event(&ts::key(crossterm::event::KeyCode::Char('3')))
+            .unwrap();
+        assert_eq!(c.selection_revision(), Some(3)); // r3
+        c.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
     }
 
     #[test]

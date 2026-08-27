@@ -1,6 +1,39 @@
 //! Parsers for `svn status` / `svn log` / `svn blame` / `svn diff` output.
 
-use super::models::{BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, StatusEntry};
+use super::models::{
+    BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, StatusEntry, SvnInfo,
+};
+
+/// Parse the plain-text output of `svn info`.
+///
+/// Only the fields svnui needs are extracted: `URL`, `Relative URL`
+/// (`^/trunk`, `^/branches/x`, ... — missing on very old svn versions) and
+/// `Revision`. `Repository URL:` must not be mistaken for `URL:`.
+pub fn parse_info(output: &str) -> SvnInfo {
+    let mut url = String::new();
+    let mut branch = String::new();
+    let mut revision = 0;
+    for raw in output.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(v) = line.strip_prefix("URL:") {
+            url = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Relative URL:") {
+            // "^/branches/foo" → "branches/foo"
+            branch = v
+                .trim()
+                .trim_start_matches('^')
+                .trim_start_matches('/')
+                .to_string();
+        } else if let Some(v) = line.strip_prefix("Revision:") {
+            revision = v.trim().parse().unwrap_or(0);
+        }
+    }
+    SvnInfo {
+        url,
+        branch,
+        revision,
+    }
+}
 
 /// Parse the plain-text output of `svn status`.
 ///
@@ -52,7 +85,10 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
 
 /// Parse `svn log -v` output.
 pub fn parse_log(output: &str) -> Vec<LogEntry> {
-    const SEP: &str = "------------------------------------";
+    // svn emits a hardcoded 72-dash separator between entries. Matching the
+    // full line keeps a *message* line of dashes from being mistaken for an
+    // entry boundary.
+    const SEP: &str = "------------------------------------------------------------------------";
     let mut entries = Vec::new();
     let mut current: Option<LogEntry> = None;
     let mut message_lines: Vec<String> = Vec::new();
@@ -89,8 +125,9 @@ pub fn parse_log(output: &str) -> Vec<LogEntry> {
             continue;
         }
 
-        if line.starts_with("Changed paths:") {
-            in_message = false;
+        // The "Changed paths:" marker only appears between the header and
+        // the message; once inside the message, such a line is content
+        if !in_message && line == "Changed paths:" {
             continue;
         }
 
@@ -327,6 +364,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_info() {
+        let out = "\
+Path: .
+Working Copy Root Path: /home/user/wc
+URL: https://svn.example.com/repos/proj/branches/feature-x
+Relative URL: ^/branches/feature-x
+Repository Root: https://svn.example.com/repos/proj
+Repository UUID: 12345678-1234-1234-1234-123456789012
+Revision: 1234
+Node Kind: directory
+Schedule: normal
+Last Changed Rev: 1230
+";
+        let info = parse_info(out);
+        assert_eq!(
+            info.url,
+            "https://svn.example.com/repos/proj/branches/feature-x"
+        );
+        assert_eq!(info.branch, "branches/feature-x");
+        assert_eq!(info.revision, 1234);
+        assert_eq!(info.branch_label(), "branches/feature-x");
+    }
+
+    #[test]
+    fn test_parse_info_trunk_and_missing_relative_url() {
+        let out = "URL: file:///tmp/repo/trunk\nRelative URL: ^/trunk\nRevision: 2\n";
+        let info = parse_info(out);
+        assert_eq!(info.branch, "trunk");
+        // old svn without Relative URL: branch stays empty, label = URL
+        let old = parse_info("URL: file:///tmp/repo/trunk\nRevision: 7\n");
+        assert_eq!(old.branch, "");
+        assert_eq!(old.revision, 7);
+        assert_eq!(old.branch_label(), "file:///tmp/repo/trunk");
+    }
+
+    #[test]
     fn test_parse_status() {
         let out = "M       Cargo.toml\n?       newfile.txt\nA  +    src/foo.rs\n";
         let entries = parse_status(out, no_root());
@@ -413,6 +486,43 @@ remove old
         assert_eq!(e2.revision, 41);
         assert_eq!(e2.changed[0], ('D', "trunk/old.txt".to_string()));
         assert_eq!(e2.message, "remove old");
+    }
+
+    #[test]
+    fn test_parse_log_message_with_separator_like_lines() {
+        // A message line of dashes (fewer than the 72-dash entry separator)
+        // must stay part of the message
+        let dashes40 = "-".repeat(40);
+        let out = format!(
+            "{sep}\nr7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 3 lines\n\nbefore\n{dashes40}\nafter\n{sep}\n",
+            sep = "-".repeat(72),
+        );
+        let entries = parse_log(&out);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].message, format!("before\n{dashes40}\nafter"));
+    }
+
+    #[test]
+    fn test_parse_log_message_mentions_changed_paths() {
+        // A message line *containing* "Changed paths:" must not be eaten;
+        // the real marker line is exactly "Changed paths:" before the message
+        let out = "\
+------------------------------------------------------------------------
+r8 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 2 lines
+Changed paths:
+   M /trunk/a.txt
+
+Changed paths: this line is message content
+second line
+------------------------------------------------------------------------
+";
+        let entries = parse_log(out);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].changed.len(), 1);
+        assert_eq!(
+            entries[0].message,
+            "Changed paths: this line is message content\nsecond line"
+        );
     }
 
     #[test]

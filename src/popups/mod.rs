@@ -26,18 +26,22 @@ pub enum Popup {
     Output(OutputPopup),
     Diff(DiffPopup),
     Blame(super::components::blame::BlamePopup),
+    FileLog(super::components::file_log::FileLogPopup),
+    FileFinder(super::components::file_finder::FileFinderPopup),
 }
 
 impl Popup {
     /// The rectangle this popup occupies within the screen.
     pub fn rect(&self, area: Rect) -> Rect {
         match self {
-            Popup::Confirm(_) => ui::popup_area(area, 55, 30),
+            Popup::Confirm(_) => ui::popup_area(area, 60, 40),
             Popup::Msg(_) => ui::popup_area(area, 65, 35),
             Popup::Help(_) => ui::popup_area(area, 75, 75),
             Popup::Output(_) => ui::popup_area(area, 80, 65),
             Popup::Diff(_) => ui::popup_area(area, 92, 92),
             Popup::Blame(_) => ui::popup_area(area, 85, 85),
+            Popup::FileLog(_) => ui::popup_area(area, 75, 70),
+            Popup::FileFinder(_) => ui::popup_area(area, 70, 60),
         }
     }
 }
@@ -51,6 +55,8 @@ impl DrawableComponent for Popup {
             Popup::Output(p) => p.draw(f, area),
             Popup::Diff(p) => p.draw(f, area),
             Popup::Blame(p) => p.draw(f, area),
+            Popup::FileLog(p) => p.draw(f, area),
+            Popup::FileFinder(p) => p.draw(f, area),
         }
     }
 
@@ -62,6 +68,8 @@ impl DrawableComponent for Popup {
             Popup::Output(p) => p.event(ev),
             Popup::Diff(p) => p.event(ev),
             Popup::Blame(p) => p.event(ev),
+            Popup::FileLog(p) => p.event(ev),
+            Popup::FileFinder(p) => p.event(ev),
         }
     }
 }
@@ -85,6 +93,12 @@ impl Popup {
     }
     pub fn blame(ctx: &Context, path: &str) -> Self {
         Popup::Blame(super::components::blame::BlamePopup::new(ctx, path))
+    }
+    pub fn file_log(ctx: &Context, path: &str) -> Self {
+        Popup::FileLog(super::components::file_log::FileLogPopup::new(ctx, path))
+    }
+    pub fn file_finder(ctx: &Context) -> Self {
+        Popup::FileFinder(super::components::file_finder::FileFinderPopup::new(ctx))
     }
 }
 
@@ -117,6 +131,8 @@ mod tests {
             Popup::output(&c, "t".into(), "c"),
             Popup::diff(&c, "t".into(), "c"),
             Popup::blame(&c, "p"),
+            Popup::file_log(&c, "p"),
+            Popup::file_finder(&c),
         ];
         for p in &popups {
             let r = p.rect(area);
@@ -181,5 +197,28 @@ mod tests {
         assert!(ts::dump(&t6).contains("Blame: f.rs"));
         b.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();
+
+        let mut fl = Popup::file_log(&c, "f.rs");
+        let t7 = ts::render(60, 10, |f| {
+            fl.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
+        });
+        assert!(ts::dump(&t7).contains("File history: f.rs"));
+        fl.event(&ts::key(crossterm::event::KeyCode::Char('q')))
+            .unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(crate::queue::InternalEvent::ClosePopup)
+        ));
+
+        let mut ff = Popup::file_finder(&c);
+        let t8 = ts::render(60, 10, |f| {
+            ff.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
+        });
+        assert!(ts::dump(&t8).contains("Find file"));
+        ff.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(crate::queue::InternalEvent::ClosePopup)
+        ));
     }
 }

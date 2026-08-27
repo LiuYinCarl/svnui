@@ -4,9 +4,8 @@
 //! multiplexes three channels (input, async svn results, spinner tick)
 //! using `crossbeam_channel::select`, mirroring gitui's `main.rs`.
 
-use clap::Parser;
 use crossbeam_channel::{Receiver, select};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -27,13 +26,58 @@ type Terminal = ratatui::Terminal<CrosstermBackend<Stdout>>;
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
+/// Whether an input event should reach the app. Key *release* events (sent
+/// by terminals with the kitty keyboard protocol, and by the Windows
+/// console) are dropped: forwarding them would insert every typed character
+/// twice — most visible with IME-committed CJK text.
+fn should_forward(ev: &Event) -> bool {
+    !matches!(ev, Event::Key(k) if k.kind == KeyEventKind::Release)
+}
+
 /// Command line arguments.
-#[derive(Parser, Debug)]
-#[command(name = "svnui", version, about = "An SVN TUI client inspired by gitui")]
+#[derive(Debug, PartialEq, Eq)]
 struct CliArgs {
     /// Working copy path (defaults to the current directory)
-    #[arg(default_value = ".")]
     path: PathBuf,
+}
+
+enum CliAction {
+    Run(CliArgs),
+    Help,
+    Version,
+}
+
+const USAGE: &str = "svnui — an SVN TUI client inspired by gitui
+
+Usage: svnui [PATH]
+
+Arguments:
+  [PATH]  Working copy path [default: .]
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version";
+
+/// Parse argv (without the program name). A single optional positional
+/// argument doesn't justify pulling in clap and its derive macro tree.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<CliAction, String> {
+    let mut path: Option<PathBuf> = None;
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
+            _ => {
+                if path.is_some() {
+                    return Err(format!("unexpected extra argument: {arg}"));
+                }
+                path = Some(PathBuf::from(arg));
+            }
+        }
+    }
+    Ok(CliAction::Run(CliArgs {
+        path: path.unwrap_or_else(|| PathBuf::from(".")),
+    }))
 }
 
 /// Events multiplexed in the main loop.
@@ -44,7 +88,21 @@ enum QueueEvent {
 }
 
 fn main() -> Result<(), String> {
-    let args = CliArgs::parse();
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(CliAction::Run(args)) => args,
+        Ok(CliAction::Help) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Ok(CliAction::Version) => {
+            println!("svnui {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     let cwd = std::fs::canonicalize(&args.path)
         .map_err(|e| format!("invalid path {}: {e}", args.path.display()))?;
 
@@ -59,6 +117,9 @@ fn main() -> Result<(), String> {
         .name("input-reader".to_string())
         .spawn(move || {
             while let Ok(ev) = event::read() {
+                if !should_forward(&ev) {
+                    continue;
+                }
                 if tx_input.send(ev).is_err() {
                     break;
                 }
@@ -88,11 +149,21 @@ fn main() -> Result<(), String> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            crossterm::event::DisableBracketedPaste
+        );
         default_hook(info);
     }));
     let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+    // bracketed paste: pasted text arrives as one Event::Paste, so pasting
+    // a (multi-line, CJK) commit message never triggers stray key actions
+    if let Err(e) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    ) {
         disable_raw_mode().ok();
         return Err(format!("failed to enter alternate screen: {e}"));
     }
@@ -127,7 +198,11 @@ fn main() -> Result<(), String> {
 
     // teardown
     disable_raw_mode().ok();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        crossterm::event::DisableBracketedPaste
+    );
 
     if let Some(fatal) = app.fatal_error.clone() {
         eprintln!("{fatal}");
@@ -200,15 +275,49 @@ mod tests {
     use ratatui::backend::TestBackend;
     use svnui::app::App;
     use svnui::components::Context;
-    use svnui::svn::models::StatusEntry;
+    use svnui::svn::models::{StatusEntry, SvnInfo};
     use svnui::test_support::TestRepo;
 
     #[test]
+    fn key_release_events_are_dropped() {
+        let press = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('中'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(should_forward(&press));
+        let release = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('中'),
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(!should_forward(&release));
+        // paste / resize events pass through
+        assert!(should_forward(&Event::Paste("文本".into())));
+        assert!(should_forward(&Event::Resize(80, 24)));
+    }
+
+    #[test]
     fn cli_args_default_and_explicit() {
-        let args = CliArgs::try_parse_from(["svnui"]).unwrap();
+        let Ok(CliAction::Run(args)) = parse_args([].into_iter()) else {
+            panic!("expected Run");
+        };
         assert_eq!(args.path, PathBuf::from("."));
-        let args = CliArgs::try_parse_from(["svnui", "/tmp/repo"]).unwrap();
+        let Ok(CliAction::Run(args)) = parse_args(["/tmp/repo".to_string()].into_iter()) else {
+            panic!("expected Run");
+        };
         assert_eq!(args.path, PathBuf::from("/tmp/repo"));
+        // help / version
+        assert!(matches!(
+            parse_args(["--help".to_string()].into_iter()),
+            Ok(CliAction::Help)
+        ));
+        assert!(matches!(
+            parse_args(["-V".to_string()].into_iter()),
+            Ok(CliAction::Version)
+        ));
+        // unknown option / extra positional args are errors
+        assert!(parse_args(["--bogus".to_string()].into_iter()).is_err());
+        assert!(parse_args(["a".to_string(), "b".to_string()].into_iter()).is_err());
     }
 
     #[test]
@@ -258,7 +367,11 @@ mod tests {
         };
         let svn = svn::Svn::new(repo.wc.clone(), tx_async);
         let mut app = App::new(repo.wc.clone(), svn, ctx);
-        app.handle_async(svn::AsyncSvnNotification::Info(Ok(())));
+        app.handle_async(svn::AsyncSvnNotification::Info(Ok(SvnInfo {
+            url: "file:///repo".into(),
+            branch: "trunk".into(),
+            revision: 1,
+        })));
         app.handle_async(svn::AsyncSvnNotification::Status(Ok(vec![StatusEntry {
             status: 'M',
             props_status: ' ',

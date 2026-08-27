@@ -1,21 +1,34 @@
 //! Single-threaded event queue for components to communicate (like gitui's
 //! `queue` module).
 
-use bitflags::bitflags;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-bitflags! {
-    /// Which parts of the app need a refresh/redraw.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct NeedsUpdate: u32 {
-        /// redraw everything
-        const ALL = 0b0111;
-        /// status tree / diff may have changed
-        const STATUS = 0b0010;
-        /// log view may have changed
-        const LOG = 0b0100;
+/// Which parts of the app need a refresh/redraw.
+///
+/// Hand-rolled bit flags — three flags don't justify the bitflags crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeedsUpdate(u32);
+
+impl NeedsUpdate {
+    /// redraw everything
+    pub const ALL: Self = Self(0b0111);
+    /// status tree / diff may have changed
+    pub const STATUS: Self = Self(0b0010);
+    /// log view may have changed
+    pub const LOG: Self = Self(0b0100);
+
+    /// Whether all bits of `other` are set in `self`.
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for NeedsUpdate {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
     }
 }
 
@@ -46,8 +59,16 @@ pub enum InternalEvent {
     RequestFileDiff,
     /// Request blame of the selected file
     RequestBlame,
+    /// Request the history of the currently selected file (status tab)
+    RequestFileHistory,
+    /// Open the history popup for a specific path (e.g. from file finder)
+    OpenFileHistory(String),
+    /// Open the fuzzy file finder popup
+    OpenFileFinder,
     /// Request a diff of the selected revision (log tab)
     RequestRevisionDiff(u64),
+    /// Request a combined diff of several marked revisions (log tab)
+    RequestRangeDiff(Vec<u64>),
 }
 
 /// An action that needs user confirmation.
