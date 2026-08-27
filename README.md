@@ -9,12 +9,12 @@
 | 功能 | 说明 |
 | --- | --- |
 | **状态视图** | `svn status` 结果按目录树展示，M/A/D/C/? 状态彩色标识，目录可折叠/展开 |
-| **分支信息** | 状态栏常驻显示当前分支（来自 `svn info` 的 Relative URL），提交确认弹窗显示目的分支与将提交的文件列表 |
+| **分支信息** | 状态栏常驻显示当前分支，提交确认弹窗显示目的分支与将提交的文件列表 |
 | **Diff 面板** | 选中文件自动显示 `svn diff`，带行号与 +/− 高亮；未版本化文件直接显示内容 |
-| **暂存/提交** | `space` 暂存（加入提交集），`A` 全部暂存，`U` 全部取消；暂存未版本化文件会自动执行 `svn add`；`svn commit` 只提交暂存的文件（**未暂存任何文件时拒绝提交**，避免误提交全部变更）。输入框基于 `tui-textarea-2`：**中文/emoji 等宽字符时光标严格按单元格对齐**，退格按字符安全删除；`Tab` 弹出最近 10 条提交信息供快速填充；bracketed paste 保证粘贴多行/中文文本不会误触发提交 |
-| **日志视图** | `svn log -v` 修订列表 + 变更路径与提交信息详情；`/` 按关键字（修订号/作者/信息）搜索提交；`space` 标记多个修订后 `d`/`Enter` 查看合并 diff；可查看单个修订的 diff |
-| **文件历史** | `t` 查看选中文件的 `svn log` 历史（修订号/作者/信息），弹窗内 `Enter` 直接看该修订 diff |
-| **文件搜索** | `Ctrl+p` 打开 fzf 式模糊搜索（数据源 `svn list -R .@HEAD`，匹配由 [fuzzy-matcher](https://crates.io/crates/fuzzy-matcher)（skim 的 SkimMatcherV2）完成，命中字符高亮），回车跳转到该文件的历史 |
+| **暂存/提交** | `space` 暂存（加入提交集），`A` 全部暂存，`U` 全部取消；暂存未版本化文件会自动 `svn add`；提交集为空时拒绝提交。输入框支持中文/宽字符与多行粘贴，`Tab` 可回填最近提交信息 |
+| **日志视图** | `svn log -v` 修订列表 + 变更路径与提交信息详情；`/` 按关键字搜索提交；`space` 标记多个修订后 `d`/`Enter` 查看合并 diff |
+| **文件历史** | `t` 查看选中文件的 `svn log` 历史，弹窗内 `Enter` 直接看该修订 diff |
+| **文件搜索** | `Ctrl+p` fzf 式模糊搜索文件，命中字符高亮，回车跳转到该文件的历史 |
 | **Blame** | `svn blame` 按修订号着色显示 |
 | **还原** | `svn revert`（带确认） |
 | **更新** | `svn update`、更新到指定修订（`svn update -r N`，均带确认） |
@@ -51,18 +51,18 @@ svnui /path/to/working-copy
 | `x` | 解决冲突（采用工作副本版本） |
 | `c` | 聚焦提交信息输入框 |
 | `Enter` | 提交（输入框内） |
-| `Tab` | 提交输入框内：列出最近 10 条提交信息，选中回填 |
+| `Tab` | 提交输入框内：列出最近提交信息，选中回填 |
 | `u` | `svn update` |
 | `d` | 全屏 Diff |
 | `b` | Blame 文件 |
-| `t` | 查看选中文件的提交历史（`svn log`） |
-| `Ctrl+p` | fzf 式模糊搜索文件（回车查看文件历史） |
+| `t` | 查看选中文件的提交历史 |
+| `Ctrl+p` | 模糊搜索文件（回车查看文件历史） |
 | `/` | 过滤文件（状态页）/ 搜索提交（日志页） |
 | `F5` / `R` | 刷新状态 |
 | `Tab` / `Shift+Tab` | 切换面板焦点 |
 | `1` / `2` | 状态 / 日志 标签页 |
 | `Enter` / `d` | 日志页：查看所选（或标记的多个）修订的 diff |
-| `space` | 日志页：标记 / 取消标记修订（≥2 个时查看合并 diff） |
+| `space` | 日志页：标记 / 取消标记修订 |
 | `o` | 日志页：更新到所选修订 |
 | `?` | 帮助 |
 | `Esc` | 关闭弹窗 / 取消 |
@@ -74,8 +74,8 @@ svnui /path/to/working-copy
 
 `.github/workflows/` 包含两条流水线：
 
-- **ci.yml** — push / PR 时运行：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`（零警告门禁）、Linux/macOS 全量测试、`cargo llvm-cov` 覆盖率门禁（**≥ 80%**）、三平台 release 构建。
-- **release.yml** — 推送 `v*` 标签时运行：校验标签与 `Cargo.toml` 版本一致 → 在 Linux (x86_64)、macOS (arm64)、Windows (x86_64) 上构建 release 二进制 → 用仓库自身的 `GITHUB_TOKEN` 创建 GitHub Release 并附上二进制（不使用任何 Release Bot / 机器人账号）。
+- **ci.yml** — push / PR 时运行：fmt、clippy（零警告门禁）、Linux/macOS 全量测试、覆盖率门禁（≥ 80%）、三平台 release 构建。
+- **release.yml** — 推送 `v*` 标签时运行：校验标签与 `Cargo.toml` 版本一致，在 Linux (x86_64)、macOS (arm64)、Windows (x86_64) 上构建 release 二进制并创建 GitHub Release。
 
 ### 发布新版本（Tag 触发 Release）
 
@@ -88,17 +88,14 @@ git tag v0.2.0
 git push origin master --tags
 ```
 
-推送标签后，Release 工作流会自动构建并创建 Release（含自动生成的变更日志），无需任何机器人。
-
 ## 性能（超大型 SVN 项目）
 
-针对 10 万+ 文件的工作副本做了针对性优化，并配套性能测试：
+针对 10 万+ 文件的工作副本做了针对性优化：
 
-- 文件树构建 O(n)（曾为 O(n²)，10 万文件单目录下 8.8s → 现 ~47ms）
-- 树 / Diff / Blame 渲染虚拟化：每次绘制只处理可见窗口（10 万条目 ~80µs）
+- 文件树构建为 O(n)（一次 HashMap 装配）
+- 树 / Diff / Blame 渲染虚拟化：每次绘制只处理可见窗口
 - 目录暂存计数缓存，导航时零重算
-- `cargo bench --bench tree`（criterion 基准）+ `cargo test perf`（CI 时间门禁，
-  O(n²) 回归会立刻被拦下）
+- `cargo bench --bench tree`（criterion 基准）+ `cargo test perf`（CI 时间门禁，防止复杂度回归）
 
 ## 设计说明
 
@@ -112,34 +109,22 @@ git push origin master --tags
 - `src/popups/` — 确认、消息、输出查看、全屏 Diff 等弹窗（对应 gitui 的 `popups/`）
 - `src/keys.rs` — 快捷键集中定义（对应 gitui 的 `keys/`）
 
-SVN 没有 git 那样的暂存区，因此「暂存」被实现为**提交集**：标记要随下一次提交一起提交的文件；未版本化文件暂存时自动 `svn add`。提交集为空时拒绝提交（防止误提交全部变更）。
+SVN 没有 git 那样的暂存区，因此「暂存」被实现为**提交集**：标记要随下一次提交一起提交的文件；未版本化文件暂存时自动 `svn add`；提交集为空时拒绝提交。
 
-## 测试与覆盖率
+## 测试
 
 ```bash
-cargo test                 # 153 个单元/集成测试
+cargo test                 # 单元/集成测试（部分用例会创建真实临时 SVN 仓库）
 cargo llvm-cov             # 覆盖率报告（需要 cargo-llvm-cov + llvm-tools-preview）
 cargo clippy --all-targets # 零警告
 ```
 
-**行覆盖率 95%**（目标 ≥80%），按模块：
-
-| 模块 | 覆盖率 |
-| --- | --- |
-| app.rs（状态机/异步分发/绘制） | ~92% |
-| components/*（文件树/Diff/日志/Blame/提交输入） | ~92–98% |
-| popups/*（确认/消息/输出/全屏 Diff） | ~96% |
-| status.rs（Status 标签页聚合） | ~96% |
-| svn/mod.rs（svn 命令封装，跑真实仓库） | ~92% |
-| svn/parser.rs（status/log/blame/diff 解析） | ~93% |
-| ui/*（布局/滚动/主题） | ~90–99% |
-| main.rs（事件循环，终端初始化除外） | ~58% |
-
 测试策略：
+
 - **解析器/模型**：构造 svn 输出样本做单元测试；
 - **UI 组件**：用 `ratatui::TestBackend` 离屏渲染 + 合成 crossterm 事件驱动交互；
 - **svn 命令层**：测试中 `svnadmin create` 临时仓库，真实执行 status/diff/log/blame/add/revert/commit/update/resolve；
 - **App 状态机**：直接喂入 `AsyncSvnNotification` 与 `InternalEvent` 覆盖全部分支，含错误路径；
 - **事件循环**：用 `run()` 泛型化 + TestBackend 驱动到退出。
 
-已在 macOS (svn 1.14.5) 上验证：状态/暂存/提交/还原/更新/日志/修订 diff/blame/冲突解决/过滤/帮助等完整流程。
+已在 macOS (svn 1.14.5) 上验证完整流程。
