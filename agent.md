@@ -13,6 +13,8 @@
   代码里绝不能出现 `git` 命令或 git 语义（索引、HEAD、rebase 等）。
 - SVN **没有暂存区**。"暂存"被实现为**提交集**（`StatusTreeComponent::staged: HashSet<String>`）：
   标记哪些路径随下一次 `svn commit` 一起提交。未版本化（`?`）文件暂存时自动执行 `svn add`。
+  **提交集为空时拒绝提交**（app 层在确认弹窗前和 `perform_confirmed` 里双重拦截）——
+  空目标列表的 `svn commit` 会提交工作副本里的全部变更，太容易误触。
 - 禁止使用 `unsafe`。新代码必须通过 `cargo clippy --all-targets -- -D warnings`（CI 门禁）。
 
 ## 目录结构
@@ -96,7 +98,7 @@ parsers/parse_diff_50k           ~1.5 ms
 
 ```bash
 cargo build                 # 开发构建
-cargo test                  # 152 个测试（含 7 个性能门禁；部分会创建真实临时 SVN 仓库）
+cargo test                  # 153 个测试（含 7 个性能门禁；部分会创建真实临时 SVN 仓库）
 cargo bench --bench tree     # criterion 性能基准（超大型工作副本）
 cargo test <name>           # 跑单个测试
 cargo llvm-cov              # 覆盖率报告（需 cargo-llvm-cov + llvm-tools-preview）

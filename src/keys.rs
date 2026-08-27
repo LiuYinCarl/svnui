@@ -39,6 +39,8 @@ pub enum KeyAction {
     Escape,
     Quit,
     ToggleStage,
+    StageAll,
+    UnstageAll,
     AddFiles,
     RevertFiles,
     ResolveConflict,
@@ -79,6 +81,8 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::Escape => is_key(ev, KeyCode::Esc),
         KeyAction::Quit => is_key(ev, KeyCode::Char('q')),
         KeyAction::ToggleStage => is_key(ev, KeyCode::Char(' ')),
+        KeyAction::StageAll => is_key(ev, KeyCode::Char('A')),
+        KeyAction::UnstageAll => is_key(ev, KeyCode::Char('U')),
         KeyAction::AddFiles => is_key(ev, KeyCode::Char('a')),
         KeyAction::RevertFiles => is_key(ev, KeyCode::Char('r')),
         KeyAction::ResolveConflict => is_key(ev, KeyCode::Char('x')),
@@ -129,6 +133,7 @@ pub fn all_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("g / G", "Jump to first / last entry"),
         KeyBinding::new("PgUp / PgDn", "Page up / down"),
         KeyBinding::new("space", "Stage / unstage (toggle commit set)"),
+        KeyBinding::new("A / U", "Stage all changes / unstage all"),
         KeyBinding::new("a", "Add selected files (svn add)"),
         KeyBinding::new("r", "Revert selected files (svn revert)"),
         KeyBinding::new("x", "Resolve conflict (accept working copy)"),
@@ -189,6 +194,11 @@ mod tests {
         assert!(key_match(&key(KeyCode::Char('q')), KeyAction::Quit));
         assert!(!key_match(&key(KeyCode::Char('q')), KeyAction::Commit));
         assert!(key_match(&key(KeyCode::Char(' ')), KeyAction::ToggleStage));
+        assert!(key_match(&key(KeyCode::Char('A')), KeyAction::StageAll));
+        assert!(key_match(&key(KeyCode::Char('U')), KeyAction::UnstageAll));
+        // lowercase a/u keep their own actions, no overlap with A/U
+        assert!(!key_match(&key(KeyCode::Char('a')), KeyAction::StageAll));
+        assert!(!key_match(&key(KeyCode::Char('u')), KeyAction::UnstageAll));
         assert!(key_match(&key(KeyCode::Char('a')), KeyAction::AddFiles));
         assert!(key_match(&key(KeyCode::Char('r')), KeyAction::RevertFiles));
         assert!(key_match(

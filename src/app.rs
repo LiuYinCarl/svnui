@@ -223,6 +223,14 @@ impl App {
                             self.show_error("Commit message is empty".to_string());
                             return;
                         }
+                        // Refuse to commit with an empty commit set: without
+                        // explicit targets `svn commit` would sweep up every
+                        // change in the working copy, which is too easy to
+                        // trigger by accident.
+                        if paths.is_empty() && self.status.tree.staged_count() == 0 {
+                            self.show_error(MSG.commit_nothing_staged.to_string());
+                            return;
+                        }
                         self.commit_confirm_message(message, paths)
                     }
                     ConfirmAction::Revert(paths) => {
@@ -328,7 +336,8 @@ impl App {
             .map(|i| i.branch_label().to_string())
             .unwrap_or_else(|| "(unknown branch)".to_string());
         // what will actually be committed mirrors `perform_confirmed`:
-        // explicit paths > staged set > all changes
+        // explicit paths > staged set (an empty staged set is refused
+        // before this popup is ever shown)
         let targets: Vec<(char, String)> = if !paths.is_empty() {
             paths
                 .iter()
@@ -337,11 +346,7 @@ impl App {
         } else {
             self.status.commit_targets()
         };
-        let what = if paths.is_empty() && self.status.tree.staged_count() == 0 {
-            MSG.commit_all.to_string()
-        } else {
-            format!("{} ({} files)", MSG.commit_staged, targets.len())
-        };
+        let what = format!("{} ({} files)", MSG.commit_staged, targets.len());
         const MAX_LISTED: usize = 8;
         let mut out = format!("{what}\nTarget branch: {branch}\n");
         if !targets.is_empty() {
@@ -362,6 +367,12 @@ impl App {
             ConfirmAction::Commit { message, mut paths } => {
                 if paths.is_empty() {
                     paths = self.status.tree.staged.iter().cloned().collect();
+                }
+                // last-line guard: never hand svn an empty target list,
+                // which would commit every change in the working copy
+                if paths.is_empty() {
+                    self.show_error(MSG.commit_nothing_staged.to_string());
+                    return;
                 }
                 self.svn.commit(&message, &paths);
                 self.pending += 1;
@@ -967,8 +978,9 @@ mod tests {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
 
-        // commit all (no staged)
+        // commit the staged file
         test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 7\n");
+        app.status.set_staged(&["Cargo.toml".into()]);
         app.perform_confirmed(ConfirmAction::Commit {
             message: "bump".into(),
             paths: vec![],
@@ -1013,6 +1025,18 @@ mod tests {
         assert!(app.popups.len() == 1);
 
         app.popups.clear();
+        // nothing staged -> commit is refused, no confirm popup
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Commit {
+                message: "good message".into(),
+                paths: vec![],
+            }));
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+
+        // staged -> confirm popup
+        app.popups.clear();
+        app.status.set_staged(&["a.txt".into()]);
         app.queue
             .push(InternalEvent::Confirm(ConfirmAction::Commit {
                 message: "good message".into(),

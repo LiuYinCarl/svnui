@@ -332,6 +332,19 @@ impl StatusTreeComponent {
                     self.ctx.queue.push(InternalEvent::AddFiles(needs_add));
                 }
             }
+        } else if key_match(k, KeyAction::StageAll) {
+            let all: Vec<String> = self.changed_files().into_iter().map(|(_, p)| p).collect();
+            let needs_add: Vec<String> = all
+                .iter()
+                .filter(|p| self.entry_for_path(p).is_some_and(|e| e.status == '?'))
+                .cloned()
+                .collect();
+            self.set_staged(&all);
+            if !needs_add.is_empty() {
+                self.ctx.queue.push(InternalEvent::AddFiles(needs_add));
+            }
+        } else if key_match(k, KeyAction::UnstageAll) {
+            self.clear_staged();
         } else if key_match(k, KeyAction::AddFiles) {
             let paths = self.paths_at_selection();
             if !paths.is_empty() {
@@ -952,6 +965,26 @@ mod interaction_tests {
         let (mut c2, q2) = comp_with(vec![entry('M', "m.txt")]);
         c2.event(&key(KeyCode::Char('x'))).unwrap();
         assert!(q2.pop().is_none());
+    }
+
+    #[test]
+    fn stage_all_and_unstage_all_keys() {
+        let (mut c, q) = comp_with(vec![
+            entry('M', "a.txt"),
+            entry('?', "new.txt"),
+            entry('M', "dir/b.txt"),
+        ]);
+        // A stages everything; unversioned files are svn-added
+        c.event(&key(KeyCode::Char('A'))).unwrap();
+        assert_eq!(c.staged_count(), 3);
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::AddFiles(paths)) if paths == vec!["new.txt".to_string()]
+        ));
+        // U clears the commit set
+        c.event(&key(KeyCode::Char('U'))).unwrap();
+        assert_eq!(c.staged_count(), 0);
+        assert!(q.pop().is_none());
     }
 
     #[test]

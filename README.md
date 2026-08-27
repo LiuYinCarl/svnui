@@ -11,7 +11,7 @@
 | **状态视图** | `svn status` 结果按目录树展示，M/A/D/C/? 状态彩色标识，目录可折叠/展开 |
 | **分支信息** | 状态栏常驻显示当前分支（来自 `svn info` 的 Relative URL），提交确认弹窗显示目的分支与将提交的文件列表 |
 | **Diff 面板** | 选中文件自动显示 `svn diff`，带行号与 +/− 高亮；未版本化文件直接显示内容 |
-| **暂存/提交** | `space` 暂存（加入提交集），暂存未版本化文件会自动执行 `svn add`；`svn commit` 只提交暂存的文件（未暂存时提交全部变更）。输入框基于 `tui-textarea-2`：**中文/emoji 等宽字符时光标严格按单元格对齐**，退格按字符安全删除；`Tab` 弹出最近 10 条提交信息供快速填充；bracketed paste 保证粘贴多行/中文文本不会误触发提交 |
+| **暂存/提交** | `space` 暂存（加入提交集），`A` 全部暂存，`U` 全部取消；暂存未版本化文件会自动执行 `svn add`；`svn commit` 只提交暂存的文件（**未暂存任何文件时拒绝提交**，避免误提交全部变更）。输入框基于 `tui-textarea-2`：**中文/emoji 等宽字符时光标严格按单元格对齐**，退格按字符安全删除；`Tab` 弹出最近 10 条提交信息供快速填充；bracketed paste 保证粘贴多行/中文文本不会误触发提交 |
 | **日志视图** | `svn log -v` 修订列表 + 变更路径与提交信息详情；`/` 按关键字（修订号/作者/信息）搜索提交；`space` 标记多个修订后 `d`/`Enter` 查看合并 diff；可查看单个修订的 diff |
 | **文件历史** | `t` 查看选中文件的 `svn log` 历史（修订号/作者/信息），弹窗内 `Enter` 直接看该修订 diff |
 | **文件搜索** | `Ctrl+p` 打开 fzf 式模糊搜索（数据源 `svn list -R .@HEAD`，匹配由 [fuzzy-matcher](https://crates.io/crates/fuzzy-matcher)（skim 的 SkimMatcherV2）完成，命中字符高亮），回车跳转到该文件的历史 |
@@ -45,6 +45,7 @@ svnui /path/to/working-copy
 | `g` / `G` | 跳到第一项 / 最后一项 |
 | `PgUp` / `PgDn` | 翻页 |
 | `space` | 暂存 / 取消暂存（切换提交集） |
+| `A` / `U` | 全部暂存 / 全部取消暂存 |
 | `a` | `svn add` 选中的未版本化文件 |
 | `r` | `svn revert` 选中的文件（确认后执行） |
 | `x` | 解决冲突（采用工作副本版本） |
@@ -111,12 +112,12 @@ git push origin master --tags
 - `src/popups/` — 确认、消息、输出查看、全屏 Diff 等弹窗（对应 gitui 的 `popups/`）
 - `src/keys.rs` — 快捷键集中定义（对应 gitui 的 `keys/`）
 
-SVN 没有 git 那样的暂存区，因此「暂存」被实现为**提交集**：标记要随下一次提交一起提交的文件；未版本化文件暂存时自动 `svn add`。
+SVN 没有 git 那样的暂存区，因此「暂存」被实现为**提交集**：标记要随下一次提交一起提交的文件；未版本化文件暂存时自动 `svn add`。提交集为空时拒绝提交（防止误提交全部变更）。
 
 ## 测试与覆盖率
 
 ```bash
-cargo test                 # 152 个单元/集成测试
+cargo test                 # 153 个单元/集成测试
 cargo llvm-cov             # 覆盖率报告（需要 cargo-llvm-cov + llvm-tools-preview）
 cargo clippy --all-targets # 零警告
 ```

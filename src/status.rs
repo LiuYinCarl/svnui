@@ -132,19 +132,15 @@ impl StatusTab {
         self.commit.hint = if staged > 0 {
             format!("{staged} file(s) staged")
         } else {
-            "no files staged — commit all changes".to_string()
+            "nothing staged (space: stage · A: stage all)".to_string()
         };
     }
 
-    /// Files the next commit would include: the staged set when non-empty,
-    /// otherwise all changed files.
+    /// Files the next commit would include: the staged set. Committing with
+    /// an empty commit set is refused by the app layer, so there is no
+    /// "commit everything" fallback here.
     pub fn commit_targets(&self) -> Vec<(char, String)> {
-        let staged = self.tree.staged_files();
-        if staged.is_empty() {
-            self.tree.changed_files()
-        } else {
-            staged
-        }
+        self.tree.staged_files()
     }
 
     pub fn set_staged(&mut self, paths: &[String]) {
@@ -175,6 +171,9 @@ impl StatusTab {
         if self.focus == PaneFocus::Commit && !self.commit.focused {
             self.set_focus(PaneFocus::Tree);
         }
+        // staging keys (space / A / U) are handled inside the tree; keep the
+        // commit bar hint in sync after every event
+        self.update_commit_hint();
         Ok(EventState { consumed })
     }
 
@@ -261,7 +260,7 @@ mod tests {
         let (mut t, _q) = tab();
         t.update_status(vec![entry('M', "a.txt"), entry('?', "b.txt")]);
         assert_eq!(t.tree.staged_count(), 0);
-        assert!(t.commit.hint.contains("no files staged"));
+        assert!(t.commit.hint.contains("nothing staged"));
         // staged hint
         t.tree.set_staged(&["a.txt".to_string()]);
         t.update_commit_hint();
