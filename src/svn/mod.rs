@@ -173,43 +173,30 @@ impl Svn {
     }
 
     /// Search the full commit history with `svn log --search` (matches
-    /// author, date, message and changed paths case-sensitively; the
-    /// option exists since svn 1.8). A larger limit than the default view
-    /// is used so search can reach further back.
+    /// author, date, message and changed paths; glob syntax,
+    /// case-insensitive; the option exists since svn 1.8).
+    ///
+    /// No `-l` limit is passed on purpose: combined with `--search`,
+    /// `-l N` limits the number of revisions *scanned* (newest N), not
+    /// the number of matches shown — a limit would silently reduce the
+    /// search to recent history.
     pub fn log_search(&self, pattern: &str) {
         let cwd = self.cwd.clone();
         let pattern = pattern.to_string();
         self.spawn(move || {
-            let result = Self::run_in(
-                &cwd,
-                &[
-                    "log", "-v", "-r", "HEAD:0", "-l", "200", "--search", &pattern,
-                ],
-            )
-            .map(|out| parser::parse_log(&out));
+            let result = Self::run_in(&cwd, &["log", "-v", "-r", "HEAD:0", "--search", &pattern])
+                .map(|out| parser::parse_log(&out));
             AsyncSvnNotification::LogSearch(result)
         });
     }
 
-    /// Fetch revisions older than `before_rev` (log tab pagination);
-    /// with `search`, continues a full-history search further back.
-    pub fn log_more(&self, before_rev: u64, limit: usize, search: Option<String>) {
+    /// Fetch revisions older than `before_rev` (log tab pagination).
+    pub fn log_more(&self, before_rev: u64, limit: usize) {
         let cwd = self.cwd.clone();
         self.spawn(move || {
-            let mut args: Vec<String> = vec![
-                "log".into(),
-                "-v".into(),
-                "-r".into(),
-                format!("{}:0", before_rev - 1),
-                "-l".into(),
-                limit.to_string(),
-            ];
-            if let Some(p) = search {
-                args.push("--search".into());
-                args.push(p);
-            }
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let result = Self::run_in(&cwd, &arg_refs).map(|out| parser::parse_log(&out));
+            let range = format!("{}:0", before_rev - 1);
+            let result = Self::run_in(&cwd, &["log", "-v", "-r", &range, "-l", &limit.to_string()])
+                .map(|out| parser::parse_log(&out));
             AsyncSvnNotification::LogAppend(result)
         });
     }
@@ -604,13 +591,13 @@ mod tests {
     }
 
     #[test]
-    fn log_more_pages_and_searches() {
+    fn log_more_pages() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
 
         // revisions older than r2: just r1
-        c.log_more(2, 50, None);
+        c.log_more(2, 50);
         match recv(&rx) {
             AsyncSvnNotification::LogAppend(Ok(entries)) => {
                 assert_eq!(entries.len(), 1);
@@ -618,16 +605,27 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
 
-        // same range with a search pattern: match and no-match
-        c.log_more(2, 50, Some("initial".into()));
+    /// `log_search` must not pass `-l`: combined with --search, -l limits
+    /// the revisions *scanned*, not the matches shown. On a real repo the
+    /// search therefore covers all history.
+    #[test]
+    fn log_search_covers_full_history() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.log_search("initial");
         match recv(&rx) {
-            AsyncSvnNotification::LogAppend(Ok(entries)) => assert_eq!(entries.len(), 1),
+            AsyncSvnNotification::LogSearch(Ok(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].revision, 1);
+            }
             other => panic!("unexpected: {other:?}"),
         }
-        c.log_more(2, 50, Some("no-such-word-xyz".into()));
+        c.log_search("no-such-word-xyz");
         match recv(&rx) {
-            AsyncSvnNotification::LogAppend(Ok(entries)) => assert!(entries.is_empty()),
+            AsyncSvnNotification::LogSearch(Ok(entries)) => assert!(entries.is_empty()),
             other => panic!("unexpected: {other:?}"),
         }
     }

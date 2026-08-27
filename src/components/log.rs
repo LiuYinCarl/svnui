@@ -159,9 +159,10 @@ impl LogComponent {
     }
 
     /// Near the bottom of the list, request the next page of older
-    /// revisions (once per in-flight request).
+    /// revisions (once per in-flight request). Search results are not
+    /// paged: `log_search` already scans and returns the full history.
     fn maybe_load_more(&mut self) {
-        if self.loading_more {
+        if self.loading_more || self.search.is_some() {
             return;
         }
         let len = self.visible_indices().len();
@@ -583,6 +584,27 @@ mod tests {
         c.append_failed();
         c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+    }
+
+    #[test]
+    fn search_results_do_not_paginate() {
+        // full-history search already returned all matches: scrolling to
+        // the bottom must not request more pages
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut c = LogComponent::new(&ctx);
+        let entries: Vec<LogEntry> = (2..=60)
+            .rev()
+            .map(|r| entry(r, "a", &format!("commit {r}")))
+            .collect();
+        c.update(entries);
+        c.set_filter("commit".into());
+        c.set_search_active("commit".into());
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(q.pop().is_none());
     }
 
     #[test]

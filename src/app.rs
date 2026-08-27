@@ -235,8 +235,7 @@ impl App {
             InternalEvent::LogLoadMore => {
                 let oldest = self.log.entries.last().map(|e| e.revision).unwrap_or(1);
                 if oldest > 1 {
-                    self.svn
-                        .log_more(oldest, 50, self.log.search_pattern().map(str::to_string));
+                    self.svn.log_more(oldest, 50);
                     self.pending += 1;
                 }
             }
