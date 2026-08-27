@@ -37,7 +37,8 @@ src/
 │   ├── status_tree.rs  文件树（目录折叠、暂存、过滤）——最大的组件
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用）
 │   ├── commit.rs     提交信息输入栏（tui-textarea-2，Tab 回填最近提交信息）
-│   ├── log.rs        日志标签页（修订列表 + 详情 + 关键字搜索 + 多选合并 diff）
+│   ├── log.rs        日志标签页（修订列表 + 详情 + 关键字筛选 + 多选合并 diff）
+│   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
 │   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
 │   ├── file_finder.rs  模糊文件搜索弹窗（数据源 svn list -R .@HEAD，fuzzy-matcher 匹配）
 │   ├── blame.rs      blame 弹窗

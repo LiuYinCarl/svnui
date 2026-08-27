@@ -69,6 +69,12 @@ pub enum InternalEvent {
     RequestRevisionDiff(u64),
     /// Request a combined diff of several marked revisions (log tab)
     RequestRangeDiff(Vec<u64>),
+    /// Search the full commit history (Enter in the log search popup)
+    SearchLog(String),
+    /// Open the commit search popup (log tab)
+    OpenLogSearch,
+    /// Live-update the log filter while typing in the search popup
+    LogSearchInput(String),
 }
 
 /// An action that needs user confirmation.

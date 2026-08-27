@@ -6,7 +6,7 @@ use crate::queue::{ConfirmAction, InternalEvent};
 use crate::strings::TITLE;
 use crate::svn::models::LogEntry;
 use crate::ui::{self, style::Theme};
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -23,9 +23,12 @@ pub struct LogComponent {
     detail_scroll: Cell<usize>,
     pub pending: bool,
     pub focused: bool,
-    /// Keyword filter over revision/author/message (`/`)
+    /// Keyword filter over revision/author/message, set from the search
+    /// popup (`/`)
     filter: String,
-    filter_active: bool,
+    /// The list currently shows full-history search results
+    /// (`svn log --search`) instead of the latest revisions
+    search_active: bool,
     /// Marked revisions for a combined diff (`space`)
     pub marks: std::collections::BTreeSet<u64>,
 }
@@ -41,7 +44,7 @@ impl LogComponent {
             pending: true,
             focused: true,
             filter: String::new(),
-            filter_active: false,
+            search_active: false,
             marks: std::collections::BTreeSet::new(),
         }
     }
@@ -53,9 +56,18 @@ impl LogComponent {
         self.selection = self.selection.min(len.saturating_sub(1));
     }
 
+    /// Back to the normal latest-revisions view (called when a plain
+    /// `svn log` result arrives).
+    pub fn clear_search(&mut self) {
+        self.search_active = false;
+    }
+
     /// Indices into `entries` that match the current filter.
     fn visible_indices(&self) -> Vec<usize> {
-        if self.filter.is_empty() {
+        // full-history results are already filtered server-side; applying
+        // the keyword locally on top would hide revisions that only
+        // matched via changed paths (svn log --search also scans those)
+        if self.filter.is_empty() || self.search_active {
             return (0..self.entries.len()).collect();
         }
         let f = self.filter.to_lowercase();
@@ -110,36 +122,26 @@ impl LogComponent {
         }
     }
 
+    /// Current filter text (used to pre-fill the search popup).
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Set the keyword filter (from the search popup, live while typing).
+    pub fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.selection = 0;
+    }
+
+    /// Mark the list as showing full-history search results.
+    pub fn set_search_active(&mut self) {
+        self.search_active = true;
+    }
+
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
         let Event::Key(k) = ev else {
             return Ok(EventState::not_consumed());
         };
-
-        // search input mode captures everything
-        if self.filter_active {
-            match k.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.filter_active = false;
-                    self.selection = 0;
-                }
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                    self.selection = 0;
-                }
-                // ignore control/alt combos (Ctrl+C must not filter 'c')
-                KeyCode::Char(c)
-                    if !k.modifiers.intersects(
-                        crossterm::event::KeyModifiers::CONTROL
-                            | crossterm::event::KeyModifiers::ALT,
-                    ) =>
-                {
-                    self.filter.push(c);
-                    self.selection = 0;
-                }
-                _ => {}
-            }
-            return Ok(EventState::consumed());
-        }
 
         if key_match(k, KeyAction::MoveUp) {
             self.move_selection(-1);
@@ -158,7 +160,7 @@ impl LogComponent {
         } else if key_match(k, KeyAction::OpenRevisionDiff) {
             self.request_diff();
         } else if key_match(k, KeyAction::Filter) {
-            self.filter_active = true;
+            self.ctx.queue.push(InternalEvent::OpenLogSearch);
         } else if key_match(k, KeyAction::UpdateToRevision) {
             if let Some(rev) = self.selection_revision() {
                 self.ctx
@@ -176,6 +178,13 @@ impl LogComponent {
             if !self.filter.is_empty() {
                 self.filter.clear();
                 self.selection = 0;
+                // search results are replaced by the normal log view
+                if self.search_active {
+                    self.search_active = false;
+                    self.ctx
+                        .queue
+                        .push(InternalEvent::Update(crate::queue::NeedsUpdate::LOG));
+                }
             } else {
                 self.ctx
                     .queue
@@ -196,24 +205,6 @@ impl LogComponent {
         }
         Ok(EventState::consumed())
     }
-
-    /// The `search> ...` input row at the bottom of the list pane.
-    fn draw_filter_row(&self, f: &mut Frame, inner: Rect, theme: &Theme) {
-        if !self.filter_active || inner.height == 0 {
-            return;
-        }
-        let y = inner.y + inner.height - 1;
-        ui::render_line_at(
-            f,
-            inner.x,
-            y,
-            inner.width,
-            &Line::from(vec![
-                Span::styled("search> ", theme.info),
-                Span::raw(self.filter.clone()),
-            ]),
-        );
-    }
 }
 
 impl DrawableComponent for LogComponent {
@@ -232,7 +223,12 @@ impl DrawableComponent for LogComponent {
         // ---- left: revision list ----
         let mut title = TITLE.log.to_string();
         if !self.filter.is_empty() {
-            title.push_str(&format!("  filter: \"{}\"", self.filter));
+            let label = if self.search_active {
+                "search (all history)"
+            } else {
+                "filter"
+            };
+            title.push_str(&format!("  {label}: \"{}\"", self.filter));
         }
         if !self.marks.is_empty() {
             title.push_str(&format!("  ({} marked)", self.marks.len()));
@@ -270,12 +266,10 @@ impl DrawableComponent for LogComponent {
                 ))),
                 inner,
             );
-            self.draw_filter_row(f, inner, theme);
             return Ok(());
         }
 
-        // reserve the last row for the search input while it is active
-        let view_h = (inner.height as usize).saturating_sub(usize::from(self.filter_active));
+        let view_h = inner.height as usize;
         let mut lines: Vec<Line> = Vec::with_capacity(visible.len().min(view_h.max(1)));
         for &i in &visible {
             lines.push(log_list_line(
@@ -297,8 +291,6 @@ impl DrawableComponent for LogComponent {
 
         let highlights = vec![(self.selection, Style::default().bg(theme.selection_bg))];
         ui::render_lines(f, inner, &lines, scroll, &highlights);
-
-        self.draw_filter_row(f, inner, theme);
 
         // ---- right: details content ----
         if let Some(e) = self.selection_entry() {
@@ -475,33 +467,35 @@ mod tests {
 
     #[test]
     fn search_filters_by_keyword() {
-        let (mut c, _q) = comp();
-        // '/' enters search mode
+        let (mut c, q) = comp();
+        // '/' opens the search popup (the app handles the popup itself)
         c.event(&ts::key(crossterm::event::KeyCode::Char('/')))
             .unwrap();
-        for ch in "second".chars() {
-            c.event(&ts::key(crossterm::event::KeyCode::Char(ch)))
-                .unwrap();
-        }
+        assert!(matches!(q.pop(), Some(InternalEvent::OpenLogSearch)));
+
+        // live filter set from the popup while typing
+        c.set_filter("second".into());
+        assert_eq!(c.filter(), "second");
         assert_eq!(c.selection_revision(), Some(2));
-        // Enter keeps the filter and exits input mode
-        c.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
-        assert_eq!(c.selection_revision(), Some(2));
-        // Esc clears the filter
+        // Esc clears a plain filter without reloading
         c.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
         assert_eq!(c.selection_revision(), Some(3));
+        assert!(q.pop().is_none());
+
         // author / revision keywords work too
-        c.event(&ts::key(crossterm::event::KeyCode::Char('/')))
-            .unwrap();
-        c.event(&ts::key(crossterm::event::KeyCode::Char('b')))
-            .unwrap();
+        c.set_filter("b".into());
         assert_eq!(c.selection_revision(), Some(2)); // bob
-        c.event(&ts::key(crossterm::event::KeyCode::Backspace))
-            .unwrap();
-        c.event(&ts::key(crossterm::event::KeyCode::Char('3')))
-            .unwrap();
+        c.set_filter("3".into());
         assert_eq!(c.selection_revision(), Some(3)); // r3
+
+        // with full-history search results shown, Esc also reloads the log
+        c.set_search_active();
         c.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
+        assert_eq!(c.filter(), "");
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::Update(NeedsUpdate::LOG))
+        ));
     }
 
     #[test]

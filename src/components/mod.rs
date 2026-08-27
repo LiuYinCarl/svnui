@@ -7,6 +7,7 @@ pub mod file_finder;
 pub mod file_log;
 pub mod help;
 pub mod log;
+pub mod log_search;
 pub mod status_tree;
 
 use crate::queue::Queue;

@@ -51,6 +51,8 @@ pub enum AsyncSvnNotification {
     Resolve(Result<String, String>),
     /// Working copy updated to a specific revision (svn update -r N)
     UpdateToRevision(Result<String, String>),
+    /// Full-history search results (`svn log --search`)
+    LogSearch(Result<Vec<LogEntry>, String>),
 }
 
 /// The SVN client. Cheap to clone (path + channel).
@@ -165,6 +167,25 @@ impl Svn {
             )
             .map(|out| parser::parse_log(&out));
             AsyncSvnNotification::FileLog { path, result }
+        });
+    }
+
+    /// Search the full commit history with `svn log --search` (matches
+    /// author, date, message and changed paths case-sensitively; the
+    /// option exists since svn 1.8). A larger limit than the default view
+    /// is used so search can reach further back.
+    pub fn log_search(&self, pattern: &str) {
+        let cwd = self.cwd.clone();
+        let pattern = pattern.to_string();
+        self.spawn(move || {
+            let result = Self::run_in(
+                &cwd,
+                &[
+                    "log", "-v", "-r", "HEAD:0", "-l", "200", "--search", &pattern,
+                ],
+            )
+            .map(|out| parser::parse_log(&out));
+            AsyncSvnNotification::LogSearch(result)
         });
     }
 

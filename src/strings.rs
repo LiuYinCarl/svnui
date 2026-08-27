@@ -10,6 +10,7 @@ pub struct Title {
     pub message: &'static str,
     pub file_history: &'static str,
     pub file_finder: &'static str,
+    pub log_search: &'static str,
 }
 
 pub const TITLE: Title = Title {
@@ -22,6 +23,7 @@ pub const TITLE: Title = Title {
     message: "Message",
     file_history: "File history",
     file_finder: "Find file",
+    log_search: "Search commits",
 };
 
 pub struct Msg {

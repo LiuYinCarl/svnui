@@ -144,7 +144,7 @@ pub fn all_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("b", "Blame file (svn blame)"),
         KeyBinding::new("t", "File history (svn log of selected file)"),
         KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
-        KeyBinding::new("/", "Filter files / search commits (log tab)"),
+        KeyBinding::new("/", "Filter files / search commits (popup, log tab)"),
         KeyBinding::new("F5 / R", "Refresh status"),
         KeyBinding::new("Tab / Shift+Tab", "Cycle pane focus"),
         KeyBinding::new("Tab", "Commit input: pick a recent message"),

@@ -219,6 +219,19 @@ impl App {
                 self.status.set_focus(crate::status::PaneFocus::Commit);
                 self.status.commit.focus();
             }
+            InternalEvent::OpenLogSearch => {
+                let ctx = self.ctx.clone();
+                let current = self.log.filter().to_string();
+                self.push_popup(Popup::log_search(&ctx, &current));
+            }
+            InternalEvent::LogSearchInput(text) => {
+                self.log.set_filter(text);
+            }
+            InternalEvent::SearchLog(pattern) => {
+                self.log.set_search_active();
+                self.svn.log_search(&pattern);
+                self.pending += 1;
+            }
             InternalEvent::Confirm(action) => {
                 let message = match &action {
                     ConfirmAction::Commit { message, paths } => {
@@ -470,9 +483,19 @@ impl App {
                         .filter(|s| !s.is_empty())
                         .collect();
                     self.status.commit.set_history(history);
+                    self.log.clear_search();
                     self.log.update(entries);
                 }
                 Err(e) => self.show_error(format!("svn log: {e}")),
+            },
+            AsyncSvnNotification::LogSearch(result) => match result {
+                Ok(entries) => self.log.update(entries),
+                Err(e) => {
+                    // the search did not happen; don't leave the list in
+                    // "unfiltered server results" mode
+                    self.log.clear_search();
+                    self.show_error(format!("svn log --search: {e}"));
+                }
             },
             AsyncSvnNotification::FileLog { path, result } => match result {
                 Ok(entries) => {
@@ -1390,6 +1413,42 @@ mod tests {
             "{}",
             p2.message
         );
+    }
+
+    #[test]
+    fn log_search_popup_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
+            log_entry(3, "third"),
+            log_entry(2, "second"),
+        ])));
+
+        // OpenLogSearch opens the popup pre-filled with the current filter
+        app.log.set_filter("thi".into());
+        app.queue.push(InternalEvent::OpenLogSearch);
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::LogSearch(_))));
+
+        // typing in the popup live-filters the loaded list
+        app.queue
+            .push(InternalEvent::LogSearchInput("second".into()));
+        app.handle_queue_events();
+        assert_eq!(app.log.selection_revision(), Some(2));
+
+        // Enter in the popup → full-history search on a real repo
+        app.popups.clear();
+        app.queue.push(InternalEvent::SearchLog("second".into()));
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::LogSearch(Ok(_))));
+
+        // results replace the list; errors open a message popup
+        app.handle_async(AsyncSvnNotification::LogSearch(Ok(vec![log_entry(
+            2, "second",
+        )])));
+        assert_eq!(app.log.selection_revision(), Some(2));
+        app.handle_async(AsyncSvnNotification::LogSearch(Err("boom".into())));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
     }
 
     #[test]

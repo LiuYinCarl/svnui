@@ -28,6 +28,7 @@ pub enum Popup {
     Blame(super::components::blame::BlamePopup),
     FileLog(super::components::file_log::FileLogPopup),
     FileFinder(super::components::file_finder::FileFinderPopup),
+    LogSearch(super::components::log_search::LogSearchPopup),
 }
 
 impl Popup {
@@ -42,6 +43,7 @@ impl Popup {
             Popup::Blame(_) => ui::popup_area(area, 85, 85),
             Popup::FileLog(_) => ui::popup_area(area, 75, 70),
             Popup::FileFinder(_) => ui::popup_area(area, 70, 60),
+            Popup::LogSearch(_) => ui::popup_area(area, 60, 20),
         }
     }
 }
@@ -57,6 +59,7 @@ impl DrawableComponent for Popup {
             Popup::Blame(p) => p.draw(f, area),
             Popup::FileLog(p) => p.draw(f, area),
             Popup::FileFinder(p) => p.draw(f, area),
+            Popup::LogSearch(p) => p.draw(f, area),
         }
     }
 
@@ -70,6 +73,7 @@ impl DrawableComponent for Popup {
             Popup::Blame(p) => p.event(ev),
             Popup::FileLog(p) => p.event(ev),
             Popup::FileFinder(p) => p.event(ev),
+            Popup::LogSearch(p) => p.event(ev),
         }
     }
 }
@@ -99,6 +103,11 @@ impl Popup {
     }
     pub fn file_finder(ctx: &Context) -> Self {
         Popup::FileFinder(super::components::file_finder::FileFinderPopup::new(ctx))
+    }
+    pub fn log_search(ctx: &Context, initial: &str) -> Self {
+        Popup::LogSearch(super::components::log_search::LogSearchPopup::new(
+            ctx, initial,
+        ))
     }
 }
 
@@ -133,6 +142,7 @@ mod tests {
             Popup::blame(&c, "p"),
             Popup::file_log(&c, "p"),
             Popup::file_finder(&c),
+            Popup::log_search(&c, ""),
         ];
         for p in &popups {
             let r = p.rect(area);
@@ -216,6 +226,26 @@ mod tests {
         });
         assert!(ts::dump(&t8).contains("Find file"));
         ff.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(crate::queue::InternalEvent::ClosePopup)
+        ));
+
+        // earlier popups in this test intentionally leave events in the
+        // queue (e.g. confirm's ClosePopup); start clean
+        while q.pop().is_some() {}
+
+        let mut ls = Popup::log_search(&c, "ini");
+        let t9 = ts::render(60, 10, |f| {
+            ls.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
+        });
+        assert!(ts::dump(&t9).contains("Search commits"));
+        ls.event(&ts::key(crossterm::event::KeyCode::Enter))
+            .unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(crate::queue::InternalEvent::SearchLog(s)) if s == "ini"
+        ));
         assert!(matches!(
             q.pop(),
             Some(crate::queue::InternalEvent::ClosePopup)
