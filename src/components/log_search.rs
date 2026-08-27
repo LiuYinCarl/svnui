@@ -67,7 +67,7 @@ impl DrawableComponent for LogSearchPopup {
             chunks[1].y,
             chunks[1].width,
             &Line::from(Span::styled(
-                "Enter: search all history · Esc: close (keep filter)",
+                "Typing filters loaded commits · Enter: search all history · Esc: close",
                 theme.dim,
             )),
         );

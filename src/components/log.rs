@@ -258,10 +258,13 @@ impl DrawableComponent for LogComponent {
         // ---- left: revision list ----
         let mut title = TITLE.log.to_string();
         if !self.filter.is_empty() {
+            // make the two search modes distinguishable at a glance:
+            // typing in the popup only filtered what is loaded, Enter
+            // searched the full history
             let label = if self.search.is_some() {
                 "search (all history)"
             } else {
-                "filter"
+                "filter (loaded only)"
             };
             title.push_str(&format!("  {label}: \"{}\"", self.filter));
         }
@@ -294,11 +297,15 @@ impl DrawableComponent for LogComponent {
         }
         let visible = self.visible_indices();
         if visible.is_empty() {
+            // a filter with no local matches is not "no revisions": say so
+            // and point at the full-history search
+            let msg = if !self.filter.is_empty() && self.search.is_none() {
+                crate::strings::MSG.empty_log_filtered
+            } else {
+                crate::strings::MSG.empty_log
+            };
             f.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
-                    crate::strings::MSG.empty_log,
-                    theme.dim,
-                ))),
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(msg, theme.dim))),
                 inner,
             );
             return Ok(());
@@ -584,6 +591,27 @@ mod tests {
         c.append_failed();
         c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+    }
+
+    #[test]
+    fn filter_title_and_empty_hint_distinguish_modes() {
+        let (mut c, _q) = comp();
+        // plain filter (typing only): title says "loaded only", and a
+        // non-matching filter points at the full-history search
+        c.set_filter("zzz-no-match".into());
+        let t = ts::render(100, 12, |f| {
+            c.draw(f, Rect::new(0, 0, 100, 12)).unwrap();
+        });
+        let s = ts::dump(&t);
+        assert!(s.contains("filter (loaded only)"), "{s}");
+        assert!(s.contains("No match in loaded commits"), "{s}");
+
+        // after a full-history search: title says "all history"
+        c.set_search_active("zzz-no-match".into());
+        let t2 = ts::render(100, 12, |f| {
+            c.draw(f, Rect::new(0, 0, 100, 12)).unwrap();
+        });
+        assert!(ts::dump(&t2).contains("search (all history)"));
     }
 
     #[test]
