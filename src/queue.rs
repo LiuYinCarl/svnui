@@ -75,6 +75,8 @@ pub enum InternalEvent {
     OpenLogSearch,
     /// Live-update the log filter while typing in the search popup
     LogSearchInput(String),
+    /// Load older revisions at the bottom of the log list
+    LogLoadMore,
 }
 
 /// An action that needs user confirmation.

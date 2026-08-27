@@ -26,11 +26,13 @@ pub struct LogComponent {
     /// Keyword filter over revision/author/message, set from the search
     /// popup (`/`)
     filter: String,
-    /// The list currently shows full-history search results
-    /// (`svn log --search`) instead of the latest revisions
-    search_active: bool,
+    /// When `Some`, the list shows full-history search results for this
+    /// pattern (`svn log --search`) instead of the latest revisions
+    search: Option<String>,
     /// Marked revisions for a combined diff (`space`)
     pub marks: std::collections::BTreeSet<u64>,
+    /// A load-older-revisions request is in flight (pagination guard)
+    loading_more: bool,
 }
 
 impl LogComponent {
@@ -44,22 +46,40 @@ impl LogComponent {
             pending: true,
             focused: true,
             filter: String::new(),
-            search_active: false,
+            search: None,
             marks: std::collections::BTreeSet::new(),
+            loading_more: false,
         }
     }
 
     pub fn update(&mut self, entries: Vec<LogEntry>) {
         self.pending = false;
+        self.loading_more = false;
         self.entries = entries;
         let len = self.visible_indices().len();
         self.selection = self.selection.min(len.saturating_sub(1));
     }
 
+    /// Append older revisions (pagination result).
+    pub fn append(&mut self, entries: Vec<LogEntry>) {
+        self.loading_more = false;
+        self.entries.extend(entries);
+    }
+
+    /// A pagination request failed; allow retrying on the next scroll.
+    pub fn append_failed(&mut self) {
+        self.loading_more = false;
+    }
+
     /// Back to the normal latest-revisions view (called when a plain
     /// `svn log` result arrives).
     pub fn clear_search(&mut self) {
-        self.search_active = false;
+        self.search = None;
+    }
+
+    /// The active full-history search pattern, if any.
+    pub fn search_pattern(&self) -> Option<&str> {
+        self.search.as_deref()
     }
 
     /// Indices into `entries` that match the current filter.
@@ -67,7 +87,7 @@ impl LogComponent {
         // full-history results are already filtered server-side; applying
         // the keyword locally on top would hide revisions that only
         // matched via changed paths (svn log --search also scans those)
-        if self.filter.is_empty() || self.search_active {
+        if self.filter.is_empty() || self.search.is_some() {
             return (0..self.entries.len()).collect();
         }
         let f = self.filter.to_lowercase();
@@ -134,8 +154,22 @@ impl LogComponent {
     }
 
     /// Mark the list as showing full-history search results.
-    pub fn set_search_active(&mut self) {
-        self.search_active = true;
+    pub fn set_search_active(&mut self, pattern: String) {
+        self.search = Some(pattern);
+    }
+
+    /// Near the bottom of the list, request the next page of older
+    /// revisions (once per in-flight request).
+    fn maybe_load_more(&mut self) {
+        if self.loading_more {
+            return;
+        }
+        let len = self.visible_indices().len();
+        let oldest = self.entries.last().map(|e| e.revision).unwrap_or(1);
+        if len > 0 && oldest > 1 && self.selection + 10 >= len {
+            self.loading_more = true;
+            self.ctx.queue.push(InternalEvent::LogLoadMore);
+        }
     }
 
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
@@ -179,8 +213,7 @@ impl LogComponent {
                 self.filter.clear();
                 self.selection = 0;
                 // search results are replaced by the normal log view
-                if self.search_active {
-                    self.search_active = false;
+                if self.search.take().is_some() {
                     self.ctx
                         .queue
                         .push(InternalEvent::Update(crate::queue::NeedsUpdate::LOG));
@@ -203,6 +236,7 @@ impl LogComponent {
         } else {
             return Ok(EventState::not_consumed());
         }
+        self.maybe_load_more();
         Ok(EventState::consumed())
     }
 }
@@ -223,7 +257,7 @@ impl DrawableComponent for LogComponent {
         // ---- left: revision list ----
         let mut title = TITLE.log.to_string();
         if !self.filter.is_empty() {
-            let label = if self.search_active {
+            let label = if self.search.is_some() {
                 "search (all history)"
             } else {
                 "filter"
@@ -489,13 +523,66 @@ mod tests {
         assert_eq!(c.selection_revision(), Some(3)); // r3
 
         // with full-history search results shown, Esc also reloads the log
-        c.set_search_active();
+        c.set_search_active("3".into());
         c.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
         assert_eq!(c.filter(), "");
+        assert!(c.search_pattern().is_none());
         assert!(matches!(
             q.pop(),
             Some(InternalEvent::Update(NeedsUpdate::LOG))
         ));
+    }
+
+    #[test]
+    fn scrolling_to_bottom_loads_more() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut c = LogComponent::new(&ctx);
+        // r60 down to r2: oldest is 2, so more pages exist
+        let entries: Vec<LogEntry> = (2..=60)
+            .rev()
+            .map(|r| entry(r, "a", &format!("commit {r}")))
+            .collect();
+        c.update(entries);
+        assert_eq!(c.entries.len(), 59);
+
+        // scrolling near the bottom requests the next page exactly once
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+        c.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert!(q.pop().is_none(), "duplicate request while in flight");
+
+        // the page arrives and is appended; scrolling continues paging
+        let older: Vec<LogEntry> = vec![entry(1, "a", "commit 1")];
+        c.append(older);
+        assert_eq!(c.entries.len(), 60);
+        // oldest is now r1: no more pages
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn append_failure_allows_retry() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut c = LogComponent::new(&ctx);
+        let entries: Vec<LogEntry> = (2..=60)
+            .rev()
+            .map(|r| entry(r, "a", &format!("commit {r}")))
+            .collect();
+        c.update(entries);
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+        c.append_failed();
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
     }
 
     #[test]

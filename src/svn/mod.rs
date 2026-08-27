@@ -53,6 +53,8 @@ pub enum AsyncSvnNotification {
     UpdateToRevision(Result<String, String>),
     /// Full-history search results (`svn log --search`)
     LogSearch(Result<Vec<LogEntry>, String>),
+    /// Older revisions appended to the log list (pagination)
+    LogAppend(Result<Vec<LogEntry>, String>),
 }
 
 /// The SVN client. Cheap to clone (path + channel).
@@ -186,6 +188,29 @@ impl Svn {
             )
             .map(|out| parser::parse_log(&out));
             AsyncSvnNotification::LogSearch(result)
+        });
+    }
+
+    /// Fetch revisions older than `before_rev` (log tab pagination);
+    /// with `search`, continues a full-history search further back.
+    pub fn log_more(&self, before_rev: u64, limit: usize, search: Option<String>) {
+        let cwd = self.cwd.clone();
+        self.spawn(move || {
+            let mut args: Vec<String> = vec![
+                "log".into(),
+                "-v".into(),
+                "-r".into(),
+                format!("{}:0", before_rev - 1),
+                "-l".into(),
+                limit.to_string(),
+            ];
+            if let Some(p) = search {
+                args.push("--search".into());
+                args.push(p);
+            }
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let result = Self::run_in(&cwd, &arg_refs).map(|out| parser::parse_log(&out));
+            AsyncSvnNotification::LogAppend(result)
         });
     }
 
@@ -574,6 +599,35 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].message, "测试一下提交吧");
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_more_pages_and_searches() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        // revisions older than r2: just r1
+        c.log_more(2, 50, None);
+        match recv(&rx) {
+            AsyncSvnNotification::LogAppend(Ok(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].revision, 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // same range with a search pattern: match and no-match
+        c.log_more(2, 50, Some("initial".into()));
+        match recv(&rx) {
+            AsyncSvnNotification::LogAppend(Ok(entries)) => assert_eq!(entries.len(), 1),
+            other => panic!("unexpected: {other:?}"),
+        }
+        c.log_more(2, 50, Some("no-such-word-xyz".into()));
+        match recv(&rx) {
+            AsyncSvnNotification::LogAppend(Ok(entries)) => assert!(entries.is_empty()),
             other => panic!("unexpected: {other:?}"),
         }
     }

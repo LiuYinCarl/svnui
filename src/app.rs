@@ -228,9 +228,17 @@ impl App {
                 self.log.set_filter(text);
             }
             InternalEvent::SearchLog(pattern) => {
-                self.log.set_search_active();
+                self.log.set_search_active(pattern.clone());
                 self.svn.log_search(&pattern);
                 self.pending += 1;
+            }
+            InternalEvent::LogLoadMore => {
+                let oldest = self.log.entries.last().map(|e| e.revision).unwrap_or(1);
+                if oldest > 1 {
+                    self.svn
+                        .log_more(oldest, 50, self.log.search_pattern().map(str::to_string));
+                    self.pending += 1;
+                }
             }
             InternalEvent::Confirm(action) => {
                 let message = match &action {
@@ -495,6 +503,13 @@ impl App {
                     // "unfiltered server results" mode
                     self.log.clear_search();
                     self.show_error(format!("svn log --search: {e}"));
+                }
+            },
+            AsyncSvnNotification::LogAppend(result) => match result {
+                Ok(entries) => self.log.append(entries),
+                Err(e) => {
+                    self.log.append_failed();
+                    self.show_error(format!("svn log: {e}"));
                 }
             },
             AsyncSvnNotification::FileLog { path, result } => match result {
@@ -1449,6 +1464,33 @@ mod tests {
         assert_eq!(app.log.selection_revision(), Some(2));
         app.handle_async(AsyncSvnNotification::LogSearch(Err("boom".into())));
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn log_load_more_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // pretend the list ends at r2 so older pages exist
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
+            log_entry(3, "third"),
+            log_entry(2, "second"),
+        ])));
+
+        app.queue.push(InternalEvent::LogLoadMore);
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::LogAppend(Ok(_))));
+        app.handle_async(AsyncSvnNotification::LogAppend(Ok(vec![log_entry(
+            1, "first",
+        )])));
+        assert_eq!(app.log.entries.len(), 3);
+
+        // error path: popup + the component can retry
+        app.handle_async(AsyncSvnNotification::LogAppend(Err("boom".into())));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+
+        // oldest is r1 now: the event is a no-op (no svn call)
+        app.queue.push(InternalEvent::LogLoadMore);
+        app.handle_queue_events();
     }
 
     #[test]
