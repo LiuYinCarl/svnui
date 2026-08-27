@@ -2,6 +2,8 @@
 
 一个受 [gitui](https://github.com/gitui-org/gitui) 启发的 SVN (Subversion) 终端 UI 客户端，使用 Rust + [ratatui](https://github.com/ratatui/ratatui) 编写。
 
+![svnui 演示](https://github.com/LiuYinCarl/svnui/releases/download/assets/svnui.gif)
+
 ## 功能
 
 覆盖日常最常用的 SVN 操作：
