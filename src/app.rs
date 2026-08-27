@@ -36,6 +36,8 @@ pub struct App {
     pub popups: Vec<Popup>,
     /// Working copy info (URL / branch / revision), loaded at startup
     pub svn_info: Option<SvnInfo>,
+    /// Directory the app was started on (fallback working-copy label)
+    pub cwd: PathBuf,
     /// Number of outstanding async operations (drives the spinner)
     pub pending: usize,
     pub quitting: bool,
@@ -45,7 +47,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(_cwd: PathBuf, svn: Svn, ctx: Context) -> Self {
+    pub fn new(cwd: PathBuf, svn: Svn, ctx: Context) -> Self {
         let status = StatusTab::new(&ctx);
         let log = LogComponent::new(&ctx);
         Self {
@@ -57,6 +59,7 @@ impl App {
             active_tab: Tab::Status,
             popups: Vec::new(),
             svn_info: None,
+            cwd,
             pending: 0,
             quitting: false,
             fatal_error: None,
@@ -236,13 +239,19 @@ impl App {
                     ConfirmAction::Revert(paths) => {
                         format!("{} ({})", MSG.revert_confirm, paths.join(", "))
                     }
-                    ConfirmAction::Update => MSG.update_confirm.to_string(),
+                    ConfirmAction::Update => format!(
+                        "{}\nWorking copy: {}",
+                        MSG.update_confirm,
+                        self.working_copy_label()
+                    ),
                     ConfirmAction::Resolve(path) => {
                         format!("{} ({path})", MSG.resolve_confirm)
                     }
-                    ConfirmAction::UpdateToRevision(rev) => {
-                        format!("{} (r{rev})", MSG.update_to_rev_confirm)
-                    }
+                    ConfirmAction::UpdateToRevision(rev) => format!(
+                        "{} (r{rev})\nWorking copy: {}",
+                        MSG.update_to_rev_confirm,
+                        self.working_copy_label()
+                    ),
                 };
                 self.show_confirm(message, action);
             }
@@ -325,6 +334,18 @@ impl App {
         self.push_popup(Popup::file_log(&ctx, path));
         self.svn.file_log(path, 50);
         self.pending += 1;
+    }
+
+    /// The working copy root shown in update confirmations: the path from
+    /// `svn info` when loaded, otherwise the directory the app was started
+    /// on.
+    fn working_copy_label(&self) -> String {
+        self.svn_info
+            .as_ref()
+            .map(|i| i.wc_root.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.cwd.to_str().unwrap_or("?"))
+            .to_string()
     }
 
     /// The commit confirmation message: target branch, the files that will
@@ -716,6 +737,7 @@ mod tests {
             url: "file:///repo/trunk".into(),
             branch: "trunk".into(),
             revision: 3,
+            wc_root: "/home/user/wc".into(),
         }
     }
 
@@ -1331,6 +1353,43 @@ mod tests {
         // only the staged file is listed
         assert!(!p.message.contains("a.txt"), "{}", p.message);
         assert!(p.message.contains("\"my commit\""), "{}", p.message);
+    }
+
+    #[test]
+    fn update_confirm_shows_working_copy_path() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+
+        // with svn info loaded: use the Working Copy Root Path
+        app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Update));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(
+            p.message.contains("Working copy: /home/user/wc"),
+            "{}",
+            p.message
+        );
+        app.popups.clear();
+
+        // without svn info: fall back to the startup directory
+        let (mut app2, _rx2) = app_with(&repo);
+        app2.queue
+            .push(InternalEvent::Confirm(ConfirmAction::UpdateToRevision(2)));
+        app2.handle_queue_events();
+        let Some(Popup::Confirm(p2)) = app2.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p2.message.contains("(r2)"), "{}", p2.message);
+        assert!(
+            p2.message
+                .contains(&format!("Working copy: {}", repo.wc.display())),
+            "{}",
+            p2.message
+        );
     }
 
     #[test]

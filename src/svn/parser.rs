@@ -7,12 +7,14 @@ use super::models::{
 /// Parse the plain-text output of `svn info`.
 ///
 /// Only the fields svnui needs are extracted: `URL`, `Relative URL`
-/// (`^/trunk`, `^/branches/x`, ... — missing on very old svn versions) and
-/// `Revision`. `Repository URL:` must not be mistaken for `URL:`.
+/// (`^/trunk`, `^/branches/x`, ... — missing on very old svn versions),
+/// `Revision` and `Working Copy Root Path`. `Repository URL:` must not be
+/// mistaken for `URL:`.
 pub fn parse_info(output: &str) -> SvnInfo {
     let mut url = String::new();
     let mut branch = String::new();
     let mut revision = 0;
+    let mut wc_root = String::new();
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
         if let Some(v) = line.strip_prefix("URL:") {
@@ -26,12 +28,15 @@ pub fn parse_info(output: &str) -> SvnInfo {
                 .to_string();
         } else if let Some(v) = line.strip_prefix("Revision:") {
             revision = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("Working Copy Root Path:") {
+            wc_root = v.trim().to_string();
         }
     }
     SvnInfo {
         url,
         branch,
         revision,
+        wc_root,
     }
 }
 
@@ -384,6 +389,7 @@ Last Changed Rev: 1230
         );
         assert_eq!(info.branch, "branches/feature-x");
         assert_eq!(info.revision, 1234);
+        assert_eq!(info.wc_root, "/home/user/wc");
         assert_eq!(info.branch_label(), "branches/feature-x");
     }
 

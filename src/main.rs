@@ -371,6 +371,7 @@ mod tests {
             url: "file:///repo".into(),
             branch: "trunk".into(),
             revision: 1,
+            wc_root: repo.wc.display().to_string(),
         })));
         app.handle_async(svn::AsyncSvnNotification::Status(Ok(vec![StatusEntry {
             status: 'M',

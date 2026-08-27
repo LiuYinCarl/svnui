@@ -10,6 +10,8 @@ pub struct SvnInfo {
     pub branch: String,
     /// Current working copy revision
     pub revision: u64,
+    /// Local path of the working copy root ("Working Copy Root Path:")
+    pub wc_root: String,
 }
 
 impl SvnInfo {
@@ -141,12 +143,14 @@ mod tests {
             url: "file:///repo/trunk".into(),
             branch: "trunk".into(),
             revision: 42,
+            wc_root: "/wc".into(),
         };
         assert_eq!(info.branch_label(), "trunk");
         let no_rel = SvnInfo {
             url: "file:///repo/trunk".into(),
             branch: String::new(),
             revision: 1,
+            wc_root: String::new(),
         };
         assert_eq!(no_rel.branch_label(), "file:///repo/trunk");
     }
