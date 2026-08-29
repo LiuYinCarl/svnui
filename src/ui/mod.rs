@@ -59,6 +59,52 @@ pub fn render_line_at(f: &mut Frame, x: u16, y: u16, width: u16, line: &Line) {
     f.buffer_mut().set_line(x, y, line, width);
 }
 
+/// Render lines like [`render_lines`], but shifted right by `h_off`
+/// display columns: the first `h_off` columns of every line are skipped.
+/// Used by scrollable code views (diff / blame) so long lines remain
+/// reachable on narrow terminals.
+pub fn render_lines_h(
+    f: &mut Frame,
+    area: Rect,
+    lines: &[Line],
+    scroll: usize,
+    highlights: &[(usize, Style)],
+    h_off: usize,
+) {
+    if h_off == 0 {
+        render_lines(f, area, lines, scroll, highlights);
+        return;
+    }
+    let sliced: Vec<Line> = lines.iter().map(|l| slice_line_left(l, h_off)).collect();
+    render_lines(f, area, &sliced, scroll, highlights);
+}
+
+/// Drop the first `skip` display columns of a line, keeping span styles.
+/// A wide char straddling the cut boundary is replaced by a single space.
+fn slice_line_left(line: &Line, skip: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthChar;
+    let mut col = 0usize;
+    let mut spans: Vec<ratatui::text::Span> = Vec::new();
+    for span in &line.spans {
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col + w <= skip {
+                // fully left of the cut
+            } else if col < skip {
+                text.push(' '); // straddling wide char
+            } else {
+                text.push(ch);
+            }
+            col += w;
+        }
+        if !text.is_empty() {
+            spans.push(ratatui::text::Span::styled(text, span.style));
+        }
+    }
+    Line::from(spans)
+}
+
 /// Compute a centered popup rect with the given width/height constraints.
 pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     // u32 intermediates: `width * percent` overflows u16 on wide terminals
@@ -194,5 +240,38 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert_eq!(buf[(2, 0)].symbol(), "h");
         assert_eq!(buf[(3, 0)].symbol(), "i");
+    }
+
+    #[test]
+    fn render_lines_h_skips_columns_and_keeps_styles() {
+        let backend = TestBackend::new(10, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let red = Style::default().fg(ratatui::style::Color::Red);
+        let lines = vec![
+            Line::from(vec![Span::styled("abcdef", red)]),
+            // "中文ab" is 2+2+1+1 = 6 columns; skipping 3 cuts the 文 in
+            // half, which must collapse to a single space
+            Line::from(vec![Span::styled("中文ab", red)]),
+        ];
+        terminal
+            .draw(|f| {
+                render_lines_h(f, Rect::new(0, 0, 10, 2), &lines, 0, &[], 3);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let row: String = (0..6).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "def   ");
+        assert_eq!(buf[(0, 0)].fg, ratatui::style::Color::Red);
+        let row2: String = (0..4).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert_eq!(row2, " ab ");
+        // offset 0 behaves exactly like render_lines
+        terminal
+            .draw(|f| {
+                render_lines_h(f, Rect::new(0, 0, 10, 2), &lines, 0, &[], 0);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), "a");
+        assert_eq!(buf[(0, 1)].symbol(), "中");
     }
 }

@@ -6,15 +6,20 @@ use super::models::{
 
 /// Parse the plain-text output of `svn info`.
 ///
-/// Only the fields svnui needs are extracted: `URL`, `Relative URL`
-/// (`^/trunk`, `^/branches/x`, ... — missing on very old svn versions),
-/// `Revision` and `Working Copy Root Path`. `Repository URL:` must not be
-/// mistaken for `URL:`.
+/// `URL`, `Relative URL` (`^/trunk`, `^/branches/x`, ... — missing on very
+/// old svn versions), `Revision`, `Working Copy Root Path`, `Repository
+/// Root`, `Repository UUID` and the `Last Changed *` triple are extracted.
+/// `Repository URL:` must not be mistaken for `URL:`.
 pub fn parse_info(output: &str) -> SvnInfo {
     let mut url = String::new();
     let mut branch = String::new();
     let mut revision = 0;
     let mut wc_root = String::new();
+    let mut repo_root = String::new();
+    let mut uuid = String::new();
+    let mut last_author = String::new();
+    let mut last_rev = 0;
+    let mut last_date = String::new();
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
         if let Some(v) = line.strip_prefix("URL:") {
@@ -30,6 +35,16 @@ pub fn parse_info(output: &str) -> SvnInfo {
             revision = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("Working Copy Root Path:") {
             wc_root = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Repository Root:") {
+            repo_root = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Repository UUID:") {
+            uuid = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Last Changed Author:") {
+            last_author = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Last Changed Rev:") {
+            last_rev = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("Last Changed Date:") {
+            last_date = v.trim().to_string();
         }
     }
     SvnInfo {
@@ -37,6 +52,11 @@ pub fn parse_info(output: &str) -> SvnInfo {
         branch,
         revision,
         wc_root,
+        repo_root,
+        uuid,
+        last_author,
+        last_rev,
+        last_date,
     }
 }
 
@@ -387,7 +407,9 @@ Repository UUID: 12345678-1234-1234-1234-123456789012
 Revision: 1234
 Node Kind: directory
 Schedule: normal
+Last Changed Author: alice
 Last Changed Rev: 1230
+Last Changed Date: 2026-01-01 10:00:00 +0000 (Thu, 01 Jan 2026)
 ";
         let info = parse_info(out);
         assert_eq!(
@@ -398,6 +420,15 @@ Last Changed Rev: 1230
         assert_eq!(info.revision, 1234);
         assert_eq!(info.wc_root, "/home/user/wc");
         assert_eq!(info.branch_label(), "branches/feature-x");
+        assert_eq!(info.repo_root, "https://svn.example.com/repos/proj");
+        assert_eq!(info.uuid, "12345678-1234-1234-1234-123456789012");
+        assert_eq!(info.last_author, "alice");
+        assert_eq!(info.last_rev, 1230);
+        assert!(
+            info.last_date.starts_with("2026-01-01"),
+            "{}",
+            info.last_date
+        );
     }
 
     #[test]

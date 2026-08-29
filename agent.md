@@ -35,14 +35,14 @@ src/
 ├── components/
 │   ├── mod.rs        DrawableComponent trait、EventState、Context
 │   ├── status_tree.rs  文件树（目录折叠、暂存、路径过滤）——最大的组件
-│   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用）
+│   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用；h/l 横向滚动看长行）
 │   ├── commit.rs     提交信息输入栏（tui-textarea-2，Tab 回填最近提交信息）
 │   ├── log.rs        日志标签页（修订列表滚动分页 + 详情 + 关键字筛选 + 多选合并 diff）
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
 │   ├── status_filter.rs 状态文件过滤弹窗（输入时实时筛选，回车保留，Esc 还原；Esc 在状态页清除筛选）
 │   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
 │   ├── file_finder.rs  模糊文件搜索弹窗（数据源 svn list -R .@HEAD，fuzzy-matcher 匹配）
-│   ├── blame.rs      blame 弹窗（/ 增量搜索 + n/N 跳转）
+│   ├── blame.rs      blame 弹窗（/ 增量搜索 + n/N 跳转 + 光标行 Enter 看该修订 diff + h/l 横滚）
 │   ├── patches.rs    补丁标签页（列出 patch 目录、预览/应用/删除补丁；patch_dir() 解析存储目录，
 │   │                 SVNUI_PATCH_DIR 可覆盖）
 │   ├── text_search.rs 可复用的增量搜索状态（diff/blame 弹窗共用）

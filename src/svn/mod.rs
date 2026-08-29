@@ -21,6 +21,9 @@ type MutationJob = Box<dyn FnOnce() + Send + 'static>;
 pub enum AsyncSvnNotification {
     /// Working copy check at startup
     Info(Result<SvnInfo, String>),
+    /// Repository overview for the info popup (global `i` key): local +
+    /// remote HEAD info. Boxed: two SvnInfo would make the enum huge.
+    RepoInfo(Result<Box<(SvnInfo, Option<SvnInfo>)>, String>),
     Status(Result<Vec<StatusEntry>, String>),
     Diff {
         path: String,
@@ -191,6 +194,27 @@ impl Svn {
                 AsyncSvnNotification::Info(result)
             },
             |e| AsyncSvnNotification::Info(Err(e)),
+        );
+    }
+
+    /// Repository overview for the info popup (global `i` key): the local
+    /// `svn info` plus the remote HEAD info (`svn info -r HEAD`) so the
+    /// popup can show how far the working copy is behind. A HEAD failure
+    /// (offline, auth, ...) is non-fatal — the head half comes back None.
+    pub fn repo_info(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["info"]).map(|text| {
+                    let local = parser::parse_info(&text);
+                    let head = Self::run_in(&cwd, &["info", "-r", "HEAD"])
+                        .map(|t| parser::parse_info(&t))
+                        .ok();
+                    Box::new((local, head))
+                });
+                AsyncSvnNotification::RepoInfo(result)
+            },
+            |e| AsyncSvnNotification::RepoInfo(Err(e)),
         );
     }
 
@@ -591,6 +615,24 @@ mod tests {
         c2.check_info();
         assert!(matches!(recv(&rx2), AsyncSvnNotification::Info(Err(_))));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_info_returns_local_and_head() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.repo_info();
+        match recv(&rx) {
+            AsyncSvnNotification::RepoInfo(Ok(pair)) => {
+                let (local, head) = *pair;
+                assert!(local.url.contains("file://"), "{local:?}");
+                // a local file:// repo answers the HEAD query
+                let head = head.expect("head info for file:// repo");
+                assert!(head.revision >= local.revision, "{local:?} {head:?}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

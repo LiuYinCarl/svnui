@@ -12,6 +12,16 @@ pub struct SvnInfo {
     pub revision: u64,
     /// Local path of the working copy root ("Working Copy Root Path:")
     pub wc_root: String,
+    /// Repository root URL ("Repository Root:")
+    pub repo_root: String,
+    /// Repository UUID
+    pub uuid: String,
+    /// "Last Changed Author:"
+    pub last_author: String,
+    /// "Last Changed Rev:"
+    pub last_rev: u64,
+    /// "Last Changed Date:" (verbatim, svn formats it localized)
+    pub last_date: String,
 }
 
 impl SvnInfo {
@@ -144,13 +154,18 @@ mod tests {
             branch: "trunk".into(),
             revision: 42,
             wc_root: "/wc".into(),
+            repo_root: "file:///repo".into(),
+            uuid: "u-1".into(),
+            last_author: "alice".into(),
+            last_rev: 40,
+            last_date: "2026-01-01".into(),
         };
         assert_eq!(info.branch_label(), "trunk");
         let no_rel = SvnInfo {
-            url: "file:///repo/trunk".into(),
             branch: String::new(),
             revision: 1,
             wc_root: String::new(),
+            ..info.clone()
         };
         assert_eq!(no_rel.branch_label(), "file:///repo/trunk");
     }

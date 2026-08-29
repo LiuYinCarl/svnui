@@ -25,6 +25,11 @@ impl OutputPopup {
             .lines()
             .map(|l| Line::from(Span::raw(l.to_string())))
             .collect();
+        Self::from_lines(ctx, title, lines)
+    }
+
+    /// Build a popup from pre-styled lines (e.g. the repo-info overview).
+    pub fn from_lines(ctx: &Context, title: String, lines: Vec<Line<'static>>) -> Self {
         Self {
             ctx: ctx.clone(),
             title,

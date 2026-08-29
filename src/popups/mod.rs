@@ -41,7 +41,7 @@ impl Popup {
             Popup::Help(_) => ui::popup_area(area, 75, 75),
             Popup::Output(_) => ui::popup_area(area, 80, 65),
             Popup::Diff(_) => ui::popup_area(area, 92, 92),
-            Popup::Blame(_) => ui::popup_area(area, 85, 85),
+            Popup::Blame(_) => ui::popup_area(area, 92, 92),
             Popup::FileLog(_) => ui::popup_area(area, 75, 70),
             Popup::FileFinder(_) => ui::popup_area(area, 70, 60),
             Popup::LogSearch(_) => ui::popup_area(area, 60, 20),

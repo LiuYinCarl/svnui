@@ -69,6 +69,11 @@ pub struct DiffView {
     pub title: String,
     pub parsed: ParsedDiff,
     pub scroll: Cell<usize>,
+    /// Horizontal scroll offset in display columns (`h`/`l`), so long
+    /// lines stay reachable on narrow terminals
+    pub hscroll: Cell<usize>,
+    /// Display width of the widest line (for clamping `hscroll`)
+    max_width: Cell<usize>,
     pub pending: bool,
     /// Set when there is nothing to show
     pub empty_reason: Option<String>,
@@ -89,6 +94,8 @@ impl DiffView {
             title: title.to_string(),
             parsed: ParsedDiff::default(),
             scroll: Cell::new(0),
+            hscroll: Cell::new(0),
+            max_width: Cell::new(0),
             pending: true,
             empty_reason: None,
             focused: true,
@@ -112,6 +119,7 @@ impl DiffView {
         self.title = title;
         self.pending = true;
         self.empty_reason = None;
+        self.reset_scroll();
     }
 
     /// Show a placeholder message instead of a diff (e.g. "select a file").
@@ -121,14 +129,15 @@ impl DiffView {
         self.empty_reason = Some(reason);
         self.parsed = ParsedDiff::default();
         self.search.clear();
+        self.reset_scroll();
     }
 
     /// Set raw diff text (or raw file content for unversioned files).
     pub fn set_content(&mut self, title: String, content: &str) {
         self.title = title;
         self.pending = false;
-        self.scroll.set(0);
         self.search.clear();
+        self.reset_scroll();
         let trimmed = content.trim();
         if trimmed.is_empty() {
             self.empty_reason = Some("No textual diff".to_string());
@@ -145,6 +154,32 @@ impl DiffView {
             self.parsed = parse_new_file_content(content);
             self.empty_reason = None;
         }
+        self.max_width.set(self.compute_max_width());
+    }
+
+    /// Reset both scroll offsets (new content / placeholder).
+    fn reset_scroll(&self) {
+        self.scroll.set(0);
+        self.hscroll.set(0);
+        self.max_width.set(0);
+    }
+
+    /// Display width of the widest rendered line, including the
+    /// line-number gutter (" 12  34 │ ", 9 columns) for numbered lines.
+    fn compute_max_width(&self) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        self.parsed
+            .lines
+            .iter()
+            .map(|dl| {
+                let w = UnicodeWidthStr::width(dl.content.as_str());
+                match dl.kind {
+                    DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed => w + 9,
+                    _ => w,
+                }
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn event(&mut self, ev: &Event) -> EventState {
@@ -169,6 +204,13 @@ impl DiffView {
             scroll = 0;
         } else if key_match(k, KeyAction::End) {
             scroll = len;
+        } else if key_match(k, KeyAction::MoveLeft) {
+            self.hscroll.set(self.hscroll.get().saturating_sub(8));
+            return EventState::consumed();
+        } else if key_match(k, KeyAction::MoveRight) {
+            // right bound is applied at draw time (needs the area width)
+            self.hscroll.set(self.hscroll.get().saturating_add(8));
+            return EventState::consumed();
         } else {
             return EventState::not_consumed();
         }
@@ -370,13 +412,19 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     let total = view.parsed.lines.len();
     let scroll = ui::clamp_scroll(view.scroll.get(), total, inner.height as usize);
     view.scroll.set(scroll);
+    // clamp the horizontal offset against the widest line
+    let h_off = view
+        .hscroll
+        .get()
+        .min(view.max_width.get().saturating_sub(inner.width as usize));
+    view.hscroll.set(h_off);
     let end = (scroll + inner.height as usize).min(total);
     let mut lines = Vec::with_capacity(end - scroll);
     for i in scroll..end {
         let (ranges, current) = view.search.line_ranges(i);
         lines.push(diff_line(&view.parsed.lines[i], theme, &ranges, current));
     }
-    ui::render_lines(f, inner, &lines, 0, &[]);
+    ui::render_lines_h(f, inner, &lines, 0, &[], h_off);
     if let Some(footer) = footer {
         let line = Line::from(Span::styled(view.search.status_text(), theme.info));
         f.buffer_mut()
@@ -486,6 +534,42 @@ Index: Cargo.toml
         let mut v2 = DiffView::new("t");
         v2.set_header(Vec::new());
         assert!(v2.header().is_empty());
+    }
+
+    #[test]
+    fn horizontal_scroll_shifts_long_lines() {
+        let mut v = DiffView::new("t");
+        let content = format!("Index: f\n@@ -1 +1 @@\n+{}\n", "x".repeat(200));
+        v.set_content("t".into(), &content);
+        assert_eq!(v.hscroll.get(), 0);
+        // l/h move the view by 8 columns
+        v.event(&ts::key(KeyCode::Char('l')));
+        assert_eq!(v.hscroll.get(), 8);
+        v.event(&ts::key(KeyCode::Char('l')));
+        v.event(&ts::key(KeyCode::Char('h')));
+        assert_eq!(v.hscroll.get(), 8);
+        // rendered: skipping 8 columns of the 9-wide gutter leaves one
+        // space before the '+' (row 3 = the added line)
+        let t = ts::render(30, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 30, 6), &v, &Theme::default());
+        });
+        let buf = t.backend().buffer();
+        // skipping 8 columns of the 9-wide gutter leaves one space before
+        // the content ('+' is stripped into the line kind by the parser)
+        assert_eq!(buf[(1, 3)].symbol(), " ");
+        assert_eq!(buf[(2, 3)].symbol(), "x");
+        // scrolling far right clamps at max_width - inner width
+        for _ in 0..40 {
+            v.event(&ts::key(KeyCode::Char('l')));
+        }
+        ts::render(30, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 30, 6), &v, &Theme::default());
+        });
+        assert_eq!(v.hscroll.get(), 209 - 28);
+        // new content resets both offsets
+        v.set_content("t".into(), &content);
+        assert_eq!(v.hscroll.get(), 0);
+        assert_eq!(v.scroll.get(), 0);
     }
 
     #[test]

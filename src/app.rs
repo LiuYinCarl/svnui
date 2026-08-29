@@ -7,7 +7,7 @@ use crate::components::{
     patches::{self, PatchesComponent},
 };
 use crate::keys::{KeyAction, key_match};
-use crate::popups::{DiffPopup, Popup};
+use crate::popups::{DiffPopup, OutputPopup, Popup};
 use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Queue, Tab};
 use crate::status::StatusTab;
 use crate::strings::MSG;
@@ -36,6 +36,160 @@ fn patch_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Compose the repo-info popup lines (global `i`): local `svn info`, the
+/// remote HEAD comparison, and a working-copy change summary. Important
+/// values are styled: section headers bold, revisions yellow, authors
+/// cyan, the behind/up-to-date state yellow/green, status counts in
+/// their usual status colors.
+fn repo_info_lines(
+    local: &SvnInfo,
+    head: Option<&SvnInfo>,
+    tree: &crate::components::status_tree::StatusTreeComponent,
+    theme: &crate::ui::style::Theme,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let section = |out: &mut Vec<Line<'static>>, title: &str| {
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.push(Line::from(Span::styled(
+            title.to_string(),
+            theme.diff_header,
+        )));
+    };
+    let field = |label: &str, value: Span<'static>| {
+        Line::from(vec![
+            Span::styled(format!("  {label:<15}"), theme.dim),
+            value,
+        ])
+    };
+    let changed_spans = |prefix: &str, rev: u64, author: &str, date: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {prefix:<15}"), theme.dim),
+            Span::styled(format!("r{rev}"), theme.log_revision),
+            Span::styled(" by ", theme.dim),
+            Span::styled(author.to_string(), theme.log_author),
+            Span::styled(format!(" ({date})"), theme.dim),
+        ])
+    };
+
+    section(&mut out, "Working copy");
+    out.push(field(
+        "Path:",
+        Span::styled(local.wc_root.clone(), theme.text),
+    ));
+    out.push(field("URL:", Span::styled(local.url.clone(), theme.text)));
+    out.push(field(
+        "Branch:",
+        Span::styled(local.branch_label().to_string(), theme.log_author),
+    ));
+    out.push(field(
+        "Revision:",
+        Span::styled(format!("r{}", local.revision), theme.log_revision),
+    ));
+    if local.last_rev > 0 {
+        out.push(changed_spans(
+            "Last changed:",
+            local.last_rev,
+            &local.last_author,
+            &local.last_date,
+        ));
+    }
+
+    section(&mut out, "Repository");
+    out.push(field(
+        "Root:",
+        Span::styled(local.repo_root.clone(), theme.text),
+    ));
+    out.push(field("UUID:", Span::styled(local.uuid.clone(), theme.text)));
+    match head {
+        Some(h) => {
+            // SVN wcs are mixed-revision; this compares the root BASE
+            let state = if h.revision > local.revision {
+                Span::styled(
+                    format!(
+                        "  (working copy is {} revisions behind)",
+                        h.revision - local.revision
+                    ),
+                    theme.status_modified,
+                )
+            } else {
+                Span::styled("  (up to date)".to_string(), theme.status_added)
+            };
+            out.push(Line::from(vec![
+                Span::styled(format!("  {:<15}", "HEAD:"), theme.dim),
+                Span::styled(format!("r{}", h.revision), theme.log_revision),
+                state,
+            ]));
+            if h.last_rev > 0 {
+                out.push(changed_spans(
+                    "Last commit:",
+                    h.last_rev,
+                    &h.last_author,
+                    &h.last_date,
+                ));
+            }
+        }
+        None => {
+            out.push(field(
+                "HEAD:",
+                Span::styled("unknown (repository unreachable)".to_string(), theme.error),
+            ));
+        }
+    }
+
+    section(&mut out, "Working copy changes");
+    let mut counts: std::collections::BTreeMap<char, usize> = Default::default();
+    for (c, _) in tree.changed_files() {
+        *counts.entry(c).or_default() += 1;
+    }
+    let labels = [
+        ('M', "modified"),
+        ('A', "added"),
+        ('D', "deleted"),
+        ('C', "conflicted"),
+        ('!', "missing"),
+        ('?', "unversioned"),
+    ];
+    let mut known = 0;
+    // (text, style of the count) pairs joined by dim separators
+    let mut parts: Vec<(String, Option<char>)> = Vec::new();
+    for (c, label) in labels {
+        if let Some(n) = counts.get(&c) {
+            known += n;
+            parts.push((format!("{n} {label}"), Some(c)));
+        }
+    }
+    let total: usize = counts.values().sum();
+    if total > known {
+        parts.push((format!("{} other", total - known), None));
+    }
+    if parts.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  clean".to_string(),
+            theme.status_added,
+        )));
+    } else {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, (text, c)) in parts.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(", ", theme.dim));
+            }
+            let style = c.map(|c| theme.status_style(c)).unwrap_or(theme.text);
+            spans.push(Span::styled(text.clone(), style));
+        }
+        out.push(Line::from(spans));
+    }
+    let staged = tree.staged_count();
+    if staged > 0 {
+        out.push(Line::from(vec![
+            Span::styled("  Staged for commit: ".to_string(), theme.dim),
+            Span::styled(staged.to_string(), theme.diff_added),
+        ]));
+    }
+    out
 }
 
 /// Cap for the patch preview: the file is read and parsed synchronously
@@ -193,6 +347,9 @@ impl App {
             self.pending += 1;
         } else if key_match(k, KeyAction::SavePatch) {
             self.svn.create_patch();
+            self.pending += 1;
+        } else if key_match(k, KeyAction::RepoInfo) {
+            self.svn.repo_info();
             self.pending += 1;
         } else if key_match(k, KeyAction::FocusNext) {
             match self.active_tab {
@@ -604,6 +761,20 @@ impl App {
                 }
                 Err(e) => self.show_error(format!("svn status: {e}")),
             },
+            AsyncSvnNotification::RepoInfo(result) => match result {
+                Ok(pair) => {
+                    let (local, head) = *pair;
+                    let lines =
+                        repo_info_lines(&local, head.as_ref(), &self.status.tree, &self.ctx.theme);
+                    let ctx = self.ctx.clone();
+                    self.push_popup(Popup::Output(OutputPopup::from_lines(
+                        &ctx,
+                        "Repo info".to_string(),
+                        lines,
+                    )));
+                }
+                Err(e) => self.show_error(format!("svn info: {e}")),
+            },
             AsyncSvnNotification::Diff { path, result } => match result {
                 Ok(content) => {
                     self.status.apply_diff(&path, &content);
@@ -943,7 +1114,7 @@ impl App {
             Tab::Patches => patches::HINTS,
         };
         spans.push(Span::styled(
-            format!("{hints}  ? help  q quit  [1]status [2]log [3]patches"),
+            format!("{hints}  ? help  i info  q quit  [1]status [2]log [3]patches"),
             theme.dim,
         ));
         let line = Line::from(spans);
@@ -970,6 +1141,11 @@ mod tests {
             branch: "trunk".into(),
             revision: 3,
             wc_root: "/home/user/wc".into(),
+            repo_root: "file:///repo".into(),
+            uuid: "12345678-1234-1234-1234-123456789012".into(),
+            last_author: "alice".into(),
+            last_rev: 3,
+            last_date: "2026-01-01 10:00:00 +0000".into(),
         }
     }
 
@@ -1679,6 +1855,101 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(s.contains("[trunk]"), "{s}");
+    }
+
+    #[test]
+    fn repo_info_key_shows_output_popup() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // 'i' is a global app-level key
+        app.handle_input(&ts_key(KeyCode::Char('i'))).unwrap();
+        assert!(app.pending > 0);
+        match recv(&rx) {
+            AsyncSvnNotification::RepoInfo(Ok(pair)) => {
+                let (local, head) = *pair;
+                assert!(local.url.contains("file://"), "{local:?}");
+                assert!(head.is_some(), "file:// repo answers the HEAD query");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // the composed overview lands in a scrollable output popup
+        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
+            entry('M', "a.txt"),
+            entry('?', "b.txt"),
+        ])));
+        app.status.tree.set_staged(&["a.txt".into()]);
+        let mut head = test_info();
+        head.revision = 10;
+        app.handle_async(AsyncSvnNotification::RepoInfo(Ok(Box::new((
+            test_info(),
+            Some(head),
+        )))));
+        let Some(Popup::Output(o)) = app.popups.last() else {
+            panic!("expected output popup");
+        };
+        assert_eq!(o.title, "Repo info");
+        let text = o
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("URL:           file:///repo/trunk"), "{text}");
+        assert!(text.contains("HEAD:          r10"), "{text}");
+        assert!(text.contains("7 revisions behind"), "{text}");
+        assert!(text.contains("1 modified, 1 unversioned"), "{text}");
+        assert!(text.contains("Staged for commit: 1"), "{text}");
+        // styling: the behind warning is yellow, counts carry status colors
+        let behind = o
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("revisions behind"))
+            .unwrap();
+        assert_eq!(
+            behind.spans.last().unwrap().style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+        let changes = o
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("modified"))
+            .unwrap();
+        assert_eq!(
+            changes.spans[1].style.fg,
+            Some(ratatui::style::Color::Yellow),
+            "modified count"
+        );
+        assert_eq!(
+            changes.spans[3].style.fg,
+            Some(ratatui::style::Color::Cyan),
+            "unversioned count"
+        );
+        // unreachable repo: HEAD marked unknown, no panic
+        app.handle_async(AsyncSvnNotification::RepoInfo(Ok(Box::new((
+            test_info(),
+            None,
+        )))));
+        let Some(Popup::Output(o2)) = app.popups.last() else {
+            panic!("expected output popup");
+        };
+        let text2 = o2
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text2.contains("unknown (repository unreachable)"),
+            "{text2}"
+        );
+        // error path: plain error message instead
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::RepoInfo(Err("boom".into())));
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.is_error);
+        assert!(m.message.contains("boom"), "{}", m.message);
     }
 
     #[test]

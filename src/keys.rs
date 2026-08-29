@@ -53,6 +53,8 @@ pub enum KeyAction {
     SwitchTabStatus,
     SwitchTabLog,
     Help,
+    /// Show repository / working-copy info (svn info, global)
+    RepoInfo,
     Confirm,
     Deny,
     ClosePopup,
@@ -111,6 +113,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::SwitchTabLog => is_key(ev, KeyCode::Char('2')),
         KeyAction::SwitchTabPatches => is_key(ev, KeyCode::Char('3')),
         KeyAction::Help => is_key(ev, KeyCode::Char('?')),
+        KeyAction::RepoInfo => is_key(ev, KeyCode::Char('i')),
         KeyAction::Confirm => is_key(ev, KeyCode::Char('y')) || is_key(ev, KeyCode::Char('Y')),
         KeyAction::Deny => is_key(ev, KeyCode::Char('n')) || is_key(ev, KeyCode::Char('N')),
         KeyAction::ClosePopup => is_key(ev, KeyCode::Esc),
@@ -190,6 +193,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
                 KeyBinding::new("P", "Save working-copy changes as a patch file (no revert)"),
                 KeyBinding::new("F5 / R", "Refresh status / log / patch list"),
+                KeyBinding::new("i", "Show repository / working-copy info (svn info)"),
                 KeyBinding::new("?", "Show this help"),
                 KeyBinding::new("q", "Quit svnui"),
             ],
@@ -240,6 +244,11 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
             bindings: vec![
                 KeyBinding::new("/", "Diff / blame popup: search text (live)"),
                 KeyBinding::new("n / N", "Diff / blame search: next / previous match"),
+                KeyBinding::new(
+                    "h / l",
+                    "Diff / blame popup: scroll long lines left / right",
+                ),
+                KeyBinding::new("Enter", "Blame popup: diff of the cursor line's revision"),
                 KeyBinding::new("Ctrl+b", "File finder: blame highlighted file"),
                 KeyBinding::new("b", "File history popup: blame the file"),
                 KeyBinding::new(
@@ -313,6 +322,7 @@ mod tests {
         ));
         assert!(key_match(&key(KeyCode::Char('2')), KeyAction::SwitchTabLog));
         assert!(key_match(&key(KeyCode::Char('?')), KeyAction::Help));
+        assert!(key_match(&key(KeyCode::Char('i')), KeyAction::RepoInfo));
         assert!(key_match(&key(KeyCode::Char('y')), KeyAction::Confirm));
         assert!(key_match(&key(KeyCode::Char('Y')), KeyAction::Confirm));
         assert!(key_match(&key(KeyCode::Char('n')), KeyAction::Deny));

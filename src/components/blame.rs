@@ -20,6 +20,13 @@ pub struct BlamePopup {
     pub lines: Vec<BlameLine>,
     pub pending: bool,
     scroll: Cell<usize>,
+    /// Cursor: index of the highlighted line; Enter opens that line's
+    /// revision diff. `scroll` is derived from it at draw time.
+    selected: Cell<usize>,
+    /// Horizontal scroll offset in display columns (`h`/`l`)
+    hscroll: Cell<usize>,
+    /// Display width of the widest rendered line (for clamping)
+    max_width: Cell<usize>,
     /// Incremental search over the blame content (`/`, n/N)
     pub search: TextSearch,
 }
@@ -32,24 +39,41 @@ impl BlamePopup {
             lines: Vec::new(),
             pending: true,
             scroll: Cell::new(0),
+            selected: Cell::new(0),
+            hscroll: Cell::new(0),
+            max_width: Cell::new(0),
             search: TextSearch::new(),
         }
     }
 
     pub fn update(&mut self, lines: Vec<BlameLine>) {
+        use unicode_width::UnicodeWidthStr;
         self.pending = false;
+        // rendered line: 7-col revision + space + author + 2 spaces + content
+        self.max_width.set(
+            lines
+                .iter()
+                .map(|l| {
+                    10 + UnicodeWidthStr::width(l.author.as_str())
+                        + UnicodeWidthStr::width(l.content.as_str())
+                })
+                .max()
+                .unwrap_or(0),
+        );
         self.lines = lines;
         self.scroll.set(0);
+        self.selected.set(0);
+        self.hscroll.set(0);
         self.search.clear();
     }
 
-    /// Recompute search matches against the blame content and scroll to
-    /// the (new) current match.
+    /// Recompute search matches against the blame content and move the
+    /// cursor to the (new) current match.
     fn refresh_search(&mut self) {
         let lines: Vec<&str> = self.lines.iter().map(|l| l.content.as_str()).collect();
-        self.search.recompute(&lines, self.scroll.get());
+        self.search.recompute(&lines, self.selected.get());
         if let Some(line) = self.search.current_match_line() {
-            self.scroll.set(line);
+            self.selected.set(line);
         }
     }
 
@@ -79,30 +103,48 @@ impl BlamePopup {
             return Ok(EventState::not_consumed());
         };
         let len = self.lines.len();
-        let mut scroll = self.scroll.get();
+        let mut selected = self.selected.get();
         if key_match(k, KeyAction::MoveDown) {
-            scroll = scroll.saturating_add(1);
+            selected = selected.saturating_add(1);
         } else if key_match(k, KeyAction::MoveUp) {
-            scroll = scroll.saturating_sub(1);
+            selected = selected.saturating_sub(1);
         } else if key_match(k, KeyAction::PageDown) {
-            scroll = scroll.saturating_add(20);
+            selected = selected.saturating_add(20);
         } else if key_match(k, KeyAction::PageUp) {
-            scroll = scroll.saturating_sub(20);
+            selected = selected.saturating_sub(20);
         } else if key_match(k, KeyAction::Home) {
-            scroll = 0;
+            selected = 0;
         } else if key_match(k, KeyAction::End) {
-            scroll = len;
+            selected = len.saturating_sub(1);
+        } else if key_match(k, KeyAction::MoveLeft) {
+            self.hscroll.set(self.hscroll.get().saturating_sub(8));
+            return Ok(EventState::consumed());
+        } else if key_match(k, KeyAction::MoveRight) {
+            // right bound is applied at draw time (needs the area width)
+            self.hscroll.set(self.hscroll.get().saturating_add(8));
+            return Ok(EventState::consumed());
+        } else if key_match(k, KeyAction::Enter) {
+            // jump to the diff of the revision that last touched this line
+            if let Some(bl) = self.lines.get(selected) {
+                match bl.revision {
+                    Some(rev) => self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev)),
+                    None => self.ctx.queue.push(InternalEvent::ShowInfoMsg(
+                        "line is not committed yet (no revision)".to_string(),
+                    )),
+                }
+            }
+            return Ok(EventState::consumed());
         } else if key_match(k, KeyAction::Filter) {
             self.search.start_input();
             return Ok(EventState::consumed());
         } else if k.code == KeyCode::Char('n') && !k.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(line) = self.search.next_match() {
-                self.scroll.set(line);
+                self.selected.set(line);
             }
             return Ok(EventState::consumed());
         } else if k.code == KeyCode::Char('N') && !k.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(line) = self.search.prev_match() {
-                self.scroll.set(line);
+                self.selected.set(line);
             }
             return Ok(EventState::consumed());
         } else if key_match(k, KeyAction::Quit) {
@@ -114,7 +156,7 @@ impl BlamePopup {
         } else {
             return Ok(EventState::not_consumed());
         }
-        self.scroll.set(scroll.min(len));
+        self.selected.set(ui::clamp_index(selected, len));
         Ok(EventState::consumed())
     }
 }
@@ -168,15 +210,34 @@ impl DrawableComponent for BlamePopup {
             (inner, None)
         };
         let total = self.lines.len();
-        let scroll = ui::clamp_scroll(self.scroll.get(), total, inner.height as usize);
+        let selected = ui::clamp_index(self.selected.get(), total);
+        self.selected.set(selected);
+        // keep the cursor line inside the visible window
+        let height = inner.height as usize;
+        let mut scroll = ui::clamp_scroll(self.scroll.get(), total, height);
+        if selected < scroll {
+            scroll = selected;
+        } else if height > 0 && selected >= scroll + height {
+            scroll = selected + 1 - height;
+        }
+        let scroll = ui::clamp_scroll(scroll, total, height);
         self.scroll.set(scroll);
-        let end = (scroll + inner.height as usize).min(total);
+        let end = (scroll + height).min(total);
         let mut lines: Vec<Line> = Vec::with_capacity(end - scroll);
         for i in scroll..end {
             let (ranges, current) = self.search.line_ranges(i);
             lines.push(blame_line(&self.lines[i], theme, &ranges, current));
         }
-        ui::render_lines(f, inner, &lines, 0, &[]);
+        // clamp the horizontal offset against the widest line
+        let h_off = self
+            .hscroll
+            .get()
+            .min(self.max_width.get().saturating_sub(inner.width as usize));
+        self.hscroll.set(h_off);
+        // `lines` is the pre-sliced window, so the highlight index is
+        // relative to it
+        let highlights = [(selected - scroll, Style::default().bg(theme.selection_bg))];
+        ui::render_lines_h(f, inner, &lines, 0, &highlights, h_off);
         if let Some(footer) = footer {
             let line = Line::from(Span::styled(self.search.status_text(), theme.info));
             f.buffer_mut()
@@ -253,24 +314,76 @@ mod tests {
         assert!(!b.pending);
         b.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();
-        assert_eq!(b.scroll.get(), 1);
+        assert_eq!(b.selected.get(), 1);
         b.event(&ts::key(crossterm::event::KeyCode::Char('G')))
             .unwrap();
-        assert_eq!(b.scroll.get(), 3);
+        assert_eq!(b.selected.get(), 2);
         b.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();
-        assert_eq!(b.scroll.get(), 3); // bounded
+        assert_eq!(b.selected.get(), 2); // bounded
         b.event(&ts::key(crossterm::event::KeyCode::Char('g')))
             .unwrap();
-        assert_eq!(b.scroll.get(), 0);
+        assert_eq!(b.selected.get(), 0);
         b.event(&ts::key(crossterm::event::KeyCode::PageDown))
             .unwrap();
+        assert_eq!(b.selected.get(), 2);
         b.event(&ts::key(crossterm::event::KeyCode::PageUp))
             .unwrap();
+        assert_eq!(b.selected.get(), 0);
         // q closes
         b.event(&ts::key(crossterm::event::KeyCode::Char('q')))
             .unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+    }
+
+    #[test]
+    fn enter_opens_revision_diff_of_cursor_line() {
+        let (mut b, q) = blame_with_lines();
+        // cursor starts on line 0, whose revision is 1
+        b.event(&ts::key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RequestRevisionDiff(1))
+        ));
+        // move the cursor down, Enter follows it
+        b.event(&ts::key(KeyCode::Char('j'))).unwrap();
+        b.event(&ts::key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RequestRevisionDiff(2))
+        ));
+        // uncommitted lines have no revision to jump to
+        let (mut b2, q2) = {
+            let q = crate::queue::Queue::new();
+            let ctx = Context {
+                queue: q.clone(),
+                theme: Theme::default(),
+            };
+            let mut b = BlamePopup::new(&ctx, "f");
+            b.update(vec![line(None, "-", "uncommitted")]);
+            (b, q)
+        };
+        b2.event(&ts::key(KeyCode::Enter)).unwrap();
+        assert!(matches!(q2.pop(), Some(InternalEvent::ShowInfoMsg(_))));
+    }
+
+    #[test]
+    fn horizontal_scroll_clamps_at_draw() {
+        let (mut b, _q) = blame_with_lines();
+        // h saturates at 0, l moves right by 8 columns
+        b.event(&ts::key(KeyCode::Char('h'))).unwrap();
+        assert_eq!(b.hscroll.get(), 0);
+        b.event(&ts::key(KeyCode::Char('l'))).unwrap();
+        assert_eq!(b.hscroll.get(), 8);
+        // draw clamps against the widest line: inner width is 22 here
+        ts::render(24, 8, |f| {
+            b.draw(f, Rect::new(0, 0, 24, 8)).unwrap();
+        });
+        assert_eq!(b.hscroll.get(), b.max_width.get() - 22);
+        // new blame data resets the offset
+        b.update(vec![line(Some(1), "a", "x")]);
+        assert_eq!(b.hscroll.get(), 0);
+        assert_eq!(b.max_width.get(), 12);
     }
 
     fn blame_with_lines() -> (BlamePopup, crate::queue::Queue) {
@@ -303,9 +416,9 @@ mod tests {
         for c in "needle".chars() {
             b.event(&ts::key(KeyCode::Char(c))).unwrap();
         }
-        // live: both matches found, scrolled to the first (line index 7)
+        // live: both matches found, cursor on the first (line index 7)
         assert_eq!(b.search.match_count(), 2);
-        assert_eq!(b.scroll.get(), 7);
+        assert_eq!(b.selected.get(), 7);
         let t = ts::render(60, 8, |f| {
             b.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
         });
@@ -317,15 +430,15 @@ mod tests {
         assert!(!b.search.is_input_mode());
         assert!(b.search.is_active());
         b.event(&ts::key(KeyCode::Char('n'))).unwrap();
-        assert_eq!(b.scroll.get(), 14);
+        assert_eq!(b.selected.get(), 14);
         assert_eq!(b.search.status_text(), "/needle  [2/2]");
         b.event(&ts::key(KeyCode::Char('n'))).unwrap();
-        assert_eq!(b.scroll.get(), 7); // wrapped
+        assert_eq!(b.selected.get(), 7); // wrapped
         b.event(&ts::key(KeyCode::Char('N'))).unwrap();
-        assert_eq!(b.scroll.get(), 14);
+        assert_eq!(b.selected.get(), 14);
         // scroll keys still work with highlights active
         b.event(&ts::key(KeyCode::Char('g'))).unwrap();
-        assert_eq!(b.scroll.get(), 0);
+        assert_eq!(b.selected.get(), 0);
         // first Esc clears highlights, second closes
         b.event(&ts::key(KeyCode::Esc)).unwrap();
         assert!(!b.search.is_active());
@@ -385,5 +498,10 @@ mod tests {
         assert!(s.contains("kenshin"), "{s}");
         assert!(s.contains("fn main() {"), "{s}");
         assert!(s.contains("todo"), "{s}");
+        // the cursor line (first line, row 1 inside the border) is
+        // highlighted with the selection background
+        let buf = t3.backend().buffer();
+        let sel = ratatui::style::Color::Rgb(0x3b, 0x42, 0x61);
+        assert!((0..80).any(|x| buf[(x, 1)].bg == sel));
     }
 }
