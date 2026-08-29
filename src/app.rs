@@ -55,6 +55,9 @@ pub struct App {
     pub popups: Vec<Popup>,
     /// Working copy info (URL / branch / revision), loaded at startup
     pub svn_info: Option<SvnInfo>,
+    /// svn client version ("1.14.5"), checked against MIN_SVN_VERSION at
+    /// startup; also shown in the repo-info popup
+    pub svn_version: Option<String>,
     /// Directory the app was started on (fallback working-copy label)
     pub cwd: PathBuf,
     /// Number of outstanding async operations (drives the spinner)
@@ -80,6 +83,7 @@ impl App {
             active_tab: Tab::Status,
             popups: Vec::new(),
             svn_info: None,
+            svn_version: None,
             cwd,
             pending: 0,
             quitting: false,
@@ -144,7 +148,8 @@ impl App {
 
     pub fn start(&mut self) {
         self.svn.check_info();
-        self.pending += 1;
+        self.svn.version();
+        self.pending += 2;
     }
 
     // ----- event dispatch -----
@@ -587,6 +592,27 @@ impl App {
     pub fn handle_async(&mut self, notif: AsyncSvnNotification) {
         self.pending = self.pending.saturating_sub(1);
         match notif {
+            AsyncSvnNotification::Version(result) => {
+                // check_info fails fatally on its own when svn is missing;
+                // a version-query failure alone is not fatal
+                if let Ok(text) = result {
+                    let ver = crate::svn::parser::parse_version(&text);
+                    self.svn_version = ver.map(|(a, b, c)| format!("{a}.{b}.{c}"));
+                    let ok = ver.is_some_and(|v| {
+                        crate::svn::parser::version_at_least(v, crate::svn::MIN_SVN_VERSION)
+                    });
+                    if !ok {
+                        let (a, b, c) = crate::svn::MIN_SVN_VERSION;
+                        self.show_error(format!(
+                            "svn client is too old: found {}, need >= {a}.{b}.{c}\n\
+                             (svn log --search needs 1.8, svn patch needs 1.7)\n\
+                             svnui may misbehave; please upgrade subversion",
+                            ver.map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                                .unwrap_or_else(|| format!("unparseable {:?}", text.trim())),
+                        ));
+                    }
+                }
+            }
             AsyncSvnNotification::Info(result) => match result {
                 Ok(info) => {
                     self.svn_info = Some(info);
@@ -615,6 +641,7 @@ impl App {
                         head.as_ref(),
                         &self.status.tree.changed_files(),
                         self.status.tree.staged_count(),
+                        self.svn_version.as_deref(),
                         &self.ctx.theme,
                     );
                     let ctx = self.ctx.clone();
@@ -1043,9 +1070,34 @@ mod tests {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
         app.start();
-        // wait for the working-copy check
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Info(Ok(_))));
-        // processing it triggers status + log fetches (order not guaranteed)
+        // startup issues the working-copy check AND the version gate
+        // (concurrent; order not guaranteed)
+        let first = recv(&rx);
+        let second = recv(&rx);
+        assert!(matches!(
+            (&first, &second),
+            (
+                AsyncSvnNotification::Info(Ok(_)),
+                AsyncSvnNotification::Version(Ok(_))
+            ) | (
+                AsyncSvnNotification::Version(Ok(_)),
+                AsyncSvnNotification::Info(Ok(_))
+            )
+        ));
+        // the version gate stores the client version (and stays quiet for
+        // a recent svn)
+        let version = [&first, &second].iter().find_map(|n| match n {
+            AsyncSvnNotification::Version(Ok(v)) => Some(v.clone()),
+            _ => None,
+        });
+        if let Some(v) = version {
+            app.handle_async(AsyncSvnNotification::Version(Ok(v)));
+            assert!(app.svn_version.is_some());
+            assert!(app.popups.is_empty());
+        } else {
+            panic!("startup did not issue the version check");
+        }
+        // processing info triggers status + log fetches (order not guaranteed)
         app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
         let first = recv(&rx);
         let second = recv(&rx);
@@ -1068,6 +1120,29 @@ mod tests {
             )
         ));
         assert!(app.pending > 0);
+    }
+
+    #[test]
+    fn old_svn_version_warns() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        // below MIN_SVN_VERSION (1.8): non-fatal error popup
+        app.handle_async(AsyncSvnNotification::Version(Ok("1.7.19".into())));
+        assert_eq!(app.svn_version.as_deref(), Some("1.7.19"));
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected version warning");
+        };
+        assert!(m.is_error);
+        assert!(m.message.contains("too old"), "{}", m.message);
+        assert!(app.fatal_error.is_none(), "version gate is not fatal");
+        // unparseable output still warns (better safe than silent)
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::Version(Ok("???".into())));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        // a failing version query alone is not fatal either
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::Version(Err("no svn".into())));
+        assert!(app.popups.is_empty());
     }
 
     #[test]

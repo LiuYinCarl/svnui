@@ -16,11 +16,17 @@ use std::process::Command;
 /// One queued working-copy mutation, executed by the mutation worker.
 type MutationJob = Box<dyn FnOnce() + Send + 'static>;
 
+/// Minimum supported svn client version. Determined by the youngest
+/// features svnui uses: `svn log --search` (1.8) and `svn patch` (1.7).
+pub const MIN_SVN_VERSION: (u32, u32, u32) = (1, 8, 0);
+
 /// Result of a finished SVN background operation.
 #[derive(Clone, Debug)]
 pub enum AsyncSvnNotification {
     /// Working copy check at startup
     Info(Result<SvnInfo, String>),
+    /// `svn --version --quiet` output (startup version gate)
+    Version(Result<String, String>),
     /// Repository overview for the info popup (global `i` key): local +
     /// remote HEAD info. Boxed: two SvnInfo would make the enum huge.
     RepoInfo(Result<Box<(SvnInfo, Option<SvnInfo>)>, String>),
@@ -194,6 +200,18 @@ impl Svn {
                 AsyncSvnNotification::Info(result)
             },
             |e| AsyncSvnNotification::Info(Err(e)),
+        );
+    }
+
+    /// Client version (`svn --version --quiet`) for the startup gate.
+    pub fn version(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["--version", "--quiet"]);
+                AsyncSvnNotification::Version(result)
+            },
+            |e| AsyncSvnNotification::Version(Err(e)),
         );
     }
 

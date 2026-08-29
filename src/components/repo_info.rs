@@ -16,6 +16,7 @@ pub fn repo_info_lines(
     head: Option<&SvnInfo>,
     changed_files: &[(char, String)],
     staged_count: usize,
+    client_version: Option<&str>,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -45,6 +46,12 @@ pub fn repo_info_lines(
     };
 
     section(&mut out, "Working copy");
+    if let Some(v) = client_version {
+        out.push(field(
+            "Client:",
+            Span::styled(format!("svn {v}"), theme.text),
+        ));
+    }
     out.push(field(
         "Path:",
         Span::styled(local.wc_root.clone(), theme.text),
@@ -220,8 +227,10 @@ mod tests {
             Some(&head),
             &tree.changed_files(),
             tree.staged_count(),
+            Some("1.14.5"),
             &theme,
         ));
+        assert!(text.contains("Client:        svn 1.14.5"), "{text}");
         assert!(text.contains("HEAD:          r3"), "{text}");
         assert!(text.contains("(up to date)"), "{text}");
         assert!(!text.contains("revisions behind"), "{text}");
@@ -240,6 +249,7 @@ mod tests {
             Some(&test_info()),
             &tree.changed_files(),
             tree.staged_count(),
+            None,
             &Theme::default(),
         ));
         assert!(text.contains("2 other"), "{text}");
@@ -260,6 +270,7 @@ mod tests {
             Some(&test_info()),
             &tree.changed_files(),
             tree.staged_count(),
+            None,
             &Theme::default(),
         ));
         assert!(!text.contains("Last changed:"), "{text}");

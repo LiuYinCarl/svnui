@@ -32,7 +32,8 @@ Covers the most common daily SVN operations:
 ## Install & run
 
 ```bash
-# requires the Rust toolchain and the svn client
+# requires the Rust toolchain and an svn client >= 1.8 (checked asynchronously
+# at startup; older versions get a warning popup)
 cargo build --release
 
 # run inside an SVN working copy

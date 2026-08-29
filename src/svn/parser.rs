@@ -4,6 +4,22 @@ use super::models::{
     BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, StatusEntry, SvnInfo,
 };
 
+/// Parse `svn --version --quiet` output ("1.14.5" or "1.14.5 (r1876290)")
+/// into (major, minor, patch).
+pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let text = text.trim();
+    let mut parts = text.split(['.', ' ', '(']);
+    let major: u32 = parts.next()?.trim().parse().ok()?;
+    let minor: u32 = parts.next()?.trim().parse().ok()?;
+    let patch: u32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Lexicographic version comparison: is `v` at least `min`?
+pub fn version_at_least(v: (u32, u32, u32), min: (u32, u32, u32)) -> bool {
+    v >= min
+}
+
 /// Parse the plain-text output of `svn info`.
 ///
 /// `URL`, `Relative URL` (`^/trunk`, `^/branches/x`, ... — missing on very
@@ -447,6 +463,22 @@ mod tests {
     /// A root that matches nothing on disk (is_dir always false).
     fn no_root() -> &'static Path {
         Path::new("/svnui-test-no-such-dir")
+    }
+
+    #[test]
+    fn test_parse_version() {
+        assert_eq!(parse_version("1.14.5"), Some((1, 14, 5)));
+        assert_eq!(parse_version("1.14.5 (r1876290)\n"), Some((1, 14, 5)));
+        assert_eq!(parse_version("1.8"), Some((1, 8, 0)));
+        assert_eq!(parse_version("???"), None);
+        assert_eq!(parse_version(""), None);
+        assert!(version_at_least((1, 14, 5), crate::svn::MIN_SVN_VERSION));
+        assert!(version_at_least(
+            crate::svn::MIN_SVN_VERSION,
+            crate::svn::MIN_SVN_VERSION
+        ));
+        assert!(!version_at_least((1, 7, 99), crate::svn::MIN_SVN_VERSION));
+        assert!(version_at_least((2, 0, 0), crate::svn::MIN_SVN_VERSION));
     }
 
     #[test]

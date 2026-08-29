@@ -32,7 +32,7 @@
 ## 安装与运行
 
 ```bash
-# 需要 Rust 工具链和 svn 客户端
+# 需要 Rust 工具链和 svn 客户端（>= 1.8；启动时会异步检查版本，过旧会弹警告）
 cargo build --release
 
 # 在 SVN 工作副本中运行

@@ -112,6 +112,10 @@ cargo fmt --all --check     # 格式门禁
 
 ## SVN 输出格式要点（解析器已处理，改代码前先读）
 
+- **最低版本 1.8**(`svn::MIN_SVN_VERSION`)：由用到的最新特性决定——`svn log --search`
+  (1.8)、`svn patch`(1.7)。启动时 `App::start` 异步发 `check_info` + `version` 两个请求，
+  版本低于门槛时弹非致命警告（`AsyncSvnNotification::Version` 失败本身不致命，svn 缺失由
+  check_info 致命报错）。客户端版本同时显示在 `i` 仓库概览弹窗里。
 - 所有 svn 子进程（含测试辅助）只能从 `Svn::run_in` / `test_support::svn` 发起，
   它们固定 `env_remove("LC_ALL")` + `LC_MESSAGES=C` 保证英文输出。**禁止改成 `LC_ALL=C`**
   （会把 native 编码固定为 ASCII，破坏非 ASCII 的提交与日志显示）。
