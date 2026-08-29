@@ -92,7 +92,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 
 `.github/workflows/` contains three pipelines:
 
-- **ci.yml** — runs on push / PR: fmt, clippy (zero-warning gate), full tests on Linux/macOS, coverage gate (≥ 80%), release builds on three platforms, and a headless stress test: it shallow-clones a rotating open-source repo (redis / clap / slugify), converts it to SVN with git2svn, and drives the app through 60 randomized rounds; the source commit is logged so failures can be reproduced.
+- **ci.yml** — runs on push / PR: fmt, clippy (zero-warning gate), full tests on Linux/macOS, coverage gate (≥ 80%), release builds on three platforms, and headless stress tests: a parallel matrix of 8 popular open-source repos across languages — redis (C) / clap (Rust) / slugify (JS) / requests (Python) / gin (Go) / nlohmann/json (C++) / gson (Java) / ohmyzsh (Shell) — each shallow-cloned, converted to SVN with git2svn, and driven through 60 randomized rounds (15-minute cap per leg); the source commit is logged so failures can be reproduced.
 - **bump.yml** — runs on every push to master/main: bumps the patch version in `Cargo.toml`, commits it (message carries `[skip ci]` so it doesn't trigger itself), tags `vX.Y.Z`, pushes, then calls release.yml to publish. Multiple pushes to the same branch are serialized; a queued run first syncs the branch tip so it never computes a stale version.
 - **release.yml** — runs on `v*` tags (also called by bump.yml): verifies the tag matches the `Cargo.toml` version, builds release binaries on Linux (x86_64), macOS (arm64) and Windows (x86_64), and creates a GitHub Release.
 

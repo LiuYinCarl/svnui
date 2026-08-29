@@ -90,14 +90,28 @@ jobs:
       - name: cargo bench (quick)
         run: cargo bench --bench tree -- --quick
 
-  # Headless stress test against a LIVE open-source repo (rotating by run
-  # number): clone shallow, convert git -> svn with git2svn, drive the app
-  # headlessly. Catches bugs that only real-world histories expose (odd
-  # file names, symlinks, merges). The exact source commit is logged so a
-  # failure can be reproduced.
+  # Headless stress test against LIVE open-source repos (one per language,
+  # all in parallel): clone shallow, convert git -> svn with git2svn, drive
+  # the app headlessly. Catches bugs that only real-world histories expose
+  # (odd file names, symlinks, merges). The exact source commit is logged
+  # so a failure can be reproduced. Each leg is capped at 15 minutes; a
+  # typical leg takes ~3.
   stress:
-    name: Stress (live repo)
+    name: Stress (${{ matrix.name }}, ${{ matrix.lang }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: redis, lang: C, url: https://github.com/redis/redis }
+          - { name: clap, lang: Rust, url: https://github.com/clap-rs/clap }
+          - { name: slugify, lang: JS, url: https://github.com/sindresorhus/slugify }
+          - { name: requests, lang: Python, url: https://github.com/psf/requests }
+          - { name: gin, lang: Go, url: https://github.com/gin-gonic/gin }
+          - { name: json, lang: C++, url: https://github.com/nlohmann/json }
+          - { name: gson, lang: Java, url: https://github.com/google/gson }
+          - { name: ohmyzsh, lang: Shell, url: https://github.com/ohmyzsh/ohmyzsh }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -108,17 +122,10 @@ jobs:
         run: |
           git clone -q --depth 1 https://github.com/LiuYinCarl/git2svn target/tmp/git2svn
           (cd target/tmp/git2svn && go build -o git2svn .)
-      - name: Pick and convert a rotating open-source repo
+      - name: Convert and stress
         run: |
-          repos=(
-            "https://github.com/redis/redis"
-            "https://github.com/clap-rs/clap"
-            "https://github.com/sindresorhus/slugify"
-          )
-          repo="${repos[$((GITHUB_RUN_NUMBER % ${#repos[@]}))]}"
-          echo "stress source: $repo"
           GIT2SVN_DIR="$PWD/target/tmp/git2svn" \
-          STRESS_GIT_URL="$repo" \
+          STRESS_GIT_URL="${{ matrix.url }}" \
           SVNUI_STRESS_ROUNDS=60 \
             scripts/stress_test.sh
         shell: bash
