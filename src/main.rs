@@ -282,7 +282,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use svnui::app::App;
     use svnui::components::Context;
-    use svnui::svn::models::{StatusEntry, SvnInfo};
+    use svnui::svn::models::StatusEntry;
     use svnui::test_support::TestRepo;
 
     #[test]
@@ -374,12 +374,10 @@ mod tests {
         };
         let svn = svn::Svn::new(repo.wc.clone(), tx_async);
         let mut app = App::new(repo.wc.clone(), svn, ctx);
-        app.handle_async(svn::AsyncSvnNotification::Info(Ok(SvnInfo {
-            url: "file:///repo".into(),
-            branch: "trunk".into(),
-            revision: 1,
-            wc_root: repo.wc.display().to_string(),
-        })));
+        // NOTE: do not inject Info(Ok) here — its handler fires REAL svn
+        // status/log fetches whose responses race the injected fixtures
+        // below (a clean wc's empty status would clobber the Cargo.toml
+        // entry whenever the worker finishes before 'q' is processed).
         app.handle_async(svn::AsyncSvnNotification::Status(Ok(vec![StatusEntry {
             status: 'M',
             props_status: ' ',
