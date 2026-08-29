@@ -8,6 +8,11 @@
 #
 # Env knobs:
 #   STRESS_GIT_REPO     git repo to convert   (default ~/dev/github/openless)
+#   STRESS_GIT_URL      clone this URL (shallow, --single-branch) into
+#                       target/tmp and convert that instead; overrides
+#                       STRESS_GIT_REPO. Used by CI to stress against live
+#                       open-source repos.
+#   STRESS_GIT_DEPTH    clone depth for STRESS_GIT_URL (default 200)
 #   STRESS_GIT_BRANCH   branch to convert     (default: current branch,
 #                       falling back to main/master when detached)
 #   SVNUI_STRESS_ROUNDS stress rounds         (default 200)
@@ -18,6 +23,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GIT2SVN_DIR="${GIT2SVN_DIR:-$HOME/dev/github/git2svn}"
 GIT2SVN_BIN="$GIT2SVN_DIR/git2svn"
+STRESS_GIT_URL="${STRESS_GIT_URL:-}"
+STRESS_GIT_DEPTH="${STRESS_GIT_DEPTH:-200}"
 STRESS_GIT_REPO="${STRESS_GIT_REPO:-$HOME/dev/github/openless}"
 STRESS_GIT_BRANCH="${STRESS_GIT_BRANCH:-}"
 export SVNUI_STRESS_ROUNDS="${SVNUI_STRESS_ROUNDS:-200}"
@@ -26,6 +33,19 @@ export SVNUI_STRESS_SEED="${SVNUI_STRESS_SEED:-20260829}"
 STRESS_DIR="$ROOT/target/tmp/stress"
 SVN_REPO="$STRESS_DIR/svn-repo"
 WC="$STRESS_DIR/wc"
+
+# clone a remote repo (shallow) when STRESS_GIT_URL is given; lives
+# OUTSIDE $STRESS_DIR, which the conversion step wipes
+if [[ -n "$STRESS_GIT_URL" ]]; then
+    GIT_SRC="$ROOT/target/tmp/stress-git-src"
+    rm -rf "$GIT_SRC"
+    mkdir -p "$ROOT/target/tmp"
+    echo ">> cloning $STRESS_GIT_URL (depth $STRESS_GIT_DEPTH)"
+    git clone -q --depth "$STRESS_GIT_DEPTH" --single-branch "$STRESS_GIT_URL" "$GIT_SRC"
+    STRESS_GIT_REPO="$GIT_SRC"
+    # record the exact commit for reproducing a failure
+    git -C "$STRESS_GIT_REPO" log -1 --format="   source commit: %H %ci"
+fi
 
 # friendly preflight: fail fast with actionable messages instead of
 # cryptic git2svn/go-build errors when the defaults don't apply

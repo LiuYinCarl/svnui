@@ -241,6 +241,10 @@ impl Svn {
                 // successful diff is legitimate (the change was reverted
                 // between the status fetch and now) — falling back would
                 // show the whole file as added.
+                //
+                // NB: no peg suffix here — svn diff 1.14 rejects pegged
+                // working-copy targets outright (E155010), while it treats
+                // an unpegged `foo@bar` path literally just fine.
                 let result = match Self::run_in(&cwd, &["diff", "--", &path]) {
                     Ok(out) => Ok(out),
                     Err(e) if e.contains("E155010") => Self::read_content_fallback(&cwd, &path),
@@ -294,6 +298,7 @@ impl Svn {
         let err_path = path.clone();
         self.spawn(
             move || {
+                let pegged = Self::peg(&path);
                 let result = Self::run_in(
                     &cwd,
                     &[
@@ -304,7 +309,7 @@ impl Svn {
                         "-l",
                         &limit.to_string(),
                         "--",
-                        &path,
+                        &pegged,
                     ],
                 )
                 .map(|out| parser::parse_log(&out));
@@ -421,7 +426,7 @@ impl Svn {
         let err_path = path.clone();
         self.spawn(
             move || {
-                let result = Self::run_in(&cwd, &["blame", "--", &path])
+                let result = Self::run_in(&cwd, &["blame", "--", &Self::peg(&path)])
                     .map(|out| parser::parse_blame(&out));
                 AsyncSvnNotification::Blame { path, result }
             },
@@ -438,7 +443,7 @@ impl Svn {
         self.spawn_mutating(
             move || {
                 let mut args: Vec<String> = vec!["add".into(), "--".into()];
-                args.extend(paths.iter().cloned());
+                args.extend(paths.iter().map(|p| Self::peg(p)));
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
                 AsyncSvnNotification::Add(result)
@@ -453,7 +458,7 @@ impl Svn {
         self.spawn_mutating(
             move || {
                 let mut args: Vec<String> = vec!["revert".into(), "-R".into(), "--".into()];
-                args.extend(paths.iter().cloned());
+                args.extend(paths.iter().map(|p| Self::peg(p)));
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
                 AsyncSvnNotification::Revert(result)
@@ -467,7 +472,10 @@ impl Svn {
         let path = path.to_string();
         self.spawn_mutating(
             move || {
-                let result = Self::run_in(&cwd, &["resolve", "--accept=working", "--", &path]);
+                let result = Self::run_in(
+                    &cwd,
+                    &["resolve", "--accept=working", "--", &Self::peg(&path)],
+                );
                 AsyncSvnNotification::Resolve(result.map(|_| path.clone()))
             },
             |e| AsyncSvnNotification::Resolve(Err(e)),
@@ -542,7 +550,7 @@ impl Svn {
                 args.push("-m".into());
                 args.push(message);
                 args.push("--".into());
-                args.extend(paths.iter().cloned());
+                args.extend(paths.iter().map(|p| Self::peg(p)));
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let result = Self::run_in(&cwd, &arg_refs);
                 AsyncSvnNotification::Commit(result)
@@ -552,6 +560,14 @@ impl Svn {
     }
 
     // ----- static helpers used by worker threads -----
+
+    /// Suffix a working-copy path with an empty peg revision ("@"), so
+    /// paths containing '@' (e.g. systemd's `foo@.service` unit
+    /// templates) are not misparsed as `path@REV`. `--` does NOT protect
+    /// against this: peg parsing applies to every target argument.
+    fn peg(path: &str) -> String {
+        format!("{path}@")
+    }
 
     fn run_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
         let out = Command::new("svn")
@@ -1098,6 +1114,61 @@ mod tests {
             AsyncSvnNotification::Blame { path, result } => {
                 assert_eq!(path, "untracked.txt");
                 assert!(result.is_err(), "blame of unversioned file must fail");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// Paths containing '@' (systemd unit templates like `foo@.service`)
+    /// must survive all svn subcommands: without the empty peg suffix svn
+    /// parses `@...` as a peg revision and fails with E200009/E205000.
+    #[test]
+    fn at_sign_paths_work_everywhere() {
+        let Some(repo) = TestRepo::new() else { return };
+        let name = "systemd-redis_multiple_servers@.service";
+        test_support::write_file(&repo.wc.join(name), "[Unit]\nDescription=t\n");
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.add(&[name.to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Ok(_))));
+        c.commit("add unit template", &[name.to_string()]);
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(out)) => {
+                assert!(out.contains("Committed revision"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // modify -> diff
+        test_support::write_file(&repo.wc.join(name), "[Unit]\nDescription=t2\n");
+        c.diff(name);
+        match recv(&rx) {
+            AsyncSvnNotification::Diff { result, .. } => {
+                assert!(result.unwrap().contains("+Description=t2"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // blame and file history on the pegged path
+        c.blame(name);
+        match recv(&rx) {
+            AsyncSvnNotification::Blame { result, .. } => {
+                assert!(!result.unwrap().is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        c.file_log(name, 10);
+        match recv(&rx) {
+            AsyncSvnNotification::FileLog { result, .. } => {
+                assert_eq!(result.unwrap().len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // revert clears the modification
+        c.revert(&[name.to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Revert(Ok(_))));
+        c.status();
+        match recv(&rx) {
+            AsyncSvnNotification::Status(Ok(entries)) => {
+                assert!(entries.is_empty(), "{entries:?}");
             }
             other => panic!("unexpected: {other:?}"),
         }

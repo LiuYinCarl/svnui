@@ -5,12 +5,16 @@
 //! a real git repository (default: openless) into an SVN repo via git2svn
 //! and checks out `target/tmp/stress/wc`.
 //!
-//! This test is inert unless explicitly enabled — CI never sets the env
-//! vars, so it skips (passes) there:
+//! This test is inert unless explicitly enabled. The CI `stress` job runs
+//! it against a rotating set of live open-source repos (shallow-cloned,
+//! converted via git2svn); locally:
 //!
 //! ```sh
 //! SVNUI_STRESS=1 SVNUI_STRESS_WC=<working copy> \
 //!     cargo test --test stress -- --nocapture --test-threads=1
+//! # or end-to-end (convert a git repo first):
+//! scripts/stress_test.sh                      # local repo
+//! STRESS_GIT_URL=https://github.com/owner/repo scripts/stress_test.sh
 //! ```
 //!
 //! Knobs:
@@ -130,11 +134,15 @@ fn append_line(path: &Path, line: &str) {
 }
 
 /// All versioned text files of the working copy (`svn list -R .@HEAD`).
+/// Symlinks (svn:special, e.g. clap's clap_lex/LICENSE-MIT → ../LICENSE-MIT)
+/// are excluded: appending through a symlink modifies the *target* file,
+/// which breaks the harness's per-file modification tracking.
 fn list_wc_files(wc: &Path) -> Vec<String> {
     let out = svnui::test_support::svn(wc, &["list", "-R", ".@HEAD"]);
     out.lines()
         .filter(|l| !l.is_empty() && !l.ends_with('/'))
         .filter(|l| !is_binary_name(l))
+        .filter(|l| !wc.join(l).is_symlink())
         .map(|l| l.to_string())
         .collect()
 }
@@ -247,7 +255,17 @@ impl Harness {
         let mut steps = self.app.status.tree.visible_len();
         while self.app.status.tree.selection_path().as_deref() != Some(path) {
             if steps == 0 {
-                self.fail(&format!("file {path} not selectable in the status tree"));
+                let entries: Vec<String> = self
+                    .app
+                    .status
+                    .tree
+                    .changed_files()
+                    .iter()
+                    .map(|(c, p)| format!("{c} {p}"))
+                    .collect();
+                self.fail(&format!(
+                    "file {path} not selectable in the status tree (status entries: {entries:?})"
+                ));
             }
             steps -= 1;
             self.input(key(KeyCode::Char('j')));
@@ -278,6 +296,10 @@ impl Harness {
             );
             self.stats.anomalies += 1;
             svnui::test_support::svn(&self.wc, &["revert", "-R", "."]);
+            // the external revert bypassed the app; refresh so its status
+            // tree isn't stale for later rounds
+            self.input(key(KeyCode::F(5)));
+            self.settle();
         }
     }
 

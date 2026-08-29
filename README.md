@@ -90,7 +90,7 @@ svnui /path/to/working-copy
 
 `.github/workflows/` 包含三条流水线：
 
-- **ci.yml** — push / PR 时运行：fmt、clippy（零警告门禁）、Linux/macOS 全量测试、覆盖率门禁（≥ 80%）、三平台 release 构建。
+- **ci.yml** — push / PR 时运行：fmt、clippy（零警告门禁）、Linux/macOS 全量测试、覆盖率门禁（≥ 80%）、三平台 release 构建、压测（浅克隆一个轮换的开源仓库 redis / clap / slugify，用 git2svn 转成 SVN 后无头驱动 App 跑 60 轮随机操作；日志记录源仓库 commit 以便复现）。
 - **bump.yml** — 每次 push 到 master/main 自动运行：将 `Cargo.toml` 的补丁版本号 +1，提交（消息带 `[skip ci]`，避免触发自身流水线）、打 `vX.Y.Z` 标签并推送，随后调用 release.yml 完成发布。同一分支的多次 push 会串行排队执行，排队中的任务开始时先同步分支最新提交，避免算出过期版本号。
 - **release.yml** — 推送 `v*` 标签时运行（也供 bump.yml 调用）：校验标签与 `Cargo.toml` 版本一致，在 Linux (x86_64)、macOS (arm64)、Windows (x86_64) 上构建 release 二进制并创建 GitHub Release。
 

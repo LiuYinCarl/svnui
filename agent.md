@@ -50,7 +50,8 @@ src/
 ├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff 弹窗（enum Popup 分发，无 downcast）
 ├── ui/               渲染辅助（滚动、行绘制、弹窗矩形）+ 主题
 └── test_support.rs   测试支撑：临时 SVN 仓库（TestRepo）+ TestBackend 渲染辅助
-.github/workflows/     ci.yml（fmt/clippy/test/coverage/build）+ bump.yml（push 自动 bump
+.github/workflows/     ci.yml（fmt/clippy/test/coverage/build/stress——压测 job 浅克隆轮换的
+                       开源仓库经 git2svn 转换后无头驱动）+ bump.yml（push 自动 bump
                        补丁版本并发版）+ release.yml（Tag 触发发布，也供 bump.yml 调用）
 ```
 
@@ -127,6 +128,10 @@ cargo fmt --all --check     # 格式门禁
 - `svn info` 的 `Revision` 是工作副本根目录的 BASE 修订（SVN 是混合修订工作副本）；
   分支名取 `Relative URL`（去掉 `^/`）。
 - `svn list -R` 必须带 `.@HEAD` peg，否则按 wc 根目录的 BASE 修订列举。
+- 文件名含 `@`（如 systemd 的 `foo@.service`）：log/blame/info/add/revert/resolve/commit
+  都必须给路径追加空 peg（`path@`，见 `Svn::peg`），否则报 E205000/E200009；
+  **`svn diff` 例外**——它根本不接受带 peg 的 wc 目标（E155010），但不带 peg 时会把
+  无效的 `@xxx` 后缀当普通路径处理，所以 diff 不传 peg（验证于 svn 1.14.5）。
 - `svn commit -m "docs"` 这类"像路径"的消息会报 E205005，需要 `--force-log` 或用更长文本。
 - `svn revert` 一个刚 add 的文件：取消 add，文件留在磁盘上（变成 `?`）。
 
@@ -143,13 +148,16 @@ cargo fmt --all --check     # 格式门禁
 ## 压力测试（stress harness）
 
 `scripts/stress_test.sh` + `tests/stress.rs`：用 git2svn 把真实 git 仓库（默认
-`~/dev/github/openless` 当前分支）转成 `target/tmp/stress/svn-repo`（约 1-2 分钟，
-先 wipe 再重建），检出 `target/tmp/stress/wc`，然后以无头方式驱动真实的 `App`：
+`~/dev/github/openless` 当前分支；`STRESS_GIT_URL` 可 shallow 克隆远程仓库，CI 的
+stress job 用它在 redis/clap/slugify 间轮换）转成 `target/tmp/stress/svn-repo`（约 1-2
+分钟，先 wipe 再重建），检出 `target/tmp/stress/wc`，然后以无头方式驱动真实的 `App`：
 合成 crossterm 按键走与 main.rs 完全相同的泵（input → handle_queue_events →
 maybe_request_diff；异步通知 → handle_async → …），确定性 PRNG（xorshift64*，
 无 rand 依赖）随机执行滚动/提交信息/修订 diff + 页内搜索/文件查找 + blame + 搜索/
-日志全历史搜索/改文件 + 提交或还原/存删补丁/F5 刷新（偶发 svn update）。每轮断言：
-无 panic、`pending` 在超时内归零、无意外错误弹窗、无残留弹窗；失败信息带 seed 可复现。
+日志全历史搜索/改文件 + 提交或还原/存删补丁/F5 刷新（偶发 svn update）/repo info(i)/
+日志标记(space)/文件历史(t)。每轮断言：无 panic、`pending` 在超时内归零、无意外
+错误弹窗、无残留弹窗；失败信息带 seed 可复现。harness 挑选修改目标时跳过符号链接
+（append 会穿透到目标文件，破坏逐文件追踪）。
 
 ```bash
 scripts/stress_test.sh                    # 完整跑（默认 200 轮）

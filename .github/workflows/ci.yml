@@ -90,6 +90,39 @@ jobs:
       - name: cargo bench (quick)
         run: cargo bench --bench tree -- --quick
 
+  # Headless stress test against a LIVE open-source repo (rotating by run
+  # number): clone shallow, convert git -> svn with git2svn, drive the app
+  # headlessly. Catches bugs that only real-world histories expose (odd
+  # file names, symlinks, merges). The exact source commit is logged so a
+  # failure can be reproduced.
+  stress:
+    name: Stress (live repo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install svn
+        run: sudo apt-get update && sudo apt-get install -y subversion
+      - name: Clone git2svn and build it
+        run: |
+          git clone -q --depth 1 https://github.com/LiuYinCarl/git2svn target/tmp/git2svn
+          (cd target/tmp/git2svn && go build -o git2svn .)
+      - name: Pick and convert a rotating open-source repo
+        run: |
+          repos=(
+            "https://github.com/redis/redis"
+            "https://github.com/clap-rs/clap"
+            "https://github.com/sindresorhus/slugify"
+          )
+          repo="${repos[$((GITHUB_RUN_NUMBER % ${#repos[@]}))]}"
+          echo "stress source: $repo"
+          GIT2SVN_DIR="$PWD/target/tmp/git2svn" \
+          STRESS_GIT_URL="$repo" \
+          SVNUI_STRESS_ROUNDS=60 \
+            scripts/stress_test.sh
+        shell: bash
+
   build:
     name: Release build (${{ matrix.os }})
     strategy:
