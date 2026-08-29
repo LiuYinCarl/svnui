@@ -78,6 +78,10 @@ pub enum InternalEvent {
     OpenLogSearch,
     /// Live-update the log filter while typing in the search popup
     LogSearchInput(String),
+    /// Open the status file filter popup (status tab)
+    OpenStatusFilter,
+    /// Live-update the status file filter while typing in the popup
+    StatusFilterInput(String),
     /// Load older revisions at the bottom of the log list
     LogLoadMore,
     /// Show the full info of the selected commit (log tab)

@@ -34,11 +34,12 @@ src/
 │   └── models.rs     数据结构：StatusEntry / LogEntry / BlameLine / ParsedDiff ...
 ├── components/
 │   ├── mod.rs        DrawableComponent trait、EventState、Context
-│   ├── status_tree.rs  文件树（目录折叠、暂存、过滤）——最大的组件
+│   ├── status_tree.rs  文件树（目录折叠、暂存、路径过滤）——最大的组件
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用）
 │   ├── commit.rs     提交信息输入栏（tui-textarea-2，Tab 回填最近提交信息）
 │   ├── log.rs        日志标签页（修订列表滚动分页 + 详情 + 关键字筛选 + 多选合并 diff）
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
+│   ├── status_filter.rs 状态文件过滤弹窗（输入时实时筛选，回车保留，Esc 还原；Esc 在状态页清除筛选）
 │   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
 │   ├── file_finder.rs  模糊文件搜索弹窗（数据源 svn list -R .@HEAD，fuzzy-matcher 匹配）
 │   ├── blame.rs      blame 弹窗（/ 增量搜索 + n/N 跳转）

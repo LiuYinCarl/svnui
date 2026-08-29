@@ -29,6 +29,7 @@ pub enum Popup {
     FileLog(super::components::file_log::FileLogPopup),
     FileFinder(super::components::file_finder::FileFinderPopup),
     LogSearch(super::components::log_search::LogSearchPopup),
+    StatusFilter(super::components::status_filter::StatusFilterPopup),
 }
 
 impl Popup {
@@ -44,6 +45,7 @@ impl Popup {
             Popup::FileLog(_) => ui::popup_area(area, 75, 70),
             Popup::FileFinder(_) => ui::popup_area(area, 70, 60),
             Popup::LogSearch(_) => ui::popup_area(area, 60, 20),
+            Popup::StatusFilter(_) => ui::popup_area(area, 60, 20),
         }
     }
 }
@@ -60,6 +62,7 @@ impl DrawableComponent for Popup {
             Popup::FileLog(p) => p.draw(f, area),
             Popup::FileFinder(p) => p.draw(f, area),
             Popup::LogSearch(p) => p.draw(f, area),
+            Popup::StatusFilter(p) => p.draw(f, area),
         }
     }
 
@@ -74,6 +77,7 @@ impl DrawableComponent for Popup {
             Popup::FileLog(p) => p.event(ev),
             Popup::FileFinder(p) => p.event(ev),
             Popup::LogSearch(p) => p.event(ev),
+            Popup::StatusFilter(p) => p.event(ev),
         }
     }
 }
@@ -106,6 +110,11 @@ impl Popup {
     }
     pub fn log_search(ctx: &Context, initial: &str) -> Self {
         Popup::LogSearch(super::components::log_search::LogSearchPopup::new(
+            ctx, initial,
+        ))
+    }
+    pub fn status_filter(ctx: &Context, initial: &str) -> Self {
+        Popup::StatusFilter(super::components::status_filter::StatusFilterPopup::new(
             ctx, initial,
         ))
     }
@@ -143,6 +152,7 @@ mod tests {
             Popup::file_log(&c, "p"),
             Popup::file_finder(&c),
             Popup::log_search(&c, ""),
+            Popup::status_filter(&c, ""),
         ];
         for p in &popups {
             let r = p.rect(area);
@@ -250,6 +260,18 @@ mod tests {
             q.pop(),
             Some(crate::queue::InternalEvent::SearchLog(s)) if s == "ini"
         ));
+        assert!(matches!(
+            q.pop(),
+            Some(crate::queue::InternalEvent::ClosePopup)
+        ));
+
+        let mut sf = Popup::status_filter(&c, "ini");
+        let t10 = ts::render(60, 10, |f| {
+            sf.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
+        });
+        assert!(ts::dump(&t10).contains("Filter status files"));
+        sf.event(&ts::key(crossterm::event::KeyCode::Enter))
+            .unwrap();
         assert!(matches!(
             q.pop(),
             Some(crate::queue::InternalEvent::ClosePopup)

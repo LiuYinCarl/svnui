@@ -209,7 +209,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("Enter / d", "Diff of the selected file"),
                 KeyBinding::new("b", "Blame file (svn blame)"),
                 KeyBinding::new("t", "File history (svn log of selected file)"),
-                KeyBinding::new("/", "Filter files"),
+                KeyBinding::new("/", "Filter status files (popup)"),
                 KeyBinding::new("c", "Focus commit message / commit"),
                 KeyBinding::new("Enter / Ctrl+s", "Commit (in commit input)"),
                 KeyBinding::new("Tab", "Commit input: pick a recent message"),

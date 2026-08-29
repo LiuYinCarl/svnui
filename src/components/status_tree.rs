@@ -7,7 +7,7 @@ use crate::queue::{ConfirmAction, InternalEvent};
 use crate::strings::{self, TITLE};
 use crate::svn::models::{StatusEntry, TreeItem, TreeItemKind};
 use crate::ui;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -36,7 +36,6 @@ pub struct StatusTreeComponent {
     /// Paths included in the commit set (staged)
     pub staged: HashSet<String>,
     filter: String,
-    filter_active: bool,
     pub pending: bool,
     pub focused: bool,
     /// Cache of per-directory (staged, total) file counts, recomputed only
@@ -56,7 +55,6 @@ impl StatusTreeComponent {
             scroll: std::cell::Cell::new(0),
             staged: HashSet::new(),
             filter: String::new(),
-            filter_active: false,
             pending: true,
             focused: true,
             counts_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -86,6 +84,19 @@ impl StatusTreeComponent {
     /// Number of currently visible tree items (files + dirs).
     pub fn visible_len(&self) -> usize {
         self.visible.len()
+    }
+
+    /// The active path-substring filter (empty = no filtering).
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Set the path-substring filter and rebuild the visible list. Called
+    /// live while typing in the filter popup, and with an empty string to
+    /// clear the filter.
+    pub fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.rebuild_visible();
     }
 
     pub fn selection_path(&self) -> Option<String> {
@@ -321,31 +332,6 @@ impl StatusTreeComponent {
             return Ok(EventState::not_consumed());
         };
 
-        // Filter input mode captures everything
-        if self.filter_active {
-            match k.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.filter_active = false;
-                    self.rebuild_visible();
-                }
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                    self.rebuild_visible();
-                }
-                // ignore control/alt combos (Ctrl+C must not filter 'c')
-                KeyCode::Char(c)
-                    if !k
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    self.filter.push(c);
-                    self.rebuild_visible();
-                }
-                _ => {}
-            }
-            return Ok(EventState::consumed());
-        }
-
         if key_match(k, KeyAction::MoveUp) {
             self.move_selection(-1);
         } else if key_match(k, KeyAction::MoveDown) {
@@ -463,7 +449,14 @@ impl StatusTreeComponent {
                 .queue
                 .push(InternalEvent::Confirm(ConfirmAction::Update));
         } else if key_match(k, KeyAction::Filter) {
-            self.filter_active = true;
+            self.ctx.queue.push(InternalEvent::OpenStatusFilter);
+        } else if key_match(k, KeyAction::Escape) {
+            // with an active filter Esc clears it; without one Esc is left
+            // unconsumed for the caller (e.g. commit pane focus return)
+            if self.filter.is_empty() {
+                return Ok(EventState::not_consumed());
+            }
+            self.set_filter(String::new());
         } else if key_match(k, KeyAction::DiffFull) {
             if self.selection_entry().is_some() {
                 self.ctx.queue.push(InternalEvent::RequestFileDiff);
@@ -541,9 +534,7 @@ impl DrawableComponent for StatusTreeComponent {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let content_height = inner.height as usize;
-        let filter_row = self.filter_active;
-        let view_height = content_height.saturating_sub(if filter_row { 1 } else { 0 });
+        let view_height = inner.height as usize;
 
         // Precompute staged counts per directory (cached: only recomputed
         // when the staged set or the status entries change).
@@ -594,21 +585,6 @@ impl DrawableComponent for StatusTreeComponent {
             f.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(Span::styled(msg, theme.dim))),
                 inner,
-            );
-        }
-
-        // Filter input row
-        if filter_row && inner.height > 0 {
-            let y = inner.y + inner.height.saturating_sub(1);
-            ui::render_line_at(
-                f,
-                inner.x,
-                y,
-                inner.width,
-                &Line::from(vec![
-                    Span::styled("filter> ", theme.info),
-                    Span::raw(self.filter.clone()),
-                ]),
             );
         }
         Ok(())
@@ -888,7 +864,6 @@ mod tests {
             scroll: std::cell::Cell::new(0),
             staged: HashSet::new(),
             filter: String::new(),
-            filter_active: false,
             pending: false,
             focused: true,
             counts_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -909,6 +884,7 @@ mod interaction_tests {
     use crate::queue::InternalEvent;
     use crate::test_support as ts;
     use crate::ui::style::Theme;
+    use crossterm::event::KeyCode;
 
     fn entry(status: char, path: &str) -> StatusEntry {
         crate::svn::models::StatusEntry {
@@ -1084,37 +1060,60 @@ mod interaction_tests {
     }
 
     #[test]
-    fn filter_mode_captures_typing() {
-        let (mut c, _q) = comp_with(vec![entry('M', "alpha.txt"), entry('?', "beta.txt")]);
+    fn filter_via_set_filter_and_slash_opens_popup() {
+        let (mut c, q) = comp_with(vec![entry('M', "alpha.txt"), entry('?', "beta.txt")]);
+        // '/' asks the app to open the filter popup
         c.event(&key(KeyCode::Char('/'))).unwrap();
-        assert!(c.filter_active);
-        // typing goes into the filter
-        c.event(&key(KeyCode::Char('a'))).unwrap();
-        c.event(&key(KeyCode::Char('l'))).unwrap();
-        assert_eq!(c.filter, "al");
+        assert!(matches!(q.pop(), Some(InternalEvent::OpenStatusFilter)));
+        assert!(c.filter().is_empty());
+        // set_filter filters by path substring (case-insensitive)
+        c.set_filter("AL".to_string());
         assert_eq!(c.visible.len(), 1);
         assert_eq!(c.visible[0].path, "alpha.txt");
-        // backspace
-        c.event(&key(KeyCode::Backspace)).unwrap();
-        assert_eq!(c.filter, "a");
+        // narrowing further keeps only matches
+        c.set_filter("alpha".to_string());
+        assert_eq!(c.visible.len(), 1);
+        // clearing restores the full list
+        c.set_filter(String::new());
         assert_eq!(c.visible.len(), 2);
-        // control combos are not text input
-        let ctrl_c = Event::Key(crossterm::event::KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-        ));
-        c.event(&ctrl_c).unwrap();
-        assert_eq!(c.filter, "a");
-        // Esc exits filter mode
-        c.event(&key(KeyCode::Esc)).unwrap();
-        assert!(!c.filter_active);
+    }
+
+    #[test]
+    fn esc_clears_active_filter() {
+        let (mut c, _q) = comp_with(vec![entry('M', "alpha.txt"), entry('?', "beta.txt")]);
+        c.set_filter("alpha".to_string());
+        assert_eq!(c.visible.len(), 1);
+        // Esc with an active filter clears it and is consumed
+        assert!(c.event(&key(KeyCode::Esc)).unwrap().consumed);
+        assert!(c.filter().is_empty());
         assert_eq!(c.visible.len(), 2);
+        // Esc without a filter is not consumed
+        assert!(!c.event(&key(KeyCode::Esc)).unwrap().consumed);
+    }
+
+    #[test]
+    fn title_shows_active_filter() {
+        let (mut c, _q) = comp_with(vec![entry('M', "alpha.txt"), entry('?', "beta.txt")]);
+        c.set_filter("foo".to_string());
+        let t = ts::render(60, 10, |f| {
+            c.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
+        });
+        let s = ts::dump(&t);
+        assert!(s.contains("Files (svn status)"), "{s}");
+        assert!(s.contains("filter: \"foo\""), "{s}");
+        // filter cleared → plain title again
+        c.set_filter(String::new());
+        let t2 = ts::render(60, 10, |f| {
+            c.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
+        });
+        let s2 = ts::dump(&t2);
+        assert!(!s2.contains("filter:"), "{s2}");
     }
 
     #[test]
     fn draw_with_zero_height_area_does_not_panic() {
         let (mut c, _q) = comp_with(vec![entry('M', "a.txt")]);
-        c.event(&key(KeyCode::Char('/'))).unwrap(); // filter row visible
+        c.set_filter("a".to_string()); // filter shown in the title
         let _t = ts::render(40, 5, |f| {
             c.draw(f, Rect::new(0, 0, 40, 0)).unwrap();
         });

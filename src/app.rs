@@ -287,6 +287,14 @@ impl App {
                 self.log.clear_search();
                 self.log.set_filter(text);
             }
+            InternalEvent::OpenStatusFilter => {
+                let ctx = self.ctx.clone();
+                let current = self.status.tree.filter().to_string();
+                self.push_popup(Popup::status_filter(&ctx, &current));
+            }
+            InternalEvent::StatusFilterInput(text) => {
+                self.status.tree.set_filter(text);
+            }
             InternalEvent::SearchLog(pattern) => {
                 self.log.set_search_active(pattern.clone());
                 self.svn.log_search(&pattern);
@@ -1777,6 +1785,39 @@ mod tests {
             result: Err("boom".into()),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn status_filter_popup_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
+            entry('M', "alpha.txt"),
+            entry('?', "beta.txt"),
+        ])));
+
+        // OpenStatusFilter opens the popup pre-filled with the current filter
+        app.status.tree.set_filter("al".into());
+        app.queue.push(InternalEvent::OpenStatusFilter);
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::StatusFilter(_))));
+
+        // typing in the popup live-filters the status tree
+        app.queue
+            .push(InternalEvent::StatusFilterInput("beta".into()));
+        app.handle_queue_events();
+        assert_eq!(app.status.tree.filter(), "beta");
+        assert_eq!(app.status.tree.visible_len(), 1);
+        assert_eq!(
+            app.status.tree.selection_path().as_deref(),
+            Some("beta.txt")
+        );
+
+        // Esc in the status tab with an active filter clears it
+        app.popups.clear();
+        app.handle_input(&ts_key(KeyCode::Esc)).unwrap();
+        assert!(app.status.tree.filter().is_empty());
+        assert_eq!(app.status.tree.visible_len(), 2);
     }
 
     #[test]
