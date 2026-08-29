@@ -2,18 +2,17 @@
 //! the fullscreen diff popup.
 
 use super::EventState;
-use super::text_search::{InputOutcome, TextSearch, highlight_spans};
-use crate::keys::{KeyAction, key_match};
+use super::text_search::highlight_spans;
+use super::text_view::{SearchOutcome, TextView};
 use crate::svn::models::{DiffLine, DiffLineKind, LogEntry, ParsedDiff};
 use crate::svn::parser::{parse_diff, parse_new_file_content};
 use crate::ui::{self, style::Theme};
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
-use std::cell::Cell;
 
 /// Max lines the fixed commit-info header above a diff may occupy, so
 /// huge (merge) commit messages cannot eat the whole screen.
@@ -68,12 +67,8 @@ fn push_capped(out: &mut Vec<String>, message: &str) {
 pub struct DiffView {
     pub title: String,
     pub parsed: ParsedDiff,
-    pub scroll: Cell<usize>,
-    /// Horizontal scroll offset in display columns (`h`/`l`), so long
-    /// lines stay reachable on narrow terminals
-    pub hscroll: Cell<usize>,
-    /// Display width of the widest line (for clamping `hscroll`)
-    max_width: Cell<usize>,
+    /// Scroll offsets + incremental search (shared text-view plumbing)
+    pub tv: TextView,
     pub pending: bool,
     /// Set when there is nothing to show
     pub empty_reason: Option<String>,
@@ -81,10 +76,8 @@ pub struct DiffView {
     /// Fixed commit-info lines above the diff (revision/range diffs);
     /// never scrolled, capped at `DIFF_HEADER_MAX`
     header: Vec<String>,
-    /// Incremental-search state (`/`); only consulted when
-    /// `search_enabled` is set (fullscreen popup) — the status-tab diff
-    /// pane leaves search off.
-    pub search: TextSearch,
+    /// Search is only consulted when `search_enabled` is set (fullscreen
+    /// popup) — the status-tab diff pane leaves search off.
     pub search_enabled: bool,
 }
 
@@ -93,14 +86,11 @@ impl DiffView {
         Self {
             title: title.to_string(),
             parsed: ParsedDiff::default(),
-            scroll: Cell::new(0),
-            hscroll: Cell::new(0),
-            max_width: Cell::new(0),
+            tv: TextView::new(),
             pending: true,
             empty_reason: None,
             focused: true,
             header: Vec::new(),
-            search: TextSearch::new(),
             search_enabled: false,
         }
     }
@@ -119,7 +109,7 @@ impl DiffView {
         self.title = title;
         self.pending = true;
         self.empty_reason = None;
-        self.reset_scroll();
+        self.tv.reset();
     }
 
     /// Show a placeholder message instead of a diff (e.g. "select a file").
@@ -128,16 +118,14 @@ impl DiffView {
         self.pending = false;
         self.empty_reason = Some(reason);
         self.parsed = ParsedDiff::default();
-        self.search.clear();
-        self.reset_scroll();
+        self.tv.reset();
     }
 
     /// Set raw diff text (or raw file content for unversioned files).
     pub fn set_content(&mut self, title: String, content: &str) {
         self.title = title;
         self.pending = false;
-        self.search.clear();
-        self.reset_scroll();
+        self.tv.reset();
         let trimmed = content.trim();
         if trimmed.is_empty() {
             self.empty_reason = Some("No textual diff".to_string());
@@ -154,14 +142,7 @@ impl DiffView {
             self.parsed = parse_new_file_content(content);
             self.empty_reason = None;
         }
-        self.max_width.set(self.compute_max_width());
-    }
-
-    /// Reset both scroll offsets (new content / placeholder).
-    fn reset_scroll(&self) {
-        self.scroll.set(0);
-        self.hscroll.set(0);
-        self.max_width.set(0);
+        self.tv.max_width.set(self.compute_max_width());
     }
 
     /// Display width of the widest rendered line, including the
@@ -183,39 +164,7 @@ impl DiffView {
     }
 
     pub fn event(&mut self, ev: &Event) -> EventState {
-        let Event::Key(k) = ev else {
-            return EventState::not_consumed();
-        };
-        let len = self.parsed.lines.len();
-        let mut scroll = self.scroll.get();
-        if key_match(k, KeyAction::MoveDown) || key_match(k, KeyAction::PageDown) {
-            scroll = scroll.saturating_add(if key_match(k, KeyAction::PageDown) {
-                20
-            } else {
-                1
-            });
-        } else if key_match(k, KeyAction::MoveUp) || key_match(k, KeyAction::PageUp) {
-            scroll = scroll.saturating_sub(if key_match(k, KeyAction::PageUp) {
-                20
-            } else {
-                1
-            });
-        } else if key_match(k, KeyAction::Home) {
-            scroll = 0;
-        } else if key_match(k, KeyAction::End) {
-            scroll = len;
-        } else if key_match(k, KeyAction::MoveLeft) {
-            self.hscroll.set(self.hscroll.get().saturating_sub(8));
-            return EventState::consumed();
-        } else if key_match(k, KeyAction::MoveRight) {
-            // right bound is applied at draw time (needs the area width)
-            self.hscroll.set(self.hscroll.get().saturating_add(8));
-            return EventState::consumed();
-        } else {
-            return EventState::not_consumed();
-        }
-        self.scroll.set(scroll.min(len));
-        EventState::consumed()
+        self.tv.scroll_event(ev, self.parsed.lines.len())
     }
 
     /// Handle search-related input (`/`, live typing, `n`/`N`).
@@ -229,47 +178,19 @@ impl DiffView {
         if !self.search_enabled {
             return None;
         }
-        if self.search.is_input_mode() {
-            if self.search.input_event(ev) == InputOutcome::Changed {
-                self.refresh_search();
-            }
-            return Some(EventState::consumed());
-        }
-        let Event::Key(k) = ev else {
-            return None;
-        };
-        if key_match(k, KeyAction::Filter) {
-            self.search.start_input();
-            return Some(EventState::consumed());
-        }
-        let plain =
-            |c: char| k.code == KeyCode::Char(c) && !k.modifiers.contains(KeyModifiers::CONTROL);
-        let jump = if plain('n') {
-            self.search.next_match()
-        } else if plain('N') {
-            self.search.prev_match()
-        } else {
-            None
-        };
-        if let Some(line) = jump {
-            self.scroll.set(line);
-            return Some(EventState::consumed());
-        }
-        None
-    }
-
-    /// Recompute search matches against the current diff content and
-    /// scroll to the (new) current match.
-    fn refresh_search(&mut self) {
         let lines: Vec<&str> = self
             .parsed
             .lines
             .iter()
             .map(|l| l.content.as_str())
             .collect();
-        self.search.recompute(&lines, self.scroll.get());
-        if let Some(line) = self.search.current_match_line() {
-            self.scroll.set(line);
+        match self.tv.search_event(ev, &lines, self.tv.scroll.get()) {
+            SearchOutcome::Ignored => None,
+            SearchOutcome::Consumed => Some(EventState::consumed()),
+            SearchOutcome::Reveal(line) => {
+                self.tv.scroll.set(line);
+                Some(EventState::consumed())
+            }
         }
     }
 }
@@ -390,28 +311,17 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     // Virtualized rendering: only the visible window of lines is built, so
     // drawing a huge diff costs O(screen height), not O(diff size).
     // While a search is active the bottom row is a `/pattern [x/y]` footer.
-    let (inner, footer) = ui::split_search_footer(inner, view.search.is_active());
     let total = view.parsed.lines.len();
-    let scroll = ui::clamp_scroll(view.scroll.get(), total, inner.height as usize);
-    view.scroll.set(scroll);
-    // clamp the horizontal offset against the widest line
-    let h_off = ui::clamp_hscroll(
-        view.hscroll.get(),
-        view.max_width.get(),
-        inner.width as usize,
-    );
-    view.hscroll.set(h_off);
+    let (inner, footer, scroll) = view.tv.layout(inner, total);
     let end = (scroll + inner.height as usize).min(total);
     let mut lines = Vec::with_capacity(end - scroll);
     for i in scroll..end {
-        let (ranges, current) = view.search.line_ranges(i);
+        let (ranges, current) = view.tv.search.line_ranges(i);
         lines.push(diff_line(&view.parsed.lines[i], theme, &ranges, current));
     }
-    ui::render_lines_h(f, inner, &lines, 0, &[], h_off);
+    ui::render_lines_h(f, inner, &lines, 0, &[], view.tv.hscroll.get());
     if let Some(footer) = footer {
-        let line = Line::from(Span::styled(view.search.status_text(), theme.info));
-        f.buffer_mut()
-            .set_line(footer.x, footer.y, &line, footer.width);
+        view.tv.draw_search_footer(f, footer, theme);
     }
 }
 
@@ -420,6 +330,7 @@ mod tests {
     use super::*;
     use crate::test_support as ts;
     use crate::ui::style::Theme;
+    use crossterm::event::KeyCode;
 
     const DIFF: &str = "\
 Index: Cargo.toml
@@ -497,7 +408,7 @@ Index: Cargo.toml
             "commit message".to_string(),
         ]);
         // scroll to the bottom: the header must still be drawn
-        v.scroll.set(8);
+        v.tv.scroll.set(8);
         let t = ts::render(60, 12, |f| {
             draw_diff_block(f, Rect::new(0, 0, 60, 12), &v, &Theme::default());
         });
@@ -524,13 +435,13 @@ Index: Cargo.toml
         let mut v = DiffView::new("t");
         let content = format!("Index: f\n@@ -1 +1 @@\n+{}\n", "x".repeat(200));
         v.set_content("t".into(), &content);
-        assert_eq!(v.hscroll.get(), 0);
+        assert_eq!(v.tv.hscroll.get(), 0);
         // l/h move the view by 8 columns
         v.event(&ts::key(KeyCode::Char('l')));
-        assert_eq!(v.hscroll.get(), 8);
+        assert_eq!(v.tv.hscroll.get(), 8);
         v.event(&ts::key(KeyCode::Char('l')));
         v.event(&ts::key(KeyCode::Char('h')));
-        assert_eq!(v.hscroll.get(), 8);
+        assert_eq!(v.tv.hscroll.get(), 8);
         // rendered: skipping 8 columns of the 9-wide gutter leaves one
         // space before the '+' (row 3 = the added line)
         let t = ts::render(30, 6, |f| {
@@ -548,11 +459,11 @@ Index: Cargo.toml
         ts::render(30, 6, |f| {
             draw_diff_block(f, Rect::new(0, 0, 30, 6), &v, &Theme::default());
         });
-        assert_eq!(v.hscroll.get(), 209 - 28);
+        assert_eq!(v.tv.hscroll.get(), 209 - 28);
         // new content resets both offsets
         v.set_content("t".into(), &content);
-        assert_eq!(v.hscroll.get(), 0);
-        assert_eq!(v.scroll.get(), 0);
+        assert_eq!(v.tv.hscroll.get(), 0);
+        assert_eq!(v.tv.scroll.get(), 0);
     }
 
     #[test]
@@ -636,22 +547,22 @@ Index: Cargo.toml
         let mut v = DiffView::new("t");
         v.set_content("t".into(), DIFF);
         v.event(&ts::key(crossterm::event::KeyCode::Char('j')));
-        assert_eq!(v.scroll.get(), 1);
+        assert_eq!(v.tv.scroll.get(), 1);
         v.event(&ts::key(crossterm::event::KeyCode::Char('G')));
-        assert_eq!(v.scroll.get(), 8);
+        assert_eq!(v.tv.scroll.get(), 8);
         v.event(&ts::key(crossterm::event::KeyCode::Char('g')));
-        assert_eq!(v.scroll.get(), 0);
+        assert_eq!(v.tv.scroll.get(), 0);
         v.event(&ts::key(crossterm::event::KeyCode::PageDown));
-        assert_eq!(v.scroll.get(), 8); // bounded by content
+        assert_eq!(v.tv.scroll.get(), 8); // bounded by content
         v.event(&ts::key(crossterm::event::KeyCode::PageUp));
-        assert_eq!(v.scroll.get(), 0);
+        assert_eq!(v.tv.scroll.get(), 0);
         // unknown key not consumed
         let state = v.event(&ts::key(crossterm::event::KeyCode::Char('x')));
         assert!(!state.consumed);
         // scrolling is bounded by the content length
         v.event(&ts::key(crossterm::event::KeyCode::Char('G')));
         v.event(&ts::key(crossterm::event::KeyCode::Char('j')));
-        assert_eq!(v.scroll.get(), 8);
+        assert_eq!(v.tv.scroll.get(), 8);
         let _ = ts::render(50, 4, |f| {
             draw_diff_block(f, Rect::new(0, 0, 50, 4), &v, &Theme::default());
         });
@@ -669,10 +580,10 @@ Index: Cargo.toml
             v.search_event(&ts::key(KeyCode::Char(ch)));
         }
         v.search_event(&ts::key(KeyCode::Enter));
-        assert_eq!(v.search.match_count(), 1);
+        assert_eq!(v.tv.search.match_count(), 1);
         // skip 8 columns of the 9-wide line-number gutter
         v.event(&ts::key(KeyCode::Char('l')));
-        assert_eq!(v.hscroll.get(), 8);
+        assert_eq!(v.tv.hscroll.get(), 8);
         let theme = Theme::default();
         let t = ts::render(30, 6, |f| {
             draw_diff_block(f, Rect::new(0, 0, 30, 6), &v, &theme);
@@ -705,7 +616,7 @@ Index: Cargo.toml
         assert_eq!(buf[(10, 1)].symbol(), "修");
         assert_eq!(buf[(12, 1)].symbol(), "复");
         // cut at a column boundary: 修复 (4 columns) are gone, 中 starts it
-        v.hscroll.set(13); // 9 gutter + 4 content columns
+        v.tv.hscroll.set(13); // 9 gutter + 4 content columns
         let t = ts::render(20, 5, |f| {
             draw_diff_block(f, Rect::new(0, 0, 20, 5), &v, &theme);
         });
@@ -714,7 +625,7 @@ Index: Cargo.toml
         assert_eq!(buf[(3, 1)].symbol(), "文");
         // cut through the middle of 修: the straddling char collapses to a
         // single space instead of rendering a half glyph
-        v.hscroll.set(10);
+        v.tv.hscroll.set(10);
         let t = ts::render(20, 5, |f| {
             draw_diff_block(f, Rect::new(0, 0, 20, 5), &v, &theme);
         });

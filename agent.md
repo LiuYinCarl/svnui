@@ -46,6 +46,7 @@ src/
 │   ├── patches.rs    补丁标签页（列出 patch 目录、预览/应用/删除补丁；patch_dir() 解析存储目录，
 │   │                 SVNUI_PATCH_DIR 可覆盖）
 │   ├── text_search.rs 可复用的增量搜索状态（diff/blame 弹窗共用）
+│   ├── text_view.rs  可滚动文本视图基座（滚动/横滚/搜索/footer 布局;diff/blame 共用）
 │   └── help.rs       帮助弹窗
 ├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff 弹窗（enum Popup 分发，无 downcast）
 ├── ui/               渲染辅助（滚动、行绘制、弹窗矩形）+ 主题

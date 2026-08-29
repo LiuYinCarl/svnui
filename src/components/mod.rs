@@ -13,6 +13,7 @@ pub mod repo_info;
 pub mod status_filter;
 pub mod status_tree;
 pub mod text_search;
+pub mod text_view;
 
 use crate::queue::Queue;
 use crate::ui::style::Theme;

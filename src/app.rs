@@ -24,6 +24,13 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 /// A diff request that will turn into a fullscreen popup when loaded.
+///
+/// Token semantics: `App::pending_fullscreen` pairs this with a unique
+/// request id (`App::next_req_id`) handed to the svn layer, which echoes
+/// it back on the notification. Only a notification whose token equals the
+/// pending one opens the popup / clears the error — a stale result for a
+/// superseded request (same file/revision asked twice in a row) would
+/// otherwise hijack the newer request under plain value matching.
 #[derive(Clone, Debug)]
 enum PendingFullscreen {
     File(String),
@@ -65,7 +72,9 @@ pub struct App {
     pub quitting: bool,
     pub fatal_error: Option<String>,
     pub spinner_frame: Cell<usize>,
-    pending_fullscreen: Option<PendingFullscreen>,
+    pending_fullscreen: Option<(u64, PendingFullscreen)>,
+    /// Next token for a fullscreen diff request (see [`PendingFullscreen`])
+    next_req_id: u64,
 }
 
 impl App {
@@ -90,6 +99,7 @@ impl App {
             fatal_error: None,
             spinner_frame: Cell::new(0),
             pending_fullscreen: None,
+            next_req_id: 1,
         }
     }
 
@@ -101,6 +111,17 @@ impl App {
 
     fn pop_popup(&mut self) {
         self.popups.pop();
+    }
+
+    /// Take the pending fullscreen diff request when the notification's
+    /// token matches it; a stale or token-less (`None` = status-pane
+    /// preview) notification leaves the pending request untouched.
+    fn take_pending_fullscreen(&mut self, req: Option<u64>) -> Option<PendingFullscreen> {
+        if matches!(&self.pending_fullscreen, Some((id, _)) if Some(*id) == req) {
+            self.pending_fullscreen.take().map(|(_, p)| p)
+        } else {
+            None
+        }
     }
 
     fn show_error(&mut self, msg: String) {
@@ -242,7 +263,8 @@ impl App {
             return;
         }
         if let Some(path) = self.status.maybe_request_diff() {
-            self.svn.diff(&path);
+            // status-pane preview: no token, never opens a popup
+            self.svn.diff(&path, None);
             self.pending += 1;
         }
     }
@@ -381,8 +403,10 @@ impl App {
                     self.status.tree.selection_path(),
                     self.status.tree.selection_entry().is_some(),
                 ) {
-                    self.pending_fullscreen = Some(PendingFullscreen::File(path.clone()));
-                    self.svn.diff(&path);
+                    let id = self.next_req_id;
+                    self.next_req_id += 1;
+                    self.pending_fullscreen = Some((id, PendingFullscreen::File(path.clone())));
+                    self.svn.diff(&path, Some(id));
                     self.pending += 1;
                 }
             }
@@ -400,14 +424,18 @@ impl App {
                 }
             }
             InternalEvent::RequestRevisionDiff(rev) => {
-                self.pending_fullscreen = Some(PendingFullscreen::Revision(rev));
-                self.svn.revision_diff(rev);
+                let id = self.next_req_id;
+                self.next_req_id += 1;
+                self.pending_fullscreen = Some((id, PendingFullscreen::Revision(rev)));
+                self.svn.revision_diff(rev, Some(id));
                 self.pending += 1;
             }
             InternalEvent::RequestRangeDiff(revs) => {
                 if let (Some(&from), Some(&to)) = (revs.iter().min(), revs.iter().max()) {
-                    self.pending_fullscreen = Some(PendingFullscreen::Range(from, to));
-                    self.svn.range_diff(from, to);
+                    let id = self.next_req_id;
+                    self.next_req_id += 1;
+                    self.pending_fullscreen = Some((id, PendingFullscreen::Range(from, to)));
+                    self.svn.range_diff(from, to, Some(id));
                     self.pending += 1;
                 }
             }
@@ -653,22 +681,18 @@ impl App {
                 }
                 Err(e) => self.show_error(format!("svn info: {e}")),
             },
-            AsyncSvnNotification::Diff { path, result } => match result {
+            AsyncSvnNotification::Diff { path, req, result } => match result {
                 Ok(content) => {
                     self.status.apply_diff(&path, &content);
-                    if let Some(PendingFullscreen::File(p)) = &self.pending_fullscreen
-                        && *p == path
-                    {
-                        self.pending_fullscreen = None;
+                    // the token guarantees the pending request is this one,
+                    // so its payload carries the title
+                    if let Some(PendingFullscreen::File(p)) = self.take_pending_fullscreen(req) {
                         // file diffs have no associated commit: no header
-                        self.show_diff_popup(path.clone(), &content, Vec::new());
+                        self.show_diff_popup(p, &content, Vec::new());
                     }
                 }
                 Err(e) => {
-                    if matches!(&self.pending_fullscreen, Some(PendingFullscreen::File(p)) if *p == path)
-                    {
-                        self.pending_fullscreen = None;
-                    }
+                    self.take_pending_fullscreen(req);
                     self.show_error(format!("svn diff {path}: {e}"));
                 }
             },
@@ -766,48 +790,46 @@ impl App {
                     self.show_error(format!("svn list: {e}"));
                 }
             },
-            AsyncSvnNotification::RangeDiff { from, to, result } => match result {
+            AsyncSvnNotification::RangeDiff {
+                from,
+                to,
+                req,
+                result,
+            } => match result {
                 Ok(content) => {
-                    if let Some(PendingFullscreen::Range(f, t)) = &self.pending_fullscreen
-                        && *f == from
-                        && *t == to
+                    if let Some(PendingFullscreen::Range(f, t)) = self.take_pending_fullscreen(req)
                     {
-                        self.pending_fullscreen = None;
-                        let header = diff_view::range_header(from, to, &self.log.entries);
-                        self.show_diff_popup(format!("Diff r{from}..r{to}"), &content, header);
+                        let header = diff_view::range_header(f, t, &self.log.entries);
+                        self.show_diff_popup(format!("Diff r{f}..r{t}"), &content, header);
                     }
                 }
                 Err(e) => {
-                    if matches!(&self.pending_fullscreen, Some(PendingFullscreen::Range(f, t)) if *f == from && *t == to)
-                    {
-                        self.pending_fullscreen = None;
-                    }
+                    self.take_pending_fullscreen(req);
                     self.show_error(format!("svn diff -r {from}:{to}: {e}"));
                 }
             },
-            AsyncSvnNotification::RevisionDiff { revision, result } => match result {
+            AsyncSvnNotification::RevisionDiff {
+                revision,
+                req,
+                result,
+            } => match result {
                 Ok(content) => {
-                    if let Some(PendingFullscreen::Revision(r)) = &self.pending_fullscreen
-                        && *r == revision
+                    if let Some(PendingFullscreen::Revision(r)) = self.take_pending_fullscreen(req)
                     {
-                        self.pending_fullscreen = None;
                         // attach the commit info when the revision is in
                         // the loaded log (log-tab-triggered diff)
                         let header = self
                             .log
                             .entries
                             .iter()
-                            .find(|e| e.revision == revision)
+                            .find(|e| e.revision == r)
                             .map(diff_view::revision_header)
                             .unwrap_or_default();
-                        self.show_diff_popup(format!("Diff r{revision}"), &content, header);
+                        self.show_diff_popup(format!("Diff r{r}"), &content, header);
                     }
                 }
                 Err(e) => {
-                    if matches!(&self.pending_fullscreen, Some(PendingFullscreen::Revision(r)) if *r == revision)
-                    {
-                        self.pending_fullscreen = None;
-                    }
+                    self.take_pending_fullscreen(req);
                     self.show_error(format!("svn diff -c {revision}: {e}"));
                 }
             },
@@ -1179,6 +1201,7 @@ mod tests {
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
+            req: None,
             result: Ok("Index: a.txt\n@@ -1 +1 @@\n-old\n+new\n".into()),
         });
         assert!(!app.status.diff.pending);
@@ -1195,6 +1218,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::Log(Err("boom".into())));
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
+            req: None,
             result: Err("boom".into()),
         });
     }
@@ -1219,6 +1243,7 @@ mod tests {
         ));
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 1,
+            req: Some(1),
             result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
@@ -1330,6 +1355,7 @@ mod tests {
         ));
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
+            req: Some(1),
             result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
         });
         let Some(Popup::Diff(d)) = app.popups.last() else {
@@ -1347,6 +1373,7 @@ mod tests {
         ));
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 99,
+            req: Some(2),
             result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
         });
         let Some(Popup::Diff(d2)) = app.popups.last() else {
@@ -1372,6 +1399,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RangeDiff {
             from: 1,
             to: 3,
+            req: Some(1),
             result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
         });
         let Some(Popup::Diff(d)) = app.popups.last() else {
@@ -1394,6 +1422,7 @@ mod tests {
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
+            req: Some(1),
             result: Ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
@@ -1677,15 +1706,17 @@ mod tests {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
         // a failed fullscreen diff clears the pending request
-        app.pending_fullscreen = Some(PendingFullscreen::File("a.txt".into()));
+        app.pending_fullscreen = Some((1, PendingFullscreen::File("a.txt".into())));
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
+            req: Some(1),
             result: Err("boom".into()),
         });
         assert!(app.pending_fullscreen.is_none());
-        app.pending_fullscreen = Some(PendingFullscreen::Revision(3));
+        app.pending_fullscreen = Some((1, PendingFullscreen::Revision(3)));
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
+            req: Some(1),
             result: Err("boom".into()),
         });
         assert!(app.pending_fullscreen.is_none());
@@ -2239,6 +2270,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RangeDiff {
             from: 1,
             to: 3,
+            req: Some(1),
             result: Ok("Index: a\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
@@ -2249,8 +2281,62 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RangeDiff {
             from: 1,
             to: 2,
+            req: Some(2),
             result: Err("boom".into()),
         });
+        assert!(app.pending_fullscreen.is_none());
+    }
+
+    #[test]
+    fn fullscreen_diff_result_requires_matching_token() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // two fullscreen requests for the same revision back to back: the
+        // first is superseded, so its late result must not open a popup or
+        // clear the newer pending request
+        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RevisionDiff {
+                revision: 3,
+                req: Some(1),
+                ..
+            }
+        ));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RevisionDiff {
+                revision: 3,
+                req: Some(2),
+                ..
+            }
+        ));
+        // stale result for the superseded request: silently dropped
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: Some(1),
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
+        assert!(app.pending_fullscreen.is_some());
+        // a token-less status-pane preview never opens a popup either
+        app.handle_async(AsyncSvnNotification::Diff {
+            path: "a.txt".into(),
+            req: None,
+            result: Ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
+        assert!(app.pending_fullscreen.is_some());
+        // the current token opens the popup and clears the pending request
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: Some(2),
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
         assert!(app.pending_fullscreen.is_none());
     }
 

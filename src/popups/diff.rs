@@ -43,7 +43,7 @@ impl DrawableComponent for DiffPopup {
         if let Event::Key(k) = ev
             && key_match(k, KeyAction::ClosePopup)
         {
-            if self.view.search.esc() == EscAction::ClosePopup {
+            if self.view.tv.search.esc() == EscAction::ClosePopup {
                 self.ctx.queue.push(InternalEvent::ClosePopup);
             }
             return Ok(EventState::consumed());
@@ -108,7 +108,7 @@ Index: f
         let (mut p, q) = popup(content);
         assert_eq!(p.view.parsed.lines.len(), 5);
         p.event(&ts::key(KeyCode::Char('j'))).unwrap();
-        assert_eq!(p.view.scroll.get(), 1);
+        assert_eq!(p.view.tv.scroll.get(), 1);
         // Esc closes
         p.event(&ts::key(KeyCode::Esc)).unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
@@ -127,15 +127,15 @@ Index: f
         let (mut p, q) = popup(SEARCH_DIFF);
         // '/' enters input mode with a fresh pattern
         p.event(&ts::key(KeyCode::Char('/'))).unwrap();
-        assert!(p.view.search.is_input_mode());
+        assert!(p.view.tv.search.is_input_mode());
         // typing updates the pattern live; 'q' is pattern text here
         for c in "need".chars() {
             p.event(&ts::key(KeyCode::Char(c))).unwrap();
         }
-        assert_eq!(p.view.search.pattern(), "need");
-        assert_eq!(p.view.search.match_count(), 2);
+        assert_eq!(p.view.tv.search.pattern(), "need");
+        assert_eq!(p.view.tv.search.match_count(), 2);
         // scrolled to the first match (line index 8 in parsed.lines)
-        assert_eq!(p.view.scroll.get(), 8);
+        assert_eq!(p.view.tv.scroll.get(), 8);
         let t = ts::render(60, 8, |f| {
             p.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
         });
@@ -160,23 +160,23 @@ Index: f
         }
         // Enter confirms: input mode off, highlights stay
         p.event(&ts::key(KeyCode::Enter)).unwrap();
-        assert!(!p.view.search.is_input_mode());
-        assert!(p.view.search.is_active());
-        assert_eq!(p.view.scroll.get(), 8);
+        assert!(!p.view.tv.search.is_input_mode());
+        assert!(p.view.tv.search.is_active());
+        assert_eq!(p.view.tv.scroll.get(), 8);
         // n jumps to the next match and updates the counter
         p.event(&ts::key(KeyCode::Char('n'))).unwrap();
-        assert_eq!(p.view.scroll.get(), 10);
-        assert_eq!(p.view.search.status_text(), "/needle  [2/2]");
+        assert_eq!(p.view.tv.scroll.get(), 10);
+        assert_eq!(p.view.tv.search.status_text(), "/needle  [2/2]");
         // n wraps to the first match, N back again
         p.event(&ts::key(KeyCode::Char('n'))).unwrap();
-        assert_eq!(p.view.search.status_text(), "/needle  [1/2]");
+        assert_eq!(p.view.tv.search.status_text(), "/needle  [1/2]");
         p.event(&ts::key(KeyCode::Char('N'))).unwrap();
-        assert_eq!(p.view.search.status_text(), "/needle  [2/2]");
+        assert_eq!(p.view.tv.search.status_text(), "/needle  [2/2]");
         // scrolling still works with highlights active
         p.event(&ts::key(KeyCode::Char('j'))).unwrap();
         // first Esc clears the highlights, popup stays open
         p.event(&ts::key(KeyCode::Esc)).unwrap();
-        assert!(!p.view.search.is_active());
+        assert!(!p.view.tv.search.is_active());
         assert!(q.pop().is_none());
         // second Esc closes
         p.event(&ts::key(KeyCode::Esc)).unwrap();
@@ -192,13 +192,13 @@ Index: f
         }
         p.event(&ts::key(KeyCode::Esc)).unwrap();
         // search cancelled, popup still open
-        assert!(!p.view.search.is_input_mode());
-        assert!(!p.view.search.is_active());
+        assert!(!p.view.tv.search.is_input_mode());
+        assert!(!p.view.tv.search.is_active());
         assert!(q.pop().is_none());
         // paste works in input mode
         p.event(&ts::key(KeyCode::Char('/'))).unwrap();
         p.event(&Event::Paste("zzz".to_string())).unwrap();
-        assert_eq!(p.view.search.pattern(), "zzz");
+        assert_eq!(p.view.tv.search.pattern(), "zzz");
         let t = ts::render(60, 8, |f| {
             p.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
         });

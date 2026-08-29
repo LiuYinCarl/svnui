@@ -33,6 +33,9 @@ pub enum AsyncSvnNotification {
     Status(Result<Vec<StatusEntry>, String>),
     Diff {
         path: String,
+        /// Fullscreen-request token: `Some(id)` when the request came from
+        /// a fullscreen diff action, `None` for status-pane previews
+        req: Option<u64>,
         result: Result<String, String>,
     },
     Log(Result<Vec<LogEntry>, String>),
@@ -45,12 +48,16 @@ pub enum AsyncSvnNotification {
     ListFiles(Result<Vec<String>, String>),
     RevisionDiff {
         revision: u64,
+        /// Fullscreen-request token (as on `Diff`)
+        req: Option<u64>,
         result: Result<String, String>,
     },
     /// Combined diff of a revision range (`svn diff -r from-1:to`)
     RangeDiff {
         from: u64,
         to: u64,
+        /// Fullscreen-request token (as on `Diff`)
+        req: Option<u64>,
         result: Result<String, String>,
     },
     Blame {
@@ -248,7 +255,7 @@ impl Svn {
         );
     }
 
-    pub fn diff(&self, path: &str) {
+    pub fn diff(&self, path: &str, req: Option<u64>) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
         let err_path = path.clone();
@@ -268,10 +275,11 @@ impl Svn {
                     Err(e) if e.contains("E155010") => Self::read_content_fallback(&cwd, &path),
                     Err(e) => Err(e),
                 };
-                AsyncSvnNotification::Diff { path, result }
+                AsyncSvnNotification::Diff { path, req, result }
             },
             move |e| AsyncSvnNotification::Diff {
                 path: err_path,
+                req,
                 result: Err(e),
             },
         );
@@ -407,32 +415,43 @@ impl Svn {
         );
     }
 
-    pub fn revision_diff(&self, revision: u64) {
+    pub fn revision_diff(&self, revision: u64, req: Option<u64>) {
         let cwd = self.cwd.clone();
         self.spawn(
             move || {
                 let result = Self::run_in(&cwd, &["diff", "-c", &revision.to_string()]);
-                AsyncSvnNotification::RevisionDiff { revision, result }
+                AsyncSvnNotification::RevisionDiff {
+                    revision,
+                    req,
+                    result,
+                }
             },
             move |e| AsyncSvnNotification::RevisionDiff {
                 revision,
+                req,
                 result: Err(e),
             },
         );
     }
 
     /// Combined diff of the revisions `from..=to` (`svn diff -r from-1:to`).
-    pub fn range_diff(&self, from: u64, to: u64) {
+    pub fn range_diff(&self, from: u64, to: u64, req: Option<u64>) {
         let cwd = self.cwd.clone();
         self.spawn(
             move || {
                 let range = format!("{}:{to}", from.saturating_sub(1));
                 let result = Self::run_in(&cwd, &["diff", "-r", &range]);
-                AsyncSvnNotification::RangeDiff { from, to, result }
+                AsyncSvnNotification::RangeDiff {
+                    from,
+                    to,
+                    req,
+                    result,
+                }
             },
             move |e| AsyncSvnNotification::RangeDiff {
                 from,
                 to,
+                req,
                 result: Err(e),
             },
         );
@@ -720,20 +739,23 @@ mod tests {
         test_support::write_file(&repo.wc.join("untracked.txt"), "raw content\n");
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
-        c.diff("Cargo.toml");
+        c.diff("Cargo.toml", Some(7));
         match recv(&rx) {
-            AsyncSvnNotification::Diff { path, result } => {
+            AsyncSvnNotification::Diff { path, req, result } => {
                 assert_eq!(path, "Cargo.toml");
+                // the fullscreen-request token is echoed back
+                assert_eq!(req, Some(7));
                 let content = result.unwrap();
                 assert!(content.contains("Index: Cargo.toml"));
                 assert!(content.contains("version = 3"));
             }
             other => panic!("unexpected: {other:?}"),
         }
-        c.diff("untracked.txt");
+        c.diff("untracked.txt", None);
         match recv(&rx) {
-            AsyncSvnNotification::Diff { path, result } => {
+            AsyncSvnNotification::Diff { path, req, result } => {
                 assert_eq!(path, "untracked.txt");
+                assert_eq!(req, None);
                 // fallback reads file content
                 assert_eq!(result.unwrap().trim(), "raw content");
             }
@@ -766,10 +788,15 @@ mod tests {
         repo.svn(&["commit", "-m", "bump"]);
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
-        c.revision_diff(2);
+        c.revision_diff(2, Some(9));
         match recv(&rx) {
-            AsyncSvnNotification::RevisionDiff { revision, result } => {
+            AsyncSvnNotification::RevisionDiff {
+                revision,
+                req,
+                result,
+            } => {
                 assert_eq!(revision, 2);
+                assert_eq!(req, Some(9));
                 let content = result.unwrap();
                 assert!(content.contains("Index: Cargo.toml"));
             }
@@ -945,7 +972,7 @@ mod tests {
     fn diff_missing_file_falls_back_to_empty() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
-        Svn::new(repo.wc.clone(), tx).diff("does-not-exist.txt");
+        Svn::new(repo.wc.clone(), tx).diff("does-not-exist.txt", None);
         match recv(&rx) {
             AsyncSvnNotification::Diff {
                 result: Ok(content),
@@ -1012,10 +1039,16 @@ mod tests {
         repo.svn(&["commit", "-m", "r3"]);
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
-        c.range_diff(2, 3);
+        c.range_diff(2, 3, None);
         match recv(&rx) {
-            AsyncSvnNotification::RangeDiff { from, to, result } => {
+            AsyncSvnNotification::RangeDiff {
+                from,
+                to,
+                req,
+                result,
+            } => {
                 assert_eq!((from, to), (2, 3));
+                assert_eq!(req, None);
                 let content = result.unwrap();
                 assert!(content.contains("Index: Cargo.toml"), "{content}");
                 // combined diff goes straight from r1 content to r3 content
@@ -1030,7 +1063,7 @@ mod tests {
     fn revision_diff_error_reports_stderr() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
-        Svn::new(repo.wc.clone(), tx).revision_diff(999_999);
+        Svn::new(repo.wc.clone(), tx).revision_diff(999_999, None);
         match recv(&rx) {
             AsyncSvnNotification::RevisionDiff { result: Err(e), .. } => {
                 assert!(!e.is_empty(), "expected an error message");
@@ -1206,7 +1239,7 @@ mod tests {
         }
         // modify -> diff
         test_support::write_file(&repo.wc.join(name), "[Unit]\nDescription=t2\n");
-        c.diff(name);
+        c.diff(name, None);
         match recv(&rx) {
             AsyncSvnNotification::Diff { result, .. } => {
                 assert!(result.unwrap().contains("+Description=t2"));
@@ -1315,7 +1348,7 @@ mod tests {
     fn diff_clean_file_stays_empty() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
-        Svn::new(repo.wc.clone(), tx).diff("src/main.rs");
+        Svn::new(repo.wc.clone(), tx).diff("src/main.rs", None);
         match recv(&rx) {
             AsyncSvnNotification::Diff {
                 result: Ok(content),
@@ -1336,7 +1369,7 @@ mod tests {
         let big = "x".repeat(2_100_000);
         test_support::write_file(&repo.wc.join("big.bin"), &big);
         let (tx, rx) = unbounded();
-        Svn::new(repo.wc.clone(), tx).diff("big.bin");
+        Svn::new(repo.wc.clone(), tx).diff("big.bin", None);
         match recv(&rx) {
             AsyncSvnNotification::Diff {
                 result: Ok(content),
