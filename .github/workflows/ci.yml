@@ -90,12 +90,13 @@ jobs:
       - name: cargo bench (quick)
         run: cargo bench --bench tree -- --quick
 
-  # Headless stress test against LIVE open-source repos (one per language,
-  # all in parallel): clone shallow, convert git -> svn with git2svn, drive
-  # the app headlessly. Catches bugs that only real-world histories expose
-  # (odd file names, symlinks, merges). The exact source commit is logged
-  # so a failure can be reproduced. Each leg is capped at 15 minutes; a
-  # typical leg takes ~3.
+  # Headless stress test against LIVE open-source repos (13 across
+  # languages, all in parallel): shallow-clone 500 commits, convert
+  # git -> svn with git2svn, drive the app headlessly. Catches bugs that
+  # only real-world histories expose (odd file names, symlinks, merges).
+  # The exact source commit is logged so a failure can be reproduced.
+  # Each leg is capped at 15 minutes; the slowest measured leg takes ~5
+  # (clone ~1min + convert ~1min + 60 stress rounds ~1min).
   stress:
     name: Stress (${{ matrix.name }}, ${{ matrix.lang }})
     runs-on: ubuntu-latest
@@ -105,12 +106,17 @@ jobs:
       matrix:
         include:
           - { name: redis, lang: C, url: https://github.com/redis/redis }
+          - { name: tmux, lang: C, url: https://github.com/tmux/tmux }
           - { name: clap, lang: Rust, url: https://github.com/clap-rs/clap }
           - { name: slugify, lang: JS, url: https://github.com/sindresorhus/slugify }
+          - { name: ts-node, lang: TypeScript, url: https://github.com/TypeStrong/ts-node }
           - { name: requests, lang: Python, url: https://github.com/psf/requests }
           - { name: gin, lang: Go, url: https://github.com/gin-gonic/gin }
           - { name: json, lang: C++, url: https://github.com/nlohmann/json }
           - { name: gson, lang: Java, url: https://github.com/google/gson }
+          - { name: jekyll, lang: Ruby, url: https://github.com/jekyll/jekyll }
+          - { name: composer, lang: PHP, url: https://github.com/composer/composer }
+          - { name: elixir, lang: Elixir, url: https://github.com/elixir-lang/elixir }
           - { name: ohmyzsh, lang: Shell, url: https://github.com/ohmyzsh/ohmyzsh }
     steps:
       - uses: actions/checkout@v5
@@ -128,6 +134,7 @@ jobs:
         run: |
           GIT2SVN_DIR="$RUNNER_TEMP/git2svn" \
           STRESS_GIT_URL="${{ matrix.url }}" \
+          STRESS_GIT_DEPTH=500 \
           SVNUI_STRESS_ROUNDS=60 \
             scripts/stress_test.sh
         shell: bash
