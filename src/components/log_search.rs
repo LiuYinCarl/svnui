@@ -18,6 +18,9 @@ use ratatui::widgets::{Block, Borders, Clear};
 pub struct LogSearchPopup {
     ctx: Context,
     query: String,
+    /// The filter text the popup was opened with; Esc restores it so the
+    /// list is not left filtered by an abandoned half-typed query
+    initial: String,
 }
 
 impl LogSearchPopup {
@@ -25,6 +28,7 @@ impl LogSearchPopup {
         Self {
             ctx: ctx.clone(),
             query: initial.to_string(),
+            initial: initial.to_string(),
         }
     }
 
@@ -85,6 +89,11 @@ impl DrawableComponent for LogSearchPopup {
         };
         match k.code {
             KeyCode::Esc => {
+                // restore the filter the popup was opened with before
+                // closing: the live-typed text is abandoned
+                self.ctx
+                    .queue
+                    .push(InternalEvent::LogSearchInput(self.initial.clone()));
                 self.ctx.queue.push(InternalEvent::ClosePopup);
             }
             KeyCode::Enter => {
@@ -153,6 +162,11 @@ mod tests {
     fn esc_closes_and_empty_enter_just_closes() {
         let (mut p, q) = comp("prefilled");
         p.event(&ts::key(KeyCode::Esc)).unwrap();
+        // Esc restores the initial filter text, then closes
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::LogSearchInput(s)) if s == "prefilled"
+        ));
         assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
         assert!(q.pop().is_none());
 
@@ -160,6 +174,21 @@ mod tests {
         p2.event(&ts::key(KeyCode::Enter)).unwrap();
         assert!(matches!(q2.pop(), Some(InternalEvent::ClosePopup)));
         assert!(q2.pop().is_none());
+    }
+
+    #[test]
+    fn esc_restores_the_initial_filter() {
+        let (mut p, q) = comp("saved");
+        for ch in "xy".chars() {
+            p.event(&ts::key(KeyCode::Char(ch))).unwrap();
+            assert!(matches!(q.pop(), Some(InternalEvent::LogSearchInput(_))));
+        }
+        p.event(&ts::key(KeyCode::Esc)).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::LogSearchInput(s)) if s == "saved"
+        ));
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
     }
 
     #[test]

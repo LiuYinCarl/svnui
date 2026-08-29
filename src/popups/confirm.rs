@@ -1,5 +1,5 @@
-//! Yes/No confirmation popup. Confirming pushes `Confirmed(action)` back
-//! to the queue so the app performs the action.
+//! Yes/No confirmation popup. Confirming closes the popup and pushes
+//! `Confirmed(action)` back to the queue so the app performs the action.
 
 use super::super::components::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
@@ -73,10 +73,14 @@ impl DrawableComponent for ConfirmPopup {
             return Ok(EventState::not_consumed());
         };
         if key_match(k, KeyAction::Confirm) {
+            // close the dialog *before* performing the action: synchronous
+            // actions (e.g. deleting a patch file) show their feedback
+            // popup immediately, and it must not be closed by this popup's
+            // own ClosePopup
+            self.ctx.queue.push(InternalEvent::ClosePopup);
             if let Some(action) = self.action.take() {
                 self.ctx.queue.push(InternalEvent::Confirmed(action));
             }
-            self.ctx.queue.push(InternalEvent::ClosePopup);
             return Ok(EventState::consumed());
         }
         if key_match(k, KeyAction::Deny) || key_match(k, KeyAction::ClosePopup) {
@@ -112,11 +116,12 @@ mod tests {
         let ev = ts::key(crossterm::event::KeyCode::Char('y'));
         let state = p.event(&ev).unwrap();
         assert!(state.consumed);
+        // the popup closes first, then the action is performed
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
         assert!(matches!(
             q.pop(),
             Some(InternalEvent::Confirmed(ConfirmAction::Update))
         ));
-        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
     }
 
     #[test]

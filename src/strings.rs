@@ -4,6 +4,7 @@ pub struct Title {
     pub status: &'static str,
     pub log: &'static str,
     pub log_detail: &'static str,
+    pub patches: &'static str,
     pub help: &'static str,
     pub blame: &'static str,
     pub confirm: &'static str,
@@ -17,6 +18,7 @@ pub const TITLE: Title = Title {
     status: "Files (svn status)",
     log: "Log (svn log)",
     log_detail: "Revision details",
+    patches: "Patches",
     help: "Help",
     blame: "Blame",
     confirm: "Confirm",
@@ -41,6 +43,12 @@ pub struct Msg {
     pub add_done: &'static str,
     pub revert_done: &'static str,
     pub resolve_done: &'static str,
+    pub empty_patches: &'static str,
+    pub patch_saved: &'static str,
+    pub patch_nothing_to_save: &'static str,
+    pub patch_deleted: &'static str,
+    pub apply_patch_confirm: &'static str,
+    pub delete_patch_confirm: &'static str,
 }
 
 pub const MSG: Msg = Msg {
@@ -58,4 +66,10 @@ pub const MSG: Msg = Msg {
     add_done: "Added to version control",
     revert_done: "Reverted",
     resolve_done: "Conflict resolved",
+    empty_patches: "No patches yet — press P to save the working-copy changes as a patch file",
+    patch_saved: "Saved patch",
+    patch_nothing_to_save: "No local changes — nothing to save as a patch",
+    patch_deleted: "Deleted patch",
+    apply_patch_confirm: "Apply this patch to the working copy? (svn patch)",
+    delete_patch_confirm: "Delete this patch file?",
 };

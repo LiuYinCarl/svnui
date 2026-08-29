@@ -1,0 +1,78 @@
+name: Bump & Release
+
+# Every push to master/main bumps the patch version, tags it, and triggers
+# the release pipeline. The bump commit carries [skip ci] so GitHub does not
+# run any workflows for it, and the job-level `if` below is a second guard
+# against the workflow retriggering itself.
+on:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: write
+
+# Serialize bumps per branch so rapid successive pushes don't race.
+concurrency:
+  group: bump-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    name: Bump patch version
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Check out the branch tip, not the event's SHA: queued runs
+          # (concurrency serializes them) must start from the state left
+          # behind by any earlier queued run, or they'd compute a stale
+          # version and fail the push as non-fast-forward.
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Sync to the current branch tip
+        # Belt and suspenders for the queued-run scenario: two pushes in
+        # quick succession mean run B only starts after run A pushed its
+        # bump commit. Make sure we build on the newest remote tip before
+        # computing the next version.
+        run: |
+          git fetch origin
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+      - name: Bump version, commit, tag, push
+        id: bump
+        run: |
+          set -euo pipefail
+          CURRENT="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "Bumping $CURRENT -> $NEW"
+          # Only the package version starts a line with `version = "..."`,
+          # so a plain anchored substitution hits exactly that one line.
+          sed -i "s/^version = \".*\"/version = \"$NEW\"/" Cargo.toml
+          # Rewrites Cargo.lock with the new package version.
+          cargo check
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): bump version to $NEW [skip ci]"
+          git tag "v$NEW"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "v$NEW"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build & publish release
+    needs: bump
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}

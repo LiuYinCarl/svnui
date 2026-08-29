@@ -3,7 +3,10 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::Rc;
+
+use crate::svn::models::LogEntry;
 
 /// Which parts of the app need a refresh/redraw.
 ///
@@ -57,8 +60,8 @@ pub enum InternalEvent {
     AddFiles(Vec<String>),
     /// Request a diff of the currently selected file (fullscreen)
     RequestFileDiff,
-    /// Request blame of the selected file
-    RequestBlame,
+    /// Request blame of a file (path relative to the working copy root)
+    RequestBlame(String),
     /// Request the history of the currently selected file (status tab)
     RequestFileHistory,
     /// Open the history popup for a specific path (e.g. from file finder)
@@ -77,6 +80,10 @@ pub enum InternalEvent {
     LogSearchInput(String),
     /// Load older revisions at the bottom of the log list
     LogLoadMore,
+    /// Show the full info of the selected commit (log tab)
+    ShowCommitInfo(LogEntry),
+    /// Preview a patch file in the diff popup (patches tab)
+    PreviewPatch(PathBuf),
 }
 
 /// An action that needs user confirmation.
@@ -92,6 +99,10 @@ pub enum ConfirmAction {
     Resolve(String),
     /// Update working copy to a revision
     UpdateToRevision(u64),
+    /// Apply a patch file to the working copy (svn patch)
+    ApplyPatch(PathBuf),
+    /// Delete a patch file from the patch directory
+    DeletePatch(PathBuf),
 }
 
 /// Which main tab is active.
@@ -99,6 +110,7 @@ pub enum ConfirmAction {
 pub enum Tab {
     Status,
     Log,
+    Patches,
 }
 
 /// Simple FIFO queue shared via Rc, so components can push events without

@@ -18,6 +18,10 @@ pub enum PaneFocus {
     Commit,
 }
 
+/// Status-bar shortcut hints shown while the status tab is active.
+pub const HINTS: &str =
+    "spc stage  c commit  r revert  u update  b blame  / filter  P patch  F5 refresh";
+
 pub struct StatusTab {
     pub tree: StatusTreeComponent,
     pub diff: DiffView,
@@ -181,7 +185,7 @@ impl StatusTab {
         let theme = &self.commit.ctx.theme;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .constraints([Constraint::Min(0), Constraint::Length(4)])
             .split(area);
         let content = chunks[0];
         let horiz = Layout::default()
@@ -389,6 +393,8 @@ mod tests {
         let s = ts::dump(&terminal);
         assert!(s.contains("a.txt"), "{s}");
         assert!(s.contains("Commit message"), "{s}");
+        // the bar is 4 rows tall so the shortcut hint line is visible
+        assert!(s.contains("[Tab] history"), "{s}");
         assert!(s.contains("old"), "{s}");
         assert!(s.contains("new"), "{s}");
     }

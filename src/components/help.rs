@@ -1,7 +1,7 @@
 //! Help popup: lists all keybindings.
 
 use super::{Context, DrawableComponent, EventState};
-use crate::keys::{KeyAction, all_bindings, key_match};
+use crate::keys::{KeyAction, all_binding_groups, key_match};
 use crate::queue::InternalEvent;
 use crate::ui;
 use crossterm::event::{Event, KeyCode};
@@ -45,11 +45,15 @@ impl DrawableComponent for HelpPopup {
             theme.title_focused,
         )));
         lines.push(Line::from(""));
-        for b in all_bindings() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {: <18}", b.keys), theme.info),
-                Span::styled(b.description, theme.text),
-            ]));
+        for group in all_binding_groups() {
+            lines.push(Line::from(Span::styled(group.title, theme.title_focused)));
+            for b in group.bindings {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {: <18}", b.keys), theme.info),
+                    Span::styled(b.description, theme.text),
+                ]));
+            }
+            lines.push(Line::from(""));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -113,6 +117,9 @@ mod tests {
         assert!(s.contains("svnui"), "{s}");
         assert!(s.contains("Quit svnui"), "{s}");
         assert!(s.contains("Help"), "{s}");
+        // bindings are grouped by context
+        assert!(s.contains("Global"), "{s}");
+        assert!(s.contains("Status tab"), "{s}");
         // scroll down
         h.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();

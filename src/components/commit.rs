@@ -137,14 +137,22 @@ impl CommitComponent {
             .title("Recent commit messages");
         let inner = block.inner(rect);
         f.render_widget(block, rect);
+        let visible = (height - 2) as usize;
+        // keep the selection inside the visible window on short terminals
+        let offset = if self.history_sel >= visible {
+            self.history_sel - visible + 1
+        } else {
+            0
+        };
         let lines: Vec<Line> = self
             .history
             .iter()
-            .take((height - 2) as usize)
+            .skip(offset)
+            .take(visible)
             .map(|m| Line::from(Span::raw(m.clone())))
             .collect();
         let highlights = vec![(
-            self.history_sel,
+            self.history_sel - offset,
             Style::default()
                 .bg(theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
@@ -482,13 +490,36 @@ mod tests {
         c.focus();
         type_text(&mut c, "hello");
         c.hint = "2 staged".to_string();
-        let terminal = ts::render(60, 5, |f| {
-            c.draw(f, Rect::new(0, 0, 60, 5)).unwrap();
+        // height 4 matches the production bar (StatusTab gives it
+        // Constraint::Length(4)): the hint line must actually render
+        let terminal = ts::render(60, 4, |f| {
+            c.draw(f, Rect::new(0, 0, 60, 4)).unwrap();
         });
         let s = ts::dump(&terminal);
         assert!(s.contains("hello"), "{s}");
         assert!(s.contains("Commit message"), "{s}");
+        assert!(s.contains("[Tab] history"), "{s}");
         assert!(s.contains("2 staged"), "{s}");
+    }
+
+    #[test]
+    fn history_picker_keeps_selection_visible() {
+        let (mut c, _q) = comp();
+        c.focus();
+        c.set_history((0..10).map(|i| format!("msg{i}")).collect());
+        c.event(&ev(KeyCode::Tab)).unwrap();
+        // select msg5; with only 3 visible rows the picker must scroll
+        for _ in 0..5 {
+            c.event(&ev(KeyCode::Down)).unwrap();
+        }
+        let terminal = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 5, 40, 3)).unwrap();
+        });
+        let s = ts::dump(&terminal);
+        assert!(s.contains("msg5"), "selection must stay visible: {s}");
+        assert!(s.contains("msg3"), "{s}");
+        assert!(!s.contains("msg0"), "scrolled-out rows must not draw: {s}");
+        assert!(!s.contains("msg2"), "scrolled-out rows must not draw: {s}");
     }
 
     #[test]

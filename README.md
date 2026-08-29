@@ -15,12 +15,13 @@
 | **Diff 面板** | 选中文件自动显示 `svn diff`，带行号与 +/− 高亮；未版本化文件直接显示内容 |
 | **暂存/提交** | `space` 暂存（加入提交集），`A` 全部暂存，`U` 全部取消；暂存未版本化文件会自动 `svn add`；提交集为空时拒绝提交。输入框支持中文/宽字符与多行粘贴，`Tab` 可回填最近提交信息 |
 | **日志视图** | `svn log -v` 修订列表 + 变更路径与提交信息详情，滚动到底部自动加载更早的修订（分页，每次 50 条）；`/` 弹出搜索框（输入时实时筛选当前列表，回车用 `svn log --search` 搜索全部历史，同样支持滚动分页）；`space` 标记多个修订后 `d`/`Enter` 查看合并 diff |
-| **文件历史** | `t` 查看选中文件的 `svn log` 历史，弹窗内 `Enter` 直接看该修订 diff |
-| **文件搜索** | `Ctrl+p` fzf 式模糊搜索文件，命中字符高亮，回车跳转到该文件的历史 |
-| **Blame** | `svn blame` 按修订号着色显示 |
+| **文件历史** | `t` 查看选中文件的 `svn log` 历史，弹窗内 `Enter` 直接看该修订 diff，`b` 查看该文件 Blame |
+| **文件搜索** | `Ctrl+p` fzf 式模糊搜索文件，命中字符高亮，回车跳转到该文件的历史，`Ctrl+b` 查看该文件 Blame |
+| **Blame** | `svn blame` 按修订号着色显示（状态树 `b`、文件历史弹窗 `b`、文件搜索 `Ctrl+b`） |
 | **还原** | `svn revert`（带确认） |
 | **更新** | `svn update`、更新到指定修订（`svn update -r N`，均带确认，确认弹窗显示将更新的工作副本路径） |
 | **冲突解决** | `svn resolve --accept=working`（带确认） |
+| **补丁管理** | `P` 将工作副本改动保存为带时间戳的补丁文件（`svn diff` 快照，不回滚工作副本）；`3` 打开补丁页浏览（最新在前）、`Enter`/`p` 预览（复用 Diff 弹窗）、`a` 应用（`svn patch`，带确认）、`d` 删除（带确认）。存储目录为平台数据目录，可用环境变量 `SVNUI_PATCH_DIR` 覆盖 |
 | **过滤** | `/` 按路径过滤文件（状态页）/ 搜索提交（日志页） |
 | **帮助** | `?` 查看全部快捷键 |
 | **异步执行** | 所有 svn 命令在后台线程执行，UI 不卡顿，带 spinner 指示 |
@@ -56,38 +57,46 @@ svnui /path/to/working-copy
 | `Tab` | 提交输入框内：列出最近提交信息，选中回填 |
 | `u` | `svn update` |
 | `d` | 全屏 Diff |
-| `b` | Blame 文件 |
+| `b` | Blame 文件（状态页 / 文件历史弹窗） |
 | `t` | 查看选中文件的提交历史 |
 | `Ctrl+p` | 模糊搜索文件（回车查看文件历史） |
-| `/` | 过滤文件（状态页）/ 搜索提交（日志页，弹窗输入，回车搜索全部历史） |
-| `F5` / `R` | 刷新状态 |
-| `Tab` / `Shift+Tab` | 切换面板焦点 |
-| `1` / `2` | 状态 / 日志 标签页 |
+| `Ctrl+b` | 文件搜索弹窗：Blame 高亮的文件 |
+| `/` | 过滤文件（状态页）/ 搜索提交（日志页，弹窗输入，回车搜索全部历史）/ Diff、Blame 弹窗内增量搜索文本（实时高亮并滚动到匹配） |
+| `n` / `N` | Diff、Blame 弹窗搜索：下一个 / 上一个匹配（循环） |
+| `F5` / `R` | 刷新状态 / 日志 / 补丁列表 |
+| `P` | 保存工作副本改动为补丁文件（快照，不回滚） |
+| `Tab` / `Shift+Tab` | 切换面板焦点 / 标签页 |
+| `1` / `2` / `3` | 状态 / 日志 / 补丁 标签页 |
 | `Enter` / `d` | 日志页：查看所选（或标记的多个）修订的 diff |
 | `space` | 日志页：标记 / 取消标记修订 |
 | `o` | 日志页：更新到所选修订 |
+| `v` | 日志页：查看完整提交信息 |
+| `Enter` / `p` | 补丁页：预览补丁（Diff 视图） |
+| `a` | 补丁页：应用补丁（`svn patch`，确认后执行） |
+| `d` | 补丁页：删除补丁文件（确认后执行） |
 | `?` | 帮助 |
-| `Esc` | 关闭弹窗 / 取消 |
+| `Esc` | 关闭弹窗 / 取消（搜索状态下：先取消输入或清除高亮，再次按下才关闭弹窗） |
 
 ## CI/CD
 
 [![CI](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml)
 [![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/release.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/release.yml)
 
-`.github/workflows/` 包含两条流水线：
+`.github/workflows/` 包含三条流水线：
 
 - **ci.yml** — push / PR 时运行：fmt、clippy（零警告门禁）、Linux/macOS 全量测试、覆盖率门禁（≥ 80%）、三平台 release 构建。
-- **release.yml** — 推送 `v*` 标签时运行：校验标签与 `Cargo.toml` 版本一致，在 Linux (x86_64)、macOS (arm64)、Windows (x86_64) 上构建 release 二进制并创建 GitHub Release。
+- **bump.yml** — 每次 push 到 master/main 自动运行：将 `Cargo.toml` 的补丁版本号 +1，提交（消息带 `[skip ci]`，避免触发自身流水线）、打 `vX.Y.Z` 标签并推送，随后调用 release.yml 完成发布。同一分支的多次 push 会串行排队执行，排队中的任务开始时先同步分支最新提交，避免算出过期版本号。
+- **release.yml** — 推送 `v*` 标签时运行（也供 bump.yml 调用）：校验标签与 `Cargo.toml` 版本一致，在 Linux (x86_64)、macOS (arm64)、Windows (x86_64) 上构建 release 二进制并创建 GitHub Release。
 
-### 发布新版本（Tag 触发 Release）
+### 发布新版本
+
+日常向 master/main push 即可：bump.yml 会自动 bump 补丁版本并发布，无需手动操作。
+
+想发 minor / major 版本：push 前自己把 `Cargo.toml` 的 `version` 改成目标版本即可（bump 只会在其基础上再 +1 补丁位）。也可以沿用手动标签流程（标签 `vX.Y.Z` 必须与 `Cargo.toml` 版本一致）：
 
 ```bash
-# 1. 更新 Cargo.toml 中的 version
-cargo set-version 0.2.0          # 或手动编辑
-# 2. 提交并打标签（标签 vX.Y.Z 必须与 Cargo.toml 版本一致）
-git add -A && git commit -m "chore: release v0.2.0"
 git tag v0.2.0
-git push origin master --tags
+git push origin v0.2.0
 ```
 
 ## 性能（超大型 SVN 项目）

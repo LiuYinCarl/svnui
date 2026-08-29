@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Internal tree node while building.
 #[derive(Clone, Debug)]
@@ -68,6 +68,12 @@ impl StatusTreeComponent {
 
     pub fn update(&mut self, entries: Vec<StatusEntry>) {
         self.pending = false;
+        // Prune staged paths that no longer have a status entry (committed
+        // or reverted elsewhere) so they cannot poison the next commit.
+        if !self.staged.is_empty() {
+            let present: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+            self.staged.retain(|p| present.contains(p.as_str()));
+        }
         self.entries = entries;
         self.counts_dirty.set(true);
         self.rebuild_visible();
@@ -94,7 +100,10 @@ impl StatusTreeComponent {
         }
     }
 
-    /// Paths affected by staging the item under the cursor.
+    /// Paths affected by staging the item under the cursor. For a directory
+    /// this includes the directory's own status entry (if any — e.g. an
+    /// unversioned or property-changed dir) plus all descendant files; svn
+    /// accepts directories as add/commit/revert targets.
     pub fn paths_at_selection(&self) -> Vec<String> {
         let Some(item) = self.visible.get(self.selection) else {
             return Vec::new();
@@ -108,9 +117,49 @@ impl StatusTreeComponent {
     /// Toggle staging for the item under the cursor. Returns the paths that
     /// were newly staged (so the app can run `svn add` for unversioned ones)
     /// and the paths that were unstaged.
+    ///
+    /// Dir-toggle semantics: if anything stageable under the selection is
+    /// unstaged, stage it all (complete, don't invert); only when everything
+    /// is staged does the toggle unstage. Missing ('!'), obstructed ('~')
+    /// and conflicted entries cannot be committed and are never staged.
     pub fn toggle_stage_at_selection(&mut self) -> (Vec<String>, Vec<String>) {
         let paths = self.paths_at_selection();
-        self.toggle_stage_paths(&paths)
+        if paths.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let by_path = self.entries_by_path();
+        let stageable_paths: Vec<&String> = paths
+            .iter()
+            .filter(|p| by_path.get(p.as_str()).is_none_or(|e| stageable(e)))
+            .collect();
+        if stageable_paths.iter().all(|p| self.staged.contains(*p)) {
+            // Everything stageable is already staged → unstage everything
+            // under the selection. This also clears staged paths that have
+            // since turned unstageable (e.g. the file went missing).
+            let removed: Vec<String> = paths
+                .iter()
+                .filter(|p| self.staged.contains(*p))
+                .cloned()
+                .collect();
+            if !removed.is_empty() {
+                self.unset_staged(&paths);
+                return (Vec::new(), removed);
+            }
+        }
+        if stageable_paths.is_empty() {
+            self.ctx.queue.push(InternalEvent::ShowInfoMsg(
+                "Nothing stageable here (missing/obstructed/conflicted files must be fixed first)"
+                    .to_string(),
+            ));
+            return (Vec::new(), Vec::new());
+        }
+        let added: Vec<String> = stageable_paths
+            .iter()
+            .filter(|p| !self.staged.contains(**p))
+            .map(|p| (*p).clone())
+            .collect();
+        self.set_staged(&added);
+        (added, Vec::new())
     }
 
     pub fn toggle_stage_paths(&mut self, paths: &[String]) -> (Vec<String>, Vec<String>) {
@@ -197,11 +246,15 @@ impl StatusTreeComponent {
 
     // ----- internals -----
 
+    /// Paths affected by acting on a directory: the directory's own status
+    /// entry (if any) plus all descendant file entries. The dir's own entry
+    /// matters for unversioned dirs (`? newdir` has no children in
+    /// `svn status` output) and dirs with property-only changes.
     fn files_under(&self, dir_path: &str) -> Vec<String> {
         let prefix = format!("{dir_path}/");
         self.entries
             .iter()
-            .filter(|e| !e.is_dir && e.path.starts_with(&prefix))
+            .filter(|e| e.path == dir_path || (!e.is_dir && e.path.starts_with(&prefix)))
             .map(|e| e.path.clone())
             .collect()
     }
@@ -323,9 +376,10 @@ impl StatusTreeComponent {
         } else if key_match(k, KeyAction::ToggleStage) {
             let (added, _) = self.toggle_stage_at_selection();
             if !added.is_empty() {
+                let by_path = self.entries_by_path();
                 let needs_add: Vec<String> = added
                     .iter()
-                    .filter(|p| self.entry_for_path(p).is_some_and(|e| e.status == '?'))
+                    .filter(|p| by_path.get(p.as_str()).is_some_and(|e| e.status == '?'))
                     .cloned()
                     .collect();
                 if !needs_add.is_empty() {
@@ -333,27 +387,43 @@ impl StatusTreeComponent {
                 }
             }
         } else if key_match(k, KeyAction::StageAll) {
-            let all: Vec<String> = self.changed_files().into_iter().map(|(_, p)| p).collect();
-            let needs_add: Vec<String> = all
-                .iter()
-                .filter(|p| self.entry_for_path(p).is_some_and(|e| e.status == '?'))
-                .cloned()
-                .collect();
+            // One pass over the entries: no per-path lookups, and files svn
+            // cannot commit (missing/obstructed/conflicted) are skipped so
+            // the next commit does not fail wholesale.
+            let mut all = Vec::new();
+            let mut needs_add = Vec::new();
+            let mut skipped = 0usize;
+            for e in &self.entries {
+                if e.is_dir {
+                    continue;
+                }
+                if !stageable(e) {
+                    skipped += 1;
+                    continue;
+                }
+                if e.status == '?' {
+                    needs_add.push(e.path.clone());
+                }
+                all.push(e.path.clone());
+            }
             self.set_staged(&all);
             if !needs_add.is_empty() {
                 self.ctx.queue.push(InternalEvent::AddFiles(needs_add));
+            }
+            if skipped > 0 {
+                self.ctx.queue.push(InternalEvent::ShowInfoMsg(format!(
+                    "Skipped {skipped} missing/obstructed/conflicted file(s)"
+                )));
             }
         } else if key_match(k, KeyAction::UnstageAll) {
             self.clear_staged();
         } else if key_match(k, KeyAction::AddFiles) {
             let paths = self.paths_at_selection();
             if !paths.is_empty() {
+                let by_path = self.entries_by_path();
                 let unversioned: Vec<String> = paths
                     .iter()
-                    .filter(|p| {
-                        self.entry_for_path(p).is_none()
-                            || self.entry_for_path(p).is_some_and(|e| e.status == '?')
-                    })
+                    .filter(|p| by_path.get(p.as_str()).is_none_or(|e| e.status == '?'))
                     .cloned()
                     .collect();
                 if !unversioned.is_empty() {
@@ -361,10 +431,11 @@ impl StatusTreeComponent {
                 }
             }
         } else if key_match(k, KeyAction::RevertFiles) {
+            let by_path = self.entries_by_path();
             let paths: Vec<String> = self
                 .paths_at_selection()
                 .into_iter()
-                .filter(|p| self.entry_for_path(p).is_some_and(|e| e.status != '?'))
+                .filter(|p| by_path.get(p.as_str()).is_some_and(|e| e.status != '?'))
                 .collect();
             if !paths.is_empty() {
                 self.ctx
@@ -401,7 +472,9 @@ impl StatusTreeComponent {
             if let Some(e) = self.selection_entry()
                 && !e.is_dir
             {
-                self.ctx.queue.push(InternalEvent::RequestBlame);
+                self.ctx
+                    .queue
+                    .push(InternalEvent::RequestBlame(e.path.clone()));
             }
         } else if key_match(k, KeyAction::FileHistory) {
             if let Some(e) = self.selection_entry()
@@ -432,6 +505,19 @@ impl StatusTreeComponent {
     fn entry_for_path(&self, path: &str) -> Option<&StatusEntry> {
         self.entries.iter().find(|e| e.path == path)
     }
+
+    /// Path → entry index map, built once per event so handlers that touch
+    /// many paths stay O(n) instead of doing a linear scan per path.
+    fn entries_by_path(&self) -> HashMap<&str, &StatusEntry> {
+        self.entries.iter().map(|e| (e.path.as_str(), e)).collect()
+    }
+}
+
+/// Whether an entry can be committed as-is. Missing ('!') and obstructed
+/// ('~') files make `svn commit` fail wholesale; conflicted files must be
+/// resolved first.
+fn stageable(e: &StatusEntry) -> bool {
+    !matches!(e.status, '!' | '~') && !e.is_conflicted()
 }
 
 impl DrawableComponent for StatusTreeComponent {
@@ -586,7 +672,9 @@ impl StatusTreeComponent {
         }
     }
 
-    fn dir_staged_counts(&self) -> std::collections::HashMap<String, (usize, usize)> {
+    fn dir_staged_counts(
+        &self,
+    ) -> std::cell::Ref<'_, std::collections::HashMap<String, (usize, usize)>> {
         if self.counts_dirty.replace(false) {
             let mut counts: std::collections::HashMap<String, (usize, usize)> =
                 std::collections::HashMap::new();
@@ -613,7 +701,7 @@ impl StatusTreeComponent {
             }
             *self.counts_cache.borrow_mut() = counts;
         }
-        self.counts_cache.borrow().clone()
+        self.counts_cache.borrow()
     }
 }
 
@@ -680,18 +768,26 @@ fn build_tree(entries: &[StatusEntry]) -> Vec<Node> {
         }
     }
 
-    fn collect(i: usize, flat: &mut [Option<Node>], children_of: &[Vec<usize>]) -> Node {
-        let mut node = flat[i].take().expect("node taken once");
+    fn collect(i: usize, flat: &mut [Option<Node>], children_of: &[Vec<usize>]) -> Option<Node> {
+        // each node is taken exactly once (one parent prefix per path);
+        // a repeat visit would mean corrupt assembly — skip the node
+        // instead of panicking
+        let mut node = flat[i].take()?;
         node.children = children_of[i]
             .iter()
-            .map(|&c| collect(c, flat, children_of))
+            .filter_map(|&c| collect(c, flat, children_of))
             .collect();
-        node
+        // A node with children is structurally a directory, even when the
+        // disk probe said otherwise — after `svn rm dir` the dir is gone
+        // from disk but status still lists it and its deleted children, and
+        // only dir nodes are expandable (so their children stay reachable).
+        node.is_dir = node.is_dir || !node.children.is_empty();
+        Some(node)
     }
 
     let mut roots: Vec<Node> = roots_idx
         .iter()
-        .map(|&i| collect(i, &mut flat, &children_of))
+        .filter_map(|&i| collect(i, &mut flat, &children_of))
         .collect();
 
     fn sort_nodes(nodes: &mut [Node]) {
@@ -1101,6 +1197,153 @@ mod interaction_tests {
         c.event(&key(KeyCode::End)).unwrap();
         assert_eq!(c.paths_at_selection(), vec!["top.txt"]);
     }
+
+    /// A status entry for a directory (is_dir on disk).
+    fn dir_entry(status: char, path: &str) -> StatusEntry {
+        crate::svn::models::StatusEntry {
+            status,
+            props_status: ' ',
+            tree_conflict: ' ',
+            path: path.to_string(),
+            is_dir: true,
+        }
+    }
+
+    #[test]
+    fn deleted_dir_with_children_is_expandable() {
+        // after `svn rm gone` the dir no longer exists on disk (is_dir=false)
+        // but status still lists it and its deleted children; the node must
+        // still behave as a directory or the children are unreachable
+        let (mut c, _q) = comp_with(vec![
+            entry('D', "gone"),
+            entry('D', "gone/a.txt"),
+            entry('D', "gone/b.txt"),
+        ]);
+        assert!(matches!(c.visible[0].kind, TreeItemKind::Dir { .. }));
+        c.event(&key(KeyCode::Char('l'))).unwrap(); // expand
+        assert_eq!(c.visible.len(), 3);
+        assert_eq!(c.visible[1].path, "gone/a.txt");
+        c.event(&key(KeyCode::Char('h'))).unwrap(); // collapse
+        // staging the dir covers the dir itself and all deleted children
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("gone"));
+        assert!(c.staged.contains("gone/a.txt"));
+        assert!(c.staged.contains("gone/b.txt"));
+    }
+
+    #[test]
+    fn unversioned_dir_can_be_staged() {
+        // svn does not recurse into unversioned dirs, so `? newdir` has no
+        // children; the dir's own path must be stageable
+        let (mut c, q) = comp_with(vec![dir_entry('?', "newdir")]);
+        assert_eq!(c.paths_at_selection(), vec!["newdir"]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("newdir"));
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::AddFiles(p)) if p == vec!["newdir"]
+        ));
+    }
+
+    #[test]
+    fn dir_with_own_entry_stages_dir_and_children() {
+        let (mut c, _q) = comp_with(vec![dir_entry('M', "dir"), entry('M', "dir/f.txt")]);
+        assert_eq!(c.paths_at_selection(), vec!["dir", "dir/f.txt"]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("dir"));
+        assert!(c.staged.contains("dir/f.txt"));
+    }
+
+    #[test]
+    fn missing_obstructed_conflicted_files_are_not_staged() {
+        for status in ['!', '~', 'C'] {
+            let (mut c, q) = comp_with(vec![entry(status, "bad.txt")]);
+            c.event(&key(KeyCode::Char(' '))).unwrap();
+            assert!(c.staged.is_empty(), "status {status} must not stage");
+            assert!(matches!(q.pop(), Some(InternalEvent::ShowInfoMsg(_))));
+        }
+        // a tree-conflict flag also refuses staging
+        let mut e = entry('M', "conf.txt");
+        e.tree_conflict = 'C';
+        let (mut c, q) = comp_with(vec![e]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.is_empty());
+        assert!(matches!(q.pop(), Some(InternalEvent::ShowInfoMsg(_))));
+        // unstaging a previously staged bad path still works
+        let (mut c, _q) = comp_with(vec![entry('M', "f.txt")]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("f.txt"));
+        c.update(vec![entry('!', "f.txt")]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.is_empty());
+    }
+
+    #[test]
+    fn stage_all_skips_missing_obstructed_conflicted() {
+        let (mut c, q) = comp_with(vec![
+            entry('M', "ok.txt"),
+            entry('!', "missing.txt"),
+            entry('~', "obstructed.txt"),
+            entry('C', "conflicted.txt"),
+        ]);
+        c.event(&key(KeyCode::Char('A'))).unwrap();
+        assert_eq!(c.staged_count(), 1);
+        assert!(c.staged.contains("ok.txt"));
+        assert!(matches!(q.pop(), Some(InternalEvent::ShowInfoMsg(_))));
+    }
+
+    #[test]
+    fn update_prunes_staged_paths_that_disappeared() {
+        let (mut c, _q) = comp_with(vec![entry('M', "a.txt"), entry('M', "b.txt")]);
+        c.set_staged(&["a.txt".to_string(), "b.txt".to_string()]);
+        // b.txt is no longer changed (committed or reverted elsewhere)
+        c.update(vec![entry('M', "a.txt")]);
+        assert!(c.staged.contains("a.txt"));
+        assert!(!c.staged.contains("b.txt"));
+        assert_eq!(c.staged_count(), 1);
+    }
+
+    #[test]
+    fn partially_staged_dir_toggle_completes_then_unstages() {
+        let (mut c, _q) = comp_with(vec![entry('M', "src/main.rs"), entry('M', "src/lib.rs")]);
+        // one file already staged: space on the dir completes the set
+        // instead of inverting each descendant
+        c.set_staged(&["src/main.rs".to_string()]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("src/main.rs"));
+        assert!(c.staged.contains("src/lib.rs"));
+        // fully staged: space unstages everything
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.is_empty());
+    }
+
+    /// Real-svn check for staging a directory together with its children:
+    /// svn must accept redundant parent+child targets for add and commit.
+    #[test]
+    fn svn_accepts_dir_and_child_targets() {
+        let Some(repo) = ts::TestRepo::new() else {
+            return; // svn unavailable
+        };
+        // property change on a dir plus an added child, committed with
+        // overlapping targets (dir first, then the child)
+        ts::write_file(&repo.wc.join("src/new.rs"), "fn new() {}\n");
+        repo.svn(&["add", "src/new.rs"]);
+        repo.svn(&["propset", "svn:ignore", "*.tmp", "src"]);
+        repo.svn(&["commit", "-m", "dir+child", "src", "src/new.rs"]);
+        assert!(repo.svn(&["status"]).trim().is_empty());
+        // deleted dir plus deleted child as overlapping targets
+        repo.svn(&["rm", "docs"]);
+        repo.svn(&["commit", "-m", "rm docs", "docs", "docs/readme.md"]);
+        assert!(repo.svn(&["status"]).trim().is_empty());
+        // an unversioned dir staged alone: `svn add dir` is recursive and
+        // committing the dir target sweeps up its children
+        ts::write_file(&repo.wc.join("newdir/f.txt"), "x\n");
+        repo.svn(&["add", "newdir"]);
+        let st = repo.svn(&["status"]);
+        assert!(st.lines().any(|l| l.contains("newdir/f.txt")), "{st}");
+        repo.svn(&["commit", "-m", "add newdir", "newdir"]);
+        assert!(repo.svn(&["status"]).trim().is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1203,5 +1446,25 @@ mod perf_tests {
         let el = t.elapsed();
         assert_eq!(c.visible.len(), 100_000);
         assert!(el < Duration::from_secs(5), "rebuild_visible took {el:?}");
+    }
+
+    /// Stage-all must not do a linear entry scan per path (the old handler
+    /// was O(n^2): one `entry_for_path` lookup per changed file).
+    #[test]
+    fn perf_stage_all_100k() {
+        let (mut c, _q) = comp();
+        c.update(ts::gen_status_entries(100_000, true));
+        let t = Instant::now();
+        c.event(&Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('A'),
+            crossterm::event::KeyModifiers::NONE,
+        )))
+        .unwrap();
+        let el = t.elapsed();
+        assert_eq!(c.staged_count(), 100_000);
+        assert!(
+            el < Duration::from_secs(5),
+            "StageAll over 100k files took {el:?}; O(n^2) regression?"
+        );
     }
 }

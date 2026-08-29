@@ -1,11 +1,12 @@
 //! Blame popup: shows `svn blame` output with per-revision coloring.
 
+use super::text_search::{InputOutcome, TextSearch, highlight_spans};
 use super::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
 use crate::queue::InternalEvent;
 use crate::svn::models::BlameLine;
 use crate::ui::{self, style::Theme};
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -19,6 +20,8 @@ pub struct BlamePopup {
     pub lines: Vec<BlameLine>,
     pub pending: bool,
     scroll: Cell<usize>,
+    /// Incremental search over the blame content (`/`, n/N)
+    pub search: TextSearch,
 }
 
 impl BlamePopup {
@@ -29,6 +32,7 @@ impl BlamePopup {
             lines: Vec::new(),
             pending: true,
             scroll: Cell::new(0),
+            search: TextSearch::new(),
         }
     }
 
@@ -36,9 +40,41 @@ impl BlamePopup {
         self.pending = false;
         self.lines = lines;
         self.scroll.set(0);
+        self.search.clear();
+    }
+
+    /// Recompute search matches against the blame content and scroll to
+    /// the (new) current match.
+    fn refresh_search(&mut self) {
+        let lines: Vec<&str> = self.lines.iter().map(|l| l.content.as_str()).collect();
+        self.search.recompute(&lines, self.scroll.get());
+        if let Some(line) = self.search.current_match_line() {
+            self.scroll.set(line);
+        }
     }
 
     pub fn event(&mut self, ev: &Event) -> Result<EventState, String> {
+        // Esc: cancel search input / clear search highlights first; only
+        // with no active search does it close the popup.
+        if let Event::Key(k) = ev
+            && key_match(k, KeyAction::ClosePopup)
+        {
+            if self.search.is_input_mode() {
+                self.search.cancel();
+            } else if self.search.is_active() {
+                self.search.clear();
+            } else {
+                self.ctx.queue.push(InternalEvent::ClosePopup);
+            }
+            return Ok(EventState::consumed());
+        }
+        // search input mode: everything goes into the pattern
+        if self.search.is_input_mode() {
+            if self.search.input_event(ev) == InputOutcome::Changed {
+                self.refresh_search();
+            }
+            return Ok(EventState::consumed());
+        }
         let Event::Key(k) = ev else {
             return Ok(EventState::not_consumed());
         };
@@ -56,7 +92,20 @@ impl BlamePopup {
             scroll = 0;
         } else if key_match(k, KeyAction::End) {
             scroll = len;
-        } else if key_match(k, KeyAction::ClosePopup) || key_match(k, KeyAction::Quit) {
+        } else if key_match(k, KeyAction::Filter) {
+            self.search.start_input();
+            return Ok(EventState::consumed());
+        } else if k.code == KeyCode::Char('n') && !k.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(line) = self.search.next_match() {
+                self.scroll.set(line);
+            }
+            return Ok(EventState::consumed());
+        } else if k.code == KeyCode::Char('N') && !k.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(line) = self.search.prev_match() {
+                self.scroll.set(line);
+            }
+            return Ok(EventState::consumed());
+        } else if key_match(k, KeyAction::Quit) {
             self.ctx.queue.push(InternalEvent::ClosePopup);
             return Ok(EventState::consumed());
         } else if k.code == KeyCode::Char('?') {
@@ -104,15 +153,35 @@ impl DrawableComponent for BlamePopup {
         }
 
         // Virtualized rendering: only build the visible window of lines.
+        // While a search is active the bottom row is a `/pattern` footer.
+        let (inner, footer) = if self.search.is_active() && inner.height > 1 {
+            (
+                Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
+                Some(Rect::new(
+                    inner.x,
+                    inner.y + inner.height - 1,
+                    inner.width,
+                    1,
+                )),
+            )
+        } else {
+            (inner, None)
+        };
         let total = self.lines.len();
         let scroll = ui::clamp_scroll(self.scroll.get(), total, inner.height as usize);
         self.scroll.set(scroll);
         let end = (scroll + inner.height as usize).min(total);
         let mut lines: Vec<Line> = Vec::with_capacity(end - scroll);
-        for bl in &self.lines[scroll..end] {
-            lines.push(blame_line(bl, theme));
+        for i in scroll..end {
+            let (ranges, current) = self.search.line_ranges(i);
+            lines.push(blame_line(&self.lines[i], theme, &ranges, current));
         }
         ui::render_lines(f, inner, &lines, 0, &[]);
+        if let Some(footer) = footer {
+            let line = Line::from(Span::styled(self.search.status_text(), theme.info));
+            f.buffer_mut()
+                .set_line(footer.x, footer.y, &line, footer.width);
+        }
         Ok(())
     }
 
@@ -121,7 +190,12 @@ impl DrawableComponent for BlamePopup {
     }
 }
 
-fn blame_line(bl: &BlameLine, theme: &Theme) -> Line<'static> {
+fn blame_line(
+    bl: &BlameLine,
+    theme: &Theme,
+    matches: &[(usize, usize)],
+    current: Option<usize>,
+) -> Line<'static> {
     let mut spans = Vec::new();
     match bl.revision {
         Some(rev) => {
@@ -135,7 +209,15 @@ fn blame_line(bl: &BlameLine, theme: &Theme) -> Line<'static> {
     spans.push(Span::raw(" "));
     spans.push(Span::styled(bl.author.clone(), theme.blame_author));
     spans.push(Span::raw("  "));
-    spans.push(Span::raw(bl.content.clone()));
+    // search hits inside the content get the hit styles
+    spans.extend(highlight_spans(
+        &bl.content,
+        Style::default(),
+        matches,
+        current,
+        theme.search_hit,
+        theme.search_hit_current,
+    ));
     Line::from(spans)
 }
 
@@ -188,6 +270,86 @@ mod tests {
         // q closes
         b.event(&ts::key(crossterm::event::KeyCode::Char('q')))
             .unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+    }
+
+    fn blame_with_lines() -> (BlamePopup, crate::queue::Queue) {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut b = BlamePopup::new(&ctx, "src/main.rs");
+        b.update(
+            (1..=20)
+                .map(|i| {
+                    let content = if i == 8 || i == 15 {
+                        format!("needle line {i}")
+                    } else {
+                        format!("plain line {i}")
+                    };
+                    line(Some(i), "alice", &content)
+                })
+                .collect(),
+        );
+        (b, q)
+    }
+
+    #[test]
+    fn search_highlights_scrolls_and_cycles() {
+        let (mut b, q) = blame_with_lines();
+        b.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        assert!(b.search.is_input_mode());
+        for c in "needle".chars() {
+            b.event(&ts::key(KeyCode::Char(c))).unwrap();
+        }
+        // live: both matches found, scrolled to the first (line index 7)
+        assert_eq!(b.search.match_count(), 2);
+        assert_eq!(b.scroll.get(), 7);
+        let t = ts::render(60, 8, |f| {
+            b.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
+        });
+        let s = ts::dump(&t);
+        assert!(s.contains("/needle  [1/2]"), "{s}");
+        assert!(s.contains("needle line 8"), "{s}");
+        // Enter keeps highlights; n/N cycle with wrapping
+        b.event(&ts::key(KeyCode::Enter)).unwrap();
+        assert!(!b.search.is_input_mode());
+        assert!(b.search.is_active());
+        b.event(&ts::key(KeyCode::Char('n'))).unwrap();
+        assert_eq!(b.scroll.get(), 14);
+        assert_eq!(b.search.status_text(), "/needle  [2/2]");
+        b.event(&ts::key(KeyCode::Char('n'))).unwrap();
+        assert_eq!(b.scroll.get(), 7); // wrapped
+        b.event(&ts::key(KeyCode::Char('N'))).unwrap();
+        assert_eq!(b.scroll.get(), 14);
+        // scroll keys still work with highlights active
+        b.event(&ts::key(KeyCode::Char('g'))).unwrap();
+        assert_eq!(b.scroll.get(), 0);
+        // first Esc clears highlights, second closes
+        b.event(&ts::key(KeyCode::Esc)).unwrap();
+        assert!(!b.search.is_active());
+        assert!(q.pop().is_none());
+        b.event(&ts::key(KeyCode::Esc)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+    }
+
+    #[test]
+    fn esc_in_input_cancels_and_q_types_into_pattern() {
+        let (mut b, q) = blame_with_lines();
+        b.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        // 'q' is pattern text while typing, not "close"
+        b.event(&ts::key(KeyCode::Char('q'))).unwrap();
+        assert_eq!(b.search.pattern(), "q");
+        assert!(q.pop().is_none());
+        // backspace edits the pattern
+        b.event(&ts::key(KeyCode::Backspace)).unwrap();
+        assert_eq!(b.search.pattern(), "");
+        b.event(&ts::key(KeyCode::Esc)).unwrap();
+        assert!(!b.search.is_active());
+        assert!(q.pop().is_none());
+        // q outside input mode still closes
+        b.event(&ts::key(KeyCode::Char('q'))).unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
     }
 

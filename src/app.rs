@@ -1,13 +1,17 @@
 //! The application state: tabs, popup stack, async operation dispatch.
 //! Modeled on gitui's `App` + `Gitui`.
 
-use crate::components::{Context, DrawableComponent, log::LogComponent};
+use crate::components::{
+    Context, DrawableComponent, diff_view,
+    log::LogComponent,
+    patches::{self, PatchesComponent},
+};
 use crate::keys::{KeyAction, key_match};
-use crate::popups::Popup;
+use crate::popups::{DiffPopup, Popup};
 use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Queue, Tab};
 use crate::status::StatusTab;
 use crate::strings::MSG;
-use crate::svn::models::{BlameLine, SvnInfo};
+use crate::svn::models::{BlameLine, LogEntry, SvnInfo};
 use crate::svn::{AsyncSvnNotification, Svn};
 use crate::ui;
 use crossterm::event::Event;
@@ -16,6 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// A diff request that will turn into a fullscreen popup when loaded.
 #[derive(Clone, Debug)]
@@ -26,12 +31,25 @@ enum PendingFullscreen {
     Range(u64, u64),
 }
 
+/// Display name of a patch file path.
+fn patch_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Cap for the patch preview: the file is read and parsed synchronously
+/// on the UI thread, so a pathological patch (hundreds of MB) would
+/// freeze the app. 8 MB is far beyond any reasonable hand-written patch.
+const MAX_PATCH_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+
 pub struct App {
     pub svn: Svn,
     pub queue: Queue,
     pub ctx: Context,
     pub status: StatusTab,
     pub log: LogComponent,
+    pub patches: PatchesComponent,
     pub active_tab: Tab,
     pub popups: Vec<Popup>,
     /// Working copy info (URL / branch / revision), loaded at startup
@@ -50,11 +68,13 @@ impl App {
     pub fn new(cwd: PathBuf, svn: Svn, ctx: Context) -> Self {
         let status = StatusTab::new(&ctx);
         let log = LogComponent::new(&ctx);
+        let patches = PatchesComponent::new(&ctx);
         Self {
             svn,
             queue: ctx.queue.clone(),
             status,
             log,
+            patches,
             ctx,
             active_tab: Tab::Status,
             popups: Vec::new(),
@@ -98,9 +118,26 @@ impl App {
         self.push_popup(Popup::output(&ctx, title, content));
     }
 
-    fn show_diff_popup(&mut self, title: String, content: &str) {
+    fn show_diff_popup(&mut self, title: String, content: &str, header: Vec<String>) {
         let ctx = self.ctx.clone();
-        self.push_popup(Popup::diff(&ctx, title, content));
+        let mut popup = DiffPopup::new(&ctx, title, content);
+        popup.view.set_header(header);
+        self.push_popup(Popup::Diff(popup));
+    }
+
+    /// Full commit info of a log entry: revision, author, date, the
+    /// complete message and the changed paths (scrollable popup).
+    fn show_commit_info(&mut self, entry: &LogEntry) {
+        let mut out = format!("r{} | {} | {}\n", entry.revision, entry.author, entry.date);
+        if !entry.changed.is_empty() {
+            out.push_str("\nChanged paths:\n");
+            for (action, path) in &entry.changed {
+                out.push_str(&format!("  {action}  {path}\n"));
+            }
+        }
+        out.push_str("\nMessage:\n");
+        out.push_str(entry.message.trim_end());
+        self.show_output(format!("Commit r{}", entry.revision), &out);
     }
 
     // ----- startup -----
@@ -134,6 +171,7 @@ impl App {
         let consumed = match self.active_tab {
             Tab::Status => self.status.event(ev)?.consumed || self.status.handle_global_key(ev),
             Tab::Log => self.log.event(ev)?.consumed,
+            Tab::Patches => self.patches.event(ev)?.consumed,
         };
         if consumed {
             return Ok(());
@@ -153,24 +191,42 @@ impl App {
             self.push_popup(Popup::file_finder(&ctx));
             self.svn.list_files();
             self.pending += 1;
+        } else if key_match(k, KeyAction::SavePatch) {
+            self.svn.create_patch();
+            self.pending += 1;
         } else if key_match(k, KeyAction::FocusNext) {
-            if self.active_tab == Tab::Status {
-                self.status.cycle_focus(true);
-            } else {
-                self.active_tab = Tab::Status;
+            match self.active_tab {
+                // unreachable: the status tab consumes Tab/Shift+Tab for
+                // its pane focus cycle in `handle_global_key` before the
+                // app-level keys run
+                Tab::Status => {}
+                Tab::Log => self.activate_tab(Tab::Patches),
+                Tab::Patches => self.activate_tab(Tab::Status),
             }
         } else if key_match(k, KeyAction::FocusPrev) {
-            if self.active_tab == Tab::Status {
-                self.status.cycle_focus(false);
-            } else {
-                self.active_tab = Tab::Status;
+            match self.active_tab {
+                // unreachable: see FocusNext above
+                Tab::Status => {}
+                Tab::Log => self.activate_tab(Tab::Status),
+                Tab::Patches => self.activate_tab(Tab::Log),
             }
         } else if key_match(k, KeyAction::SwitchTabStatus) {
-            self.active_tab = Tab::Status;
+            self.activate_tab(Tab::Status);
         } else if key_match(k, KeyAction::SwitchTabLog) {
-            self.active_tab = Tab::Log;
+            self.activate_tab(Tab::Log);
+        } else if key_match(k, KeyAction::SwitchTabPatches) {
+            self.activate_tab(Tab::Patches);
         }
         Ok(())
+    }
+
+    /// Switch the active tab; entering the patches tab reloads the list
+    /// (a cheap local dir read) so it never shows stale entries.
+    fn activate_tab(&mut self, tab: Tab) {
+        self.active_tab = tab;
+        if tab == Tab::Patches {
+            self.patches.refresh();
+        }
     }
 
     /// Called after every input event and after status updates.
@@ -225,6 +281,10 @@ impl App {
                 self.push_popup(Popup::log_search(&ctx, &current));
             }
             InternalEvent::LogSearchInput(text) => {
+                // while server-side search results are shown the live
+                // filter is ignored; drop search mode so typing in the
+                // popup filters what is on screen again
+                self.log.clear_search();
                 self.log.set_filter(text);
             }
             InternalEvent::SearchLog(pattern) => {
@@ -238,6 +298,9 @@ impl App {
                     self.svn.log_more(oldest, 50);
                     self.pending += 1;
                 }
+            }
+            InternalEvent::ShowCommitInfo(entry) => {
+                self.show_commit_info(&entry);
             }
             InternalEvent::Confirm(action) => {
                 let message = match &action {
@@ -272,6 +335,12 @@ impl App {
                         MSG.update_to_rev_confirm,
                         self.working_copy_label()
                     ),
+                    ConfirmAction::ApplyPatch(path) => {
+                        format!("{}\n{}", MSG.apply_patch_confirm, patch_name(path))
+                    }
+                    ConfirmAction::DeletePatch(path) => {
+                        format!("{}\n{}", MSG.delete_patch_confirm, patch_name(path))
+                    }
                 };
                 self.show_confirm(message, action);
             }
@@ -279,7 +348,7 @@ impl App {
                 self.perform_confirmed(action);
             }
             InternalEvent::SwitchTab(tab) => {
-                self.active_tab = tab;
+                self.activate_tab(tab);
             }
             InternalEvent::RefreshStatus => {
                 self.svn.status();
@@ -301,17 +370,17 @@ impl App {
                     self.pending += 1;
                 }
             }
-            InternalEvent::RequestBlame => {
-                if let Some(e) = self.status.tree.selection_entry() {
-                    if !e.is_dir && e.status == '?' {
-                        self.show_error("svn blame: file is not under version control".to_string());
-                    } else if !e.is_dir {
-                        let path = e.path.clone();
-                        let ctx = self.ctx.clone();
-                        self.push_popup(Popup::blame(&ctx, &path));
-                        self.svn.blame(&path);
-                        self.pending += 1;
-                    }
+            InternalEvent::RequestBlame(path) => {
+                // Reject only paths known to be unversioned (status '?');
+                // files from the finder / file log have no status entry at
+                // all and are versioned by construction, so blame proceeds.
+                if self.status.tree.status_char(&path) == '?' {
+                    self.show_error("svn blame: file is not under version control".to_string());
+                } else {
+                    let ctx = self.ctx.clone();
+                    self.push_popup(Popup::blame(&ctx, &path));
+                    self.svn.blame(&path);
+                    self.pending += 1;
                 }
             }
             InternalEvent::RequestRevisionDiff(rev) => {
@@ -344,6 +413,35 @@ impl App {
                 self.push_popup(Popup::file_finder(&ctx));
                 self.svn.list_files();
                 self.pending += 1;
+            }
+            InternalEvent::PreviewPatch(path) => {
+                // a patch file IS a unified diff: reuse the diff popup
+                // (syntax highlighting + search) with the name as header
+                match std::fs::metadata(&path) {
+                    Ok(meta) if meta.len() > MAX_PATCH_PREVIEW_BYTES => {
+                        self.show_error(format!(
+                            "{} is too large to preview ({})",
+                            patch_name(&path),
+                            patches::human_size(meta.len())
+                        ));
+                    }
+                    _ => match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            let name = patch_name(&path);
+                            let header = vec![format!(
+                                "{} ({})",
+                                name,
+                                patches::human_size(content.len() as u64)
+                            )];
+                            self.show_diff_popup(format!("Patch: {name}"), &content, header);
+                        }
+                        Err(e) => {
+                            self.show_error(format!("cannot read {}: {e}", path.display()));
+                            // the file may be gone; drop it from the list
+                            self.patches.refresh();
+                        }
+                    },
+                }
             }
         }
     }
@@ -434,6 +532,42 @@ impl App {
                 self.svn.update_to_revision(rev);
                 self.pending += 1;
             }
+            ConfirmAction::ApplyPatch(path) => {
+                self.svn.apply_patch(&path);
+                self.pending += 1;
+            }
+            ConfirmAction::DeletePatch(path) => {
+                let name = patch_name(&path);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => self.show_info(format!("{}: {name}", MSG.patch_deleted)),
+                    Err(e) => self.show_error(format!("cannot delete {name}: {e}")),
+                }
+                self.patches.refresh();
+            }
+        }
+    }
+
+    /// Save a whole-working-copy diff as a timestamped patch file. This is
+    /// a snapshot: the working copy is left untouched. An empty diff (clean
+    /// working copy) only shows an info message — no file is written.
+    fn save_patch(&mut self, diff: &str) {
+        if diff.trim().is_empty() {
+            self.show_info(MSG.patch_nothing_to_save.to_string());
+            return;
+        }
+        let dir = self.patches.dir().to_path_buf();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.show_error(format!("cannot create {}: {e}", dir.display()));
+            return;
+        }
+        let path = patches::fresh_patch_path(&dir, SystemTime::now());
+        let name = patch_name(&path);
+        match std::fs::write(&path, diff) {
+            Ok(()) => {
+                self.show_info(format!("{}: {name}", MSG.patch_saved));
+                self.patches.refresh();
+            }
+            Err(e) => self.show_error(format!("cannot write {}: {e}", path.display())),
         }
     }
 
@@ -469,7 +603,8 @@ impl App {
                         && *p == path
                     {
                         self.pending_fullscreen = None;
-                        self.show_diff_popup(path.clone(), &content);
+                        // file diffs have no associated commit: no header
+                        self.show_diff_popup(path.clone(), &content, Vec::new());
                     }
                 }
                 Err(e) => {
@@ -495,22 +630,42 @@ impl App {
                 }
                 Err(e) => self.show_error(format!("svn log: {e}")),
             },
-            AsyncSvnNotification::LogSearch(result) => match result {
-                Ok(entries) => self.log.update(entries),
-                Err(e) => {
-                    // the search did not happen; don't leave the list in
-                    // "unfiltered server results" mode
-                    self.log.clear_search();
-                    self.show_error(format!("svn log --search: {e}"));
+            AsyncSvnNotification::LogSearch { pattern, result } => {
+                // one thread per op: results can arrive out of order, and
+                // a full-history search is usually slower than a plain
+                // `log -l 50`. A result whose pattern no longer matches the
+                // active search (refresh/Esc or a newer search superseded
+                // it) must not overwrite the current list.
+                if self.log.search_pattern() != Some(pattern.as_str()) {
+                    return;
                 }
-            },
-            AsyncSvnNotification::LogAppend(result) => match result {
-                Ok(entries) => self.log.append(entries),
-                Err(e) => {
-                    self.log.append_failed();
-                    self.show_error(format!("svn log: {e}"));
+                match result {
+                    Ok(entries) => self.log.update(entries),
+                    Err(e) => {
+                        // the search did not happen; don't leave the list in
+                        // "unfiltered server results" mode
+                        self.log.clear_search();
+                        self.show_error(format!("svn log --search: {e}"));
+                    }
                 }
-            },
+            }
+            AsyncSvnNotification::LogAppend { before_rev, result } => {
+                // apply only if the list is still exactly where the request
+                // was issued from; a search/refresh in between makes this
+                // stale (appending old pages into search results corrupts
+                // the list — they pass `visible_indices` unfiltered)
+                let tail = self.log.entries.last().map(|e| e.revision);
+                if self.log.search_pattern().is_some() || tail != Some(before_rev) {
+                    return;
+                }
+                match result {
+                    Ok(entries) => self.log.append(entries),
+                    Err(e) => {
+                        self.log.append_failed();
+                        self.show_error(format!("svn log: {e}"));
+                    }
+                }
+            }
             AsyncSvnNotification::FileLog { path, result } => match result {
                 Ok(entries) => {
                     for popup in self.popups.iter_mut().rev() {
@@ -561,7 +716,8 @@ impl App {
                         && *t == to
                     {
                         self.pending_fullscreen = None;
-                        self.show_diff_popup(format!("Diff r{from}..r{to}"), &content);
+                        let header = diff_view::range_header(from, to, &self.log.entries);
+                        self.show_diff_popup(format!("Diff r{from}..r{to}"), &content, header);
                     }
                 }
                 Err(e) => {
@@ -578,7 +734,16 @@ impl App {
                         && *r == revision
                     {
                         self.pending_fullscreen = None;
-                        self.show_diff_popup(format!("Diff r{revision}"), &content);
+                        // attach the commit info when the revision is in
+                        // the loaded log (log-tab-triggered diff)
+                        let header = self
+                            .log
+                            .entries
+                            .iter()
+                            .find(|e| e.revision == revision)
+                            .map(diff_view::revision_header)
+                            .unwrap_or_default();
+                        self.show_diff_popup(format!("Diff r{revision}"), &content, header);
                     }
                 }
                 Err(e) => {
@@ -667,6 +832,20 @@ impl App {
                 }
                 Err(e) => self.show_error(format!("svn resolve: {e}")),
             },
+            AsyncSvnNotification::CreatePatch(result) => match result {
+                Ok(diff) => self.save_patch(&diff),
+                Err(e) => self.show_error(format!("svn diff: {e}")),
+            },
+            AsyncSvnNotification::ApplyPatch(result) => match result {
+                Ok(out) => {
+                    self.show_output("svn patch".to_string(), &out);
+                    self.refresh_after_op();
+                }
+                Err(e) => {
+                    self.show_error(format!("svn patch: {e}"));
+                    self.refresh_after_op();
+                }
+            },
         }
     }
 
@@ -705,6 +884,7 @@ impl App {
         match self.active_tab {
             Tab::Status => self.status.draw(f, main)?,
             Tab::Log => self.log.draw(f, main)?,
+            Tab::Patches => self.patches.draw(f, main)?,
         }
 
         // status bar
@@ -747,8 +927,15 @@ impl App {
                 theme.status_added,
             ));
         }
+        // each tab advertises only the keys that work in it; the suffix
+        // holds the truly global keys (help / quit / tab switching)
+        let hints = match self.active_tab {
+            Tab::Status => crate::status::HINTS,
+            Tab::Log => crate::components::log::HINTS,
+            Tab::Patches => patches::HINTS,
+        };
         spans.push(Span::styled(
-            "? help  c commit  u update  ^P find  F5 refresh  q quit  [1]status [2]log",
+            format!("{hints}  ? help  q quit  [1]status [2]log [3]patches"),
             theme.dim,
         ));
         let line = Line::from(spans);
@@ -928,7 +1115,8 @@ mod tests {
 
         // blame request → popup + async load
         app.popups.clear();
-        app.queue.push(InternalEvent::RequestBlame);
+        app.queue
+            .push(InternalEvent::RequestBlame("main.rs".into()));
         app.handle_queue_events();
         assert!(matches!(app.popups.last(), Some(Popup::Blame(_))));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Blame { .. }));
@@ -947,6 +1135,125 @@ mod tests {
             _ => false,
         });
         assert!(has_data);
+    }
+
+    #[test]
+    fn blame_for_file_without_status_entry() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // no status loaded at all: paths from the file finder / file log
+        // have no status entry and must still be blamed
+        app.queue
+            .push(InternalEvent::RequestBlame("Cargo.toml".into()));
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Blame(_))));
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::Blame { ref path, .. } if path == "Cargo.toml"
+        ));
+        // unversioned paths (status '?') are still rejected
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
+            '?',
+            "scratch.txt",
+        )])));
+        // the status update triggers a diff request for the selection
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
+        app.queue
+            .push(InternalEvent::RequestBlame("scratch.txt".into()));
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        // no blame command was dispatched
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn show_commit_info_opens_output_popup() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        let mut e = log_entry(5, "full message\nsecond line");
+        e.author = "bob".into();
+        app.queue.push(InternalEvent::ShowCommitInfo(e));
+        app.handle_queue_events();
+        let Some(Popup::Output(p)) = app.popups.last() else {
+            panic!("expected output popup");
+        };
+        assert_eq!(p.title, "Commit r5");
+        let text: String = p.lines.iter().map(|l| l.to_string()).collect();
+        assert!(text.contains("r5 | bob | 2026-01-01"), "{text}");
+        assert!(text.contains("Changed paths:"), "{text}");
+        assert!(text.contains("M  src/main.rs"), "{text}");
+        assert!(text.contains("full message"), "{text}");
+        assert!(text.contains("second line"), "{text}");
+        // Esc/q close the popup (OutputPopup behavior): simulate the queue
+        app.popups.clear();
+        let _ = rx;
+    }
+
+    #[test]
+    fn revision_diff_attaches_commit_header() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![log_entry(3, "three")])));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RevisionDiff { revision: 3, .. }
+        ));
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        let Some(Popup::Diff(d)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        assert_eq!(d.view.header(), &["r3 | alice | 2026-01-01", "three"]);
+
+        // a revision not in the loaded log → no header
+        app.popups.clear();
+        app.queue.push(InternalEvent::RequestRevisionDiff(99));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RevisionDiff { revision: 99, .. }
+        ));
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 99,
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        let Some(Popup::Diff(d2)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        assert!(d2.view.header().is_empty());
+    }
+
+    #[test]
+    fn range_diff_attaches_commit_header() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
+            log_entry(3, "three"),
+            log_entry(1, "one"),
+        ])));
+        app.queue.push(InternalEvent::RequestRangeDiff(vec![1, 3]));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RangeDiff { from: 1, to: 3, .. }
+        ));
+        app.handle_async(AsyncSvnNotification::RangeDiff {
+            from: 1,
+            to: 3,
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        let Some(Popup::Diff(d)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        let header = d.view.header();
+        assert_eq!(header[0], "r1..r3 (2 commits)");
+        // newest revision's message follows
+        assert_eq!(header[1], "three");
     }
 
     #[test]
@@ -1454,14 +1761,21 @@ mod tests {
         app.popups.clear();
         app.queue.push(InternalEvent::SearchLog("second".into()));
         app.handle_queue_events();
-        assert!(matches!(recv(&rx), AsyncSvnNotification::LogSearch(Ok(_))));
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::LogSearch { result: Ok(_), .. }
+        ));
 
         // results replace the list; errors open a message popup
-        app.handle_async(AsyncSvnNotification::LogSearch(Ok(vec![log_entry(
-            2, "second",
-        )])));
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "second".into(),
+            result: Ok(vec![log_entry(2, "second")]),
+        });
         assert_eq!(app.log.selection_revision(), Some(2));
-        app.handle_async(AsyncSvnNotification::LogSearch(Err("boom".into())));
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "second".into(),
+            result: Err("boom".into()),
+        });
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
     }
 
@@ -1477,19 +1791,123 @@ mod tests {
 
         app.queue.push(InternalEvent::LogLoadMore);
         app.handle_queue_events();
-        assert!(matches!(recv(&rx), AsyncSvnNotification::LogAppend(Ok(_))));
-        app.handle_async(AsyncSvnNotification::LogAppend(Ok(vec![log_entry(
-            1, "first",
-        )])));
-        assert_eq!(app.log.entries.len(), 3);
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::LogAppend { result: Ok(_), .. }
+        ));
 
-        // error path: popup + the component can retry
-        app.handle_async(AsyncSvnNotification::LogAppend(Err("boom".into())));
+        // error path (the tail is still r2, so the result is current):
+        // popup + the component can retry
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 2,
+            result: Err("boom".into()),
+        });
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        app.popups.clear();
+
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 2,
+            result: Ok(vec![log_entry(1, "first")]),
+        });
+        assert_eq!(app.log.entries.len(), 3);
 
         // oldest is r1 now: the event is a no-op (no svn call)
         app.queue.push(InternalEvent::LogLoadMore);
         app.handle_queue_events();
+    }
+
+    #[test]
+    fn out_of_order_log_results_are_dropped() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
+            log_entry(3, "third"),
+            log_entry(2, "second"),
+        ])));
+
+        // a search starts (full history, usually slower than the paged
+        // log); while it is in flight the tail is still r2
+        app.queue.push(InternalEvent::SearchLog("fix".into()));
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::LogSearch { .. }));
+        // the stale pagination page arrives after the search started and
+        // must be dropped, not appended into the search results
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 2,
+            result: Ok(vec![log_entry(1, "first")]),
+        });
+        assert_eq!(app.log.entries.len(), 2, "stale append must be dropped");
+        // a stale append error is dropped silently too (no error popup)
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 2,
+            result: Err("boom".into()),
+        });
+        assert!(app.popups.is_empty());
+
+        // a newer search replaces the first one; the old result is stale
+        app.queue.push(InternalEvent::SearchLog("other".into()));
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "fix".into(),
+            result: Ok(vec![log_entry(9, "stale")]),
+        });
+        assert_eq!(app.log.entries.len(), 2, "superseded search dropped");
+        // the current search applies
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "other".into(),
+            result: Ok(vec![log_entry(2, "second")]),
+        });
+        assert_eq!(app.log.entries.len(), 1);
+
+        // Esc/refresh cleared the search: a late search result must not
+        // overwrite the fresh list
+        app.log.clear_search();
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![log_entry(5, "five")])));
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "other".into(),
+            result: Ok(vec![log_entry(9, "stale")]),
+        });
+        assert_eq!(app.log.entries[0].revision, 5);
+        // stale search error: no popup, search state untouched
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "other".into(),
+            result: Err("boom".into()),
+        });
+        assert!(app.popups.is_empty());
+
+        // a current append error (tail r5 matches) still shows the error
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 5,
+            result: Err("boom".into()),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn typing_in_search_popup_clears_server_search() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
+            log_entry(3, "third"),
+            log_entry(2, "second"),
+        ])));
+        // run a full-history search and apply its results
+        app.queue.push(InternalEvent::SearchLog("second".into()));
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "second".into(),
+            result: Ok(vec![log_entry(2, "second")]),
+        });
+        assert!(app.log.search_pattern().is_some());
+        // typing in the popup switches back to live filtering, otherwise
+        // the input would be dead (visible_indices ignores the filter
+        // while search results are shown)
+        app.queue.push(InternalEvent::LogSearchInput("thi".into()));
+        app.handle_queue_events();
+        assert!(app.log.search_pattern().is_none());
+        assert_eq!(app.log.filter(), "thi");
     }
 
     #[test]
@@ -1631,6 +2049,290 @@ mod tests {
         assert!(s.contains("Recent commit messages"), "{s}");
         assert!(s.contains("third"), "{s}");
         assert!(s.contains("second"), "{s}");
+    }
+
+    fn patch_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("svnui-app-patches-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn patch_save_apply_delete_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        let dir = patch_test_dir("flow");
+        app.patches.set_dir(dir.clone());
+
+        // modify a file and press P (app-level key, status tab active)
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 42\n");
+        app.handle_input(&ts_key(KeyCode::Char('P'))).unwrap();
+        let diff = match recv(&rx) {
+            AsyncSvnNotification::CreatePatch(Ok(d)) => d,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(diff.contains("Index: Cargo.toml"), "{diff}");
+        app.handle_async(AsyncSvnNotification::CreatePatch(Ok(diff)));
+
+        // one timestamped patch file with the diff; the info popup names it
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("patch-"), "{name}");
+        assert!(name.ends_with(".patch"), "{name}");
+        let saved = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(saved.contains("+version = 42"), "{saved}");
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected info popup");
+        };
+        assert!(m.message.contains(&name), "{}", m.message);
+        assert!(!m.is_error);
+        app.popups.clear();
+
+        // saving is a snapshot: the working copy is NOT reverted
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join("Cargo.toml")).unwrap(),
+            "version = 42\n"
+        );
+
+        // revert the change, then apply the patch through the confirm flow
+        repo.svn(&["revert", "-R", "Cargo.toml"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join("Cargo.toml")).unwrap(),
+            "version = 1\n"
+        );
+        app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
+        assert_eq!(app.active_tab, Tab::Patches);
+        assert_eq!(app.patches.entries.len(), 1);
+        app.handle_input(&ts_key(KeyCode::Char('a'))).unwrap();
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p.message.contains(&name), "{}", p.message);
+        app.handle_input(&ts_key(KeyCode::Char('y'))).unwrap();
+        match recv(&rx) {
+            AsyncSvnNotification::ApplyPatch(Ok(out)) => {
+                assert!(out.contains("Cargo.toml"), "{out}");
+                app.handle_async(AsyncSvnNotification::ApplyPatch(Ok(out)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join("Cargo.toml")).unwrap(),
+            "version = 42\n"
+        );
+        // success shows the svn output and refreshes the status
+        assert!(matches!(app.popups.last(), Some(Popup::Output(_))));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        app.popups.clear();
+
+        // delete the patch, again behind confirmation
+        app.handle_input(&ts_key(KeyCode::Char('d'))).unwrap();
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
+        app.handle_input(&ts_key(KeyCode::Char('y'))).unwrap();
+        assert!(!files[0].path().exists());
+        assert!(app.patches.entries.is_empty());
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected info popup");
+        };
+        assert!(m.message.contains(&name), "{}", m.message);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_patch_with_clean_wc_writes_nothing() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        let dir = patch_test_dir("clean");
+        app.patches.set_dir(dir.clone());
+
+        app.handle_input(&ts_key(KeyCode::Char('P'))).unwrap();
+        let diff = match recv(&rx) {
+            AsyncSvnNotification::CreatePatch(Ok(d)) => d,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(diff.trim().is_empty(), "{diff}");
+        app.handle_async(AsyncSvnNotification::CreatePatch(Ok(diff)));
+        // info popup, and no patch file (the dir is not even created)
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected info popup");
+        };
+        assert!(m.message.contains("nothing to save"), "{}", m.message);
+        assert!(!m.is_error);
+        assert!(!dir.exists());
+
+        // error path: a failed `svn diff` shows an error popup
+        app.handle_async(AsyncSvnNotification::CreatePatch(Err("boom".into())));
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.is_error);
+
+        // a failed `svn patch` shows an error and still refreshes status
+        app.handle_async(AsyncSvnNotification::ApplyPatch(Err("boom".into())));
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.is_error);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+    }
+
+    #[test]
+    fn preview_patch_opens_diff_popup() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let dir = patch_test_dir("preview");
+        std::fs::create_dir_all(&dir).unwrap();
+        let patch_path = dir.join("a.patch");
+        std::fs::write(
+            &patch_path,
+            "Index: Cargo.toml\n===\n@@ -1 +1 @@\n-version = 1\n+version = 2\n",
+        )
+        .unwrap();
+        app.patches.set_dir(dir.clone());
+
+        app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
+        // Enter previews; the file name is the fixed header
+        app.handle_input(&ts_key(KeyCode::Enter)).unwrap();
+        app.handle_queue_events();
+        let Some(Popup::Diff(d)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        assert!(d.view.header()[0].contains("a.patch"));
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f).unwrap()).unwrap();
+        let s: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(s.contains("Patch: a.patch"), "{s}");
+        assert!(s.contains("version = 2"), "{s}");
+
+        // 'p' previews too
+        app.popups.clear();
+        app.handle_input(&ts_key(KeyCode::Char('p'))).unwrap();
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
+
+        // error path: the file vanished between listing and preview
+        app.popups.clear();
+        std::fs::remove_file(&patch_path).unwrap();
+        app.queue.push(InternalEvent::PreviewPatch(patch_path));
+        app.handle_queue_events();
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.is_error);
+        // the stale entry is dropped from the list
+        assert!(app.patches.entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_patch_rejects_huge_files() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let dir = patch_test_dir("huge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let patch_path = dir.join("big.patch");
+        std::fs::write(
+            &patch_path,
+            vec![b'x'; MAX_PATCH_PREVIEW_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        app.queue.push(InternalEvent::PreviewPatch(patch_path));
+        app.handle_queue_events();
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.is_error);
+        assert!(m.message.contains("too large to preview"), "{}", m.message);
+        assert!(m.message.contains("big.patch"), "{}", m.message);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patches_tab_switching_and_status_bar() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        // never touch the real per-user patch dir in tests
+        let dir = patch_test_dir("tabs");
+        std::fs::create_dir_all(&dir).unwrap();
+        app.patches.set_dir(dir.clone());
+
+        // '2' is queued by the tree; Tab cycles log → patches → status
+        app.handle_input(&ts_key(KeyCode::Char('2'))).unwrap();
+        app.handle_queue_events();
+        assert_eq!(app.active_tab, Tab::Log);
+        app.handle_input(&ts_key(KeyCode::Tab)).unwrap();
+        assert_eq!(app.active_tab, Tab::Patches);
+        app.handle_input(&ts_key(KeyCode::Tab)).unwrap();
+        assert_eq!(app.active_tab, Tab::Status);
+        // Shift+Tab from patches goes back to the log tab
+        app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
+        assert_eq!(app.active_tab, Tab::Patches);
+        let backtab = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        ));
+        app.handle_input(&backtab).unwrap();
+        assert_eq!(app.active_tab, Tab::Log);
+
+        // the patches tab draws (empty state) and the status bar lists it
+        app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
+        let render = |app: &mut App| {
+            let backend = TestBackend::new(160, 40);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| app.draw(f).unwrap()).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        let s = render(&mut app);
+        assert!(s.contains("No patches yet"), "{s}");
+        assert!(s.contains("[1]status [2]log [3]patches"), "{s}");
+
+        // the status bar advertises per-tab keys: patch actions only on the
+        // patches tab, status-tab actions (commit/update) stay off it
+        assert!(s.contains("a apply"), "{s}");
+        assert!(s.contains("d delete"), "{s}");
+        assert!(!s.contains("c commit"), "{s}");
+        assert!(!s.contains("u update"), "{s}");
+
+        app.handle_input(&ts_key(KeyCode::Char('2'))).unwrap();
+        app.handle_queue_events();
+        let s = render(&mut app);
+        assert!(s.contains("v info"), "{s}");
+        assert!(s.contains("o update-to"), "{s}");
+        assert!(!s.contains("c commit"), "{s}");
+        assert!(!s.contains("a apply"), "{s}");
+
+        app.handle_input(&ts_key(KeyCode::Char('1'))).unwrap();
+        app.handle_queue_events();
+        let s = render(&mut app);
+        assert!(s.contains("c commit"), "{s}");
+        assert!(s.contains("u update"), "{s}");
+        assert!(s.contains("P patch"), "{s}");
+        assert!(!s.contains("v info"), "{s}");
+        assert!(!s.contains("a apply"), "{s}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn ts_key(code: crossterm::event::KeyCode) -> crossterm::event::Event {

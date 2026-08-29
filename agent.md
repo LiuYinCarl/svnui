@@ -41,12 +41,16 @@ src/
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
 │   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
 │   ├── file_finder.rs  模糊文件搜索弹窗（数据源 svn list -R .@HEAD，fuzzy-matcher 匹配）
-│   ├── blame.rs      blame 弹窗
+│   ├── blame.rs      blame 弹窗（/ 增量搜索 + n/N 跳转）
+│   ├── patches.rs    补丁标签页（列出 patch 目录、预览/应用/删除补丁；patch_dir() 解析存储目录，
+│   │                 SVNUI_PATCH_DIR 可覆盖）
+│   ├── text_search.rs 可复用的增量搜索状态（diff/blame 弹窗共用）
 │   └── help.rs       帮助弹窗
 ├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff 弹窗（enum Popup 分发，无 downcast）
 ├── ui/               渲染辅助（滚动、行绘制、弹窗矩形）+ 主题
 └── test_support.rs   测试支撑：临时 SVN 仓库（TestRepo）+ TestBackend 渲染辅助
-.github/workflows/     ci.yml（fmt/clippy/test/coverage/build）+ release.yml（Tag 触发发布）
+.github/workflows/     ci.yml（fmt/clippy/test/coverage/build）+ bump.yml（push 自动 bump
+                       补丁版本并发版）+ release.yml（Tag 触发发布，也供 bump.yml 调用）
 ```
 
 ## 架构要点（与 gitui 的对应关系）
@@ -95,11 +99,14 @@ cargo fmt --all --check     # 格式门禁
   `draw` 是 `&self`——需要可变状态（滚动偏移等）用 `Cell`。
 - 文本输入用 `tui-textarea-2`，不要手写字符宽度计算。
 - 组件不应直接持有 `Svn`；通过 `Context.queue` push `InternalEvent`，由 App 执行命令。
-- 新增快捷键：在 `keys.rs` 加 `KeyAction` 变体 + `key_match` 分支，并更新 `all_bindings()`（帮助页）。
+- 新增快捷键：在 `keys.rs` 加 `KeyAction` 变体 + `key_match` 分支，并更新 `all_binding_groups()`（帮助页，按上下文分组）。
 - 新增用户可见文本：加到 `strings.rs`。
 - 弹窗加进 `popups/mod.rs` 的 `enum Popup`，不要在 App 里用 downcast。
 - 依赖策略：简单逻辑手写，不引入新 crate；只有复杂且易错的逻辑才引入流行的纯 Rust
   库——需无 unsafe、无 build script、维护活跃。
+- 测试也不要碰进程环境变量（edition 2024 下 `env::set_var` 是 unsafe fn，本仓库禁用
+  unsafe）：像 `patch_dir` 这类依赖环境的逻辑要拆出纯函数（如 `resolve_patch_dir`），
+  测试直接给纯函数传参。
 
 ## SVN 输出格式要点（解析器已处理，改代码前先读）
 
@@ -113,8 +120,9 @@ cargo fmt --all --check     # 格式门禁
   （最新 N 条），而不是返回的匹配数——带上它搜索就退化成"只搜最近 N 条"。
   `--search` 是 glob 语法、大小写不敏感，匹配作者/日期/提交信息/变更路径。
 - `svn diff` 对未版本化文件返回 E155010 错误而不是空输出——`Svn::diff` 回退为直接读文件内容。
-- `svn blame` 格式：`%6s %10s %s`（修订号右对齐 6、作者右对齐 10、内容从第 18 列开始，
-  前导缩进要保留）。
+- `svn blame` 格式：`%6s %10s %s`（修订号右对齐至少 6 列、作者右对齐至少 10 列——这是
+  最小宽度，CJK 作者或 7 位修订号会把内容列挤右，所以解析器按空白分隔的 token 解析，
+  不按固定列偏移；前导缩进要保留）。
 - `svn info` 的 `Revision` 是工作副本根目录的 BASE 修订（SVN 是混合修订工作副本）；
   分支名取 `Relative URL`（去掉 `^/`）。
 - `svn list -R` 必须带 `.@HEAD` peg，否则按 wc 根目录的 BASE 修订列举。
@@ -131,9 +139,44 @@ cargo fmt --all --check     # 格式门禁
   `handle_async` / `handle_queue_events`，覆盖 Ok/Err 全部分支。
 - **事件循环**：`run()` 已泛型化，可用 `TestBackend` 驱动到退出。
 
+## 压力测试（stress harness）
+
+`scripts/stress_test.sh` + `tests/stress.rs`：用 git2svn 把真实 git 仓库（默认
+`~/dev/github/openless` 当前分支）转成 `target/tmp/stress/svn-repo`（约 1-2 分钟，
+先 wipe 再重建），检出 `target/tmp/stress/wc`，然后以无头方式驱动真实的 `App`：
+合成 crossterm 按键走与 main.rs 完全相同的泵（input → handle_queue_events →
+maybe_request_diff；异步通知 → handle_async → …），确定性 PRNG（xorshift64*，
+无 rand 依赖）随机执行滚动/提交信息/修订 diff + 页内搜索/文件查找 + blame + 搜索/
+日志全历史搜索/改文件 + 提交或还原/存删补丁/F5 刷新（偶发 svn update）。每轮断言：
+无 panic、`pending` 在超时内归零、无意外错误弹窗、无残留弹窗；失败信息带 seed 可复现。
+
+```bash
+scripts/stress_test.sh                    # 完整跑（默认 200 轮）
+SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
+```
+
+环境变量：`STRESS_GIT_REPO` / `STRESS_GIT_BRANCH`（转换哪个 git 仓库/分支）、
+`SVNUI_STRESS_ROUNDS`、`SVNUI_STRESS_SEED`、`GIT2SVN_DIR`。
+**CI 不会运行它**：`tests/stress.rs` 仅在 `SVNUI_STRESS=1` 且 `SVNUI_STRESS_WC`
+指向合法工作副本时才真正执行，否则直接跳过（pass）。
+
+注意事项：
+- 曾发现 go-git 并发读 packfile 竞争导致转换偶发 "object not found"，
+  已在 git2svn 侧修复（f7011b6，每个 worker 独立的 Repository 句柄）；
+  若用旧版 git2svn，可加 `GOMAXPROCS=1` 规避。
+- 想要"恰好约 1000 提交"的仓库，可从本地大仓库截断历史（示例：
+  `git clone --no-local file://<repo> dst && cd dst && b=$(git rev-list
+  --first-parent HEAD | sed -n 1000p) && git replace --graft $b &&
+  git filter-branch -f -- --all && git replace -d $b && rm -rf refs/original`），
+  浅克隆（--depth）go-git 无法读取，不要用。
+
 ## CI/CD
 
 - **ci.yml**：fmt → clippy(-D warnings) → test(Linux/macOS) → coverage(≥80%) → 三平台 release 构建。
   修改任何代码都必须让这些 job 全绿。
-- **release.yml**：推送 `v*` 标签触发；先校验标签与 Cargo.toml 版本一致，
+- **bump.yml**：每次 push 到 master/main 自动 bump 补丁版本：改 `Cargo.toml` version +1、
+  提交（`[skip ci]` 防自触发）、打 `vX.Y.Z` 标签推送，然后调用 release.yml 发布。
+  同分支多次 push 按 concurrency 串行排队，任务开始时 checkout 分支最新 tip 并
+  `git reset --hard origin/<branch>`，避免排队任务算出过期版本号。
+- **release.yml**：推送 `v*` 标签触发（也供 bump.yml 复用）；先校验标签与 Cargo.toml 版本一致，
   再构建 Linux/macOS/Windows 二进制并创建 Release。发版流程见 README「发布新版本」。

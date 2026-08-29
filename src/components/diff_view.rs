@@ -2,17 +2,67 @@
 //! the fullscreen diff popup.
 
 use super::EventState;
+use super::text_search::{InputOutcome, TextSearch, highlight_spans};
 use crate::keys::{KeyAction, key_match};
-use crate::svn::models::{DiffLine, DiffLineKind, ParsedDiff};
+use crate::svn::models::{DiffLine, DiffLineKind, LogEntry, ParsedDiff};
 use crate::svn::parser::{parse_diff, parse_new_file_content};
 use crate::ui::{self, style::Theme};
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use std::cell::Cell;
+
+/// Max lines the fixed commit-info header above a diff may occupy, so
+/// huge (merge) commit messages cannot eat the whole screen.
+pub const DIFF_HEADER_MAX: usize = 5;
+
+/// Header lines for a single-revision diff: `r<N> | author | date` plus
+/// message lines, capped at `DIFF_HEADER_MAX`. When the message is
+/// longer, the last shown line ends with `…`.
+pub fn revision_header(e: &LogEntry) -> Vec<String> {
+    let mut out = vec![format!("r{} | {} | {}", e.revision, e.author, e.date)];
+    push_capped(&mut out, &e.message);
+    out
+}
+
+/// Header lines for a combined range diff: `r<from>..r<to> (n commits)`
+/// plus the message of the newest revision in the range (when it fits).
+/// `entries` are the loaded log entries (newest first); when none of
+/// them fall into the range the count is omitted.
+pub fn range_header(from: u64, to: u64, entries: &[LogEntry]) -> Vec<String> {
+    let in_range: Vec<&LogEntry> = entries
+        .iter()
+        .filter(|e| (from..=to).contains(&e.revision))
+        .collect();
+    let mut out = if in_range.is_empty() {
+        vec![format!("r{from}..r{to}")]
+    } else {
+        vec![format!("r{from}..r{to} ({} commits)", in_range.len())]
+    };
+    if let Some(newest) = in_range.first() {
+        push_capped(&mut out, &newest.message);
+    }
+    out
+}
+
+/// Append message lines to `out` without exceeding `DIFF_HEADER_MAX`
+/// total lines; the last line gets a `…` marker when truncated.
+fn push_capped(out: &mut Vec<String>, message: &str) {
+    let room = DIFF_HEADER_MAX.saturating_sub(out.len());
+    let lines: Vec<&str> = message.lines().collect();
+    let shown = lines.len().min(room);
+    for line in &lines[..shown] {
+        out.push((*line).to_string());
+    }
+    if lines.len() > shown
+        && let Some(last) = out.last_mut()
+    {
+        last.push_str(" …");
+    }
+}
 
 /// A scrollable view of a parsed diff.
 pub struct DiffView {
@@ -23,6 +73,14 @@ pub struct DiffView {
     /// Set when there is nothing to show
     pub empty_reason: Option<String>,
     pub focused: bool,
+    /// Fixed commit-info lines above the diff (revision/range diffs);
+    /// never scrolled, capped at `DIFF_HEADER_MAX`
+    header: Vec<String>,
+    /// Incremental-search state (`/`); only consulted when
+    /// `search_enabled` is set (fullscreen popup) — the status-tab diff
+    /// pane leaves search off.
+    pub search: TextSearch,
+    pub search_enabled: bool,
 }
 
 impl DiffView {
@@ -34,7 +92,20 @@ impl DiffView {
             pending: true,
             empty_reason: None,
             focused: true,
+            header: Vec::new(),
+            search: TextSearch::new(),
+            search_enabled: false,
         }
+    }
+
+    /// Set the fixed commit-info header (capped at `DIFF_HEADER_MAX`).
+    pub fn set_header(&mut self, header: Vec<String>) {
+        self.header = header.into_iter().take(DIFF_HEADER_MAX).collect();
+    }
+
+    /// The fixed commit-info header lines, if any.
+    pub fn header(&self) -> &[String] {
+        &self.header
     }
 
     pub fn set_loading(&mut self, title: String) {
@@ -49,6 +120,7 @@ impl DiffView {
         self.pending = false;
         self.empty_reason = Some(reason);
         self.parsed = ParsedDiff::default();
+        self.search.clear();
     }
 
     /// Set raw diff text (or raw file content for unversioned files).
@@ -56,12 +128,15 @@ impl DiffView {
         self.title = title;
         self.pending = false;
         self.scroll.set(0);
+        self.search.clear();
         let trimmed = content.trim();
         if trimmed.is_empty() {
             self.empty_reason = Some("No textual diff".to_string());
             self.parsed = ParsedDiff::default();
         } else if trimmed.starts_with("Index:")
-            || trimmed.contains("@@")
+            // a hunk header only counts at line start: raw text containing
+            // "@@" mid-line is not a diff
+            || content.lines().any(|l| l.starts_with("@@ "))
             || trimmed.starts_with("Property changes on:")
         {
             self.parsed = parse_diff(content);
@@ -101,18 +176,83 @@ impl DiffView {
         EventState::consumed()
     }
 
+    /// Handle search-related input (`/`, live typing, `n`/`N`).
+    ///
+    /// Only active when `search_enabled` (fullscreen popup); returns
+    /// `Some(consumed)` when the event was search business, `None` so the
+    /// caller can fall back to scrolling/closing. Esc is *not* handled
+    /// here — it interacts with closing the popup, which the view cannot
+    /// do (see `DiffPopup::event`).
+    pub fn search_event(&mut self, ev: &Event) -> Option<EventState> {
+        if !self.search_enabled {
+            return None;
+        }
+        if self.search.is_input_mode() {
+            if self.search.input_event(ev) == InputOutcome::Changed {
+                self.refresh_search();
+            }
+            return Some(EventState::consumed());
+        }
+        let Event::Key(k) = ev else {
+            return None;
+        };
+        if key_match(k, KeyAction::Filter) {
+            self.search.start_input();
+            return Some(EventState::consumed());
+        }
+        let plain =
+            |c: char| k.code == KeyCode::Char(c) && !k.modifiers.contains(KeyModifiers::CONTROL);
+        let jump = if plain('n') {
+            self.search.next_match()
+        } else if plain('N') {
+            self.search.prev_match()
+        } else {
+            None
+        };
+        if let Some(line) = jump {
+            self.scroll.set(line);
+            return Some(EventState::consumed());
+        }
+        None
+    }
+
+    /// Recompute search matches against the current diff content and
+    /// scroll to the (new) current match.
+    fn refresh_search(&mut self) {
+        let lines: Vec<&str> = self
+            .parsed
+            .lines
+            .iter()
+            .map(|l| l.content.as_str())
+            .collect();
+        self.search.recompute(&lines, self.scroll.get());
+        if let Some(line) = self.search.current_match_line() {
+            self.scroll.set(line);
+        }
+    }
+
     /// Build the styled lines for this diff.
     pub fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
         let mut out = Vec::with_capacity(self.parsed.lines.len());
         for dl in &self.parsed.lines {
-            out.push(diff_line(dl, theme));
+            out.push(diff_line(dl, theme, &[], None));
         }
         out
     }
 }
 
 /// Build a single styled diff line with line numbers.
-pub fn diff_line(dl: &DiffLine, theme: &Theme) -> Line<'static> {
+///
+/// `matches`/`current` highlight incremental-search hits inside the
+/// content: `matches` are the byte ranges on this line (from
+/// `TextSearch::line_ranges`) and `current` the index of the current
+/// match within them (distinct style).
+pub fn diff_line(
+    dl: &DiffLine,
+    theme: &Theme,
+    matches: &[(usize, usize)],
+    current: Option<usize>,
+) -> Line<'static> {
     let (kind_style, need_numbers) = match dl.kind {
         DiffLineKind::Header => (theme.diff_header, false),
         DiffLineKind::FileHeader => (theme.diff_file_header, false),
@@ -123,8 +263,16 @@ pub fn diff_line(dl: &DiffLine, theme: &Theme) -> Line<'static> {
         DiffLineKind::Removed => (theme.diff_removed, true),
     };
 
+    let content = highlight_spans(
+        &dl.content,
+        kind_style,
+        matches,
+        current,
+        theme.search_hit,
+        theme.search_hit_current,
+    );
     if !need_numbers {
-        return Line::from(Span::styled(dl.content.clone(), kind_style));
+        return Line::from(content);
     }
 
     let num = |n: Option<u64>| -> String {
@@ -133,13 +281,13 @@ pub fn diff_line(dl: &DiffLine, theme: &Theme) -> Line<'static> {
             None => "   ".to_string(),
         }
     };
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(num(dl.old), theme.diff_line_number),
         Span::raw(" "),
         Span::styled(num(dl.new), theme.diff_line_number),
         Span::styled("│ ", theme.diff_line_number),
-        Span::styled(dl.content.clone(), kind_style),
     ];
+    spans.extend(content);
     Line::from(spans)
 }
 
@@ -177,17 +325,63 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
         return;
     }
 
+    // Fixed commit-info header (revision/range diffs): drawn above the
+    // scrollable area, dimmed and separated by a rule, never scrolled.
+    let inner = if view.header.is_empty() {
+        inner
+    } else {
+        // +1 for the separator rule
+        let header_h = (view.header.len() as u16 + 1).min(inner.height);
+        let header_area = Rect::new(inner.x, inner.y, inner.width, header_h);
+        let mut header_lines: Vec<Line> = view
+            .header
+            .iter()
+            .map(|l| Line::from(Span::styled(l.clone(), theme.dim)))
+            .collect();
+        header_lines.push(Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme.dim,
+        )));
+        ui::render_lines(f, header_area, &header_lines, 0, &[]);
+        Rect::new(
+            inner.x,
+            inner.y + header_h,
+            inner.width,
+            inner.height - header_h,
+        )
+    };
+
     // Virtualized rendering: only the visible window of lines is built, so
     // drawing a huge diff costs O(screen height), not O(diff size).
+    // While a search is active the bottom row is a `/pattern [x/y]` footer.
+    let (inner, footer) = if view.search.is_active() && inner.height > 1 {
+        (
+            Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
+            Some(Rect::new(
+                inner.x,
+                inner.y + inner.height - 1,
+                inner.width,
+                1,
+            )),
+        )
+    } else {
+        (inner, None)
+    };
     let total = view.parsed.lines.len();
     let scroll = ui::clamp_scroll(view.scroll.get(), total, inner.height as usize);
     view.scroll.set(scroll);
     let end = (scroll + inner.height as usize).min(total);
     let mut lines = Vec::with_capacity(end - scroll);
     for i in scroll..end {
-        lines.push(diff_line(&view.parsed.lines[i], theme));
+        let (ranges, current) = view.search.line_ranges(i);
+        lines.push(diff_line(&view.parsed.lines[i], theme, &ranges, current));
     }
     ui::render_lines(f, inner, &lines, 0, &[]);
+    if let Some(footer) = footer {
+        let line = Line::from(Span::styled(view.search.status_text(), theme.info));
+        f.buffer_mut()
+            .set_line(footer.x, footer.y, &line, footer.width);
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +400,93 @@ Index: Cargo.toml
 +extra
 \\ No newline at end of file
 ";
+
+    #[test]
+    fn header_builders_cap_at_five_lines() {
+        let e = LogEntry {
+            revision: 7,
+            author: "alice".into(),
+            date: "2026-01-01".into(),
+            line_count: 9,
+            changed: vec![],
+            message: "line1\nline2\nline3\nline4\nline5\nline6\nline7".into(),
+        };
+        let h = revision_header(&e);
+        assert_eq!(h.len(), DIFF_HEADER_MAX);
+        assert_eq!(h[0], "r7 | alice | 2026-01-01");
+        assert_eq!(h[1], "line1");
+        // truncated: the last shown message line gets the ellipsis
+        assert_eq!(h[4], "line4 …");
+
+        // a short message is not truncated
+        let short = LogEntry {
+            message: "only line".into(),
+            line_count: 1,
+            ..e
+        };
+        let h2 = revision_header(&short);
+        assert_eq!(h2, vec!["r7 | alice | 2026-01-01", "only line"]);
+    }
+
+    #[test]
+    fn range_header_counts_commits_and_summarizes_newest() {
+        let mk = |rev: u64, msg: &str| LogEntry {
+            revision: rev,
+            author: "a".into(),
+            date: "d".into(),
+            line_count: 1,
+            changed: vec![],
+            message: msg.to_string(),
+        };
+        // log order is newest first
+        let entries = vec![mk(9, "newest\nsecond line"), mk(5, "mid"), mk(3, "old")];
+        let h = range_header(3, 9, &entries);
+        assert_eq!(h[0], "r3..r9 (3 commits)");
+        assert_eq!(h[1], "newest");
+        assert_eq!(h[2], "second line");
+        assert!(h.len() <= DIFF_HEADER_MAX);
+
+        // long newest message is capped
+        let long = vec![mk(9, "1\n2\n3\n4\n5\n6"), mk(3, "x")];
+        let h2 = range_header(3, 9, &long);
+        assert_eq!(h2.len(), DIFF_HEADER_MAX);
+        assert!(h2.last().unwrap().ends_with(" …"));
+
+        // no loaded entries in range → no count, just the range
+        let h3 = range_header(50, 60, &entries);
+        assert_eq!(h3, vec!["r50..r60"]);
+    }
+
+    #[test]
+    fn header_is_fixed_and_does_not_scroll_away() {
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), DIFF);
+        v.set_header(vec![
+            "r7 | alice | 2026-01-01".to_string(),
+            "commit message".to_string(),
+        ]);
+        // scroll to the bottom: the header must still be drawn
+        v.scroll.set(8);
+        let t = ts::render(60, 12, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 60, 12), &v, &Theme::default());
+        });
+        let s = ts::dump(&t);
+        assert!(s.contains("r7 | alice | 2026-01-01"), "{s}");
+        assert!(s.contains("commit message"), "{s}");
+        // scrolled: the first diff lines are gone, later ones visible
+        assert!(!s.contains("Index: Cargo.toml"), "{s}");
+        assert!(s.contains("extra"), "{s}");
+    }
+
+    #[test]
+    fn set_header_caps_at_max() {
+        let mut v = DiffView::new("t");
+        v.set_header((0..10).map(|i| format!("line {i}")).collect());
+        assert_eq!(v.header().len(), DIFF_HEADER_MAX);
+        let mut v2 = DiffView::new("t");
+        v2.set_header(Vec::new());
+        assert!(v2.header().is_empty());
+    }
 
     #[test]
     fn parses_real_diff_with_numbers() {
@@ -258,6 +539,24 @@ Index: Cargo.toml
         );
         assert!(v.empty_reason.is_none());
         assert_eq!(v.parsed.lines.len(), 3);
+    }
+
+    #[test]
+    fn at_at_mid_line_is_not_a_diff() {
+        // raw unversioned text containing "@@" must render as all-added
+        // lines, not be misparsed as a diff
+        let mut v = DiffView::new("t");
+        v.set_content("notes.txt".into(), "mail me at foo@@bar\nplain line\n");
+        assert!(v.empty_reason.is_none());
+        assert_eq!(v.parsed.lines.len(), 2);
+        for line in &v.parsed.lines {
+            assert_eq!(line.kind, DiffLineKind::Added);
+        }
+        assert_eq!(v.parsed.lines[1].new, Some(2));
+        // a real diff still parses
+        let mut v2 = DiffView::new("t");
+        v2.set_content("Cargo.toml".into(), DIFF);
+        assert!(v2.parsed.lines.iter().any(|l| l.kind == DiffLineKind::Hunk));
     }
 
     #[test]

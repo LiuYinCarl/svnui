@@ -4,15 +4,28 @@ name: Release
 # on Linux / macOS / Windows and creates a GitHub Release with them.
 # No bot account involved — the release is created by this workflow using
 # the repository's own GITHUB_TOKEN (permissions: contents: write).
+#
+# This workflow is also reusable (workflow_call): bump.yml calls it with an
+# explicit `tag` input after auto-bumping the version, because tag pushes
+# made with GITHUB_TOKEN do not trigger `on: push: tags` workflows.
 on:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.1.1)'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # For the push trigger inputs.tag is empty and we fall back to the
+  # pushed tag name; for workflow_call it is the tag passed by the caller.
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   verify:
@@ -20,13 +33,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Tag version must match Cargo.toml version
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          echo "tag=$TAG crate=$CRATE_VERSION"
-          if [ "$TAG" != "$CRATE_VERSION" ]; then
-            echo "::error::tag '${GITHUB_REF_NAME}' does not match Cargo.toml version '${CRATE_VERSION}'"
+          echo "tag=$TAG version=$VERSION crate=$CRATE_VERSION"
+          if [ "$VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::tag '${TAG}' does not match Cargo.toml version '${CRATE_VERSION}'"
             exit 1
           fi
 
@@ -54,6 +69,8 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -80,6 +97,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Download all build artifacts
         uses: actions/download-artifact@v7
         with:
@@ -90,6 +109,9 @@ jobs:
       - name: Create release with binaries
         uses: softprops/action-gh-release@v3
         with:
+          # Without this, action-gh-release infers the tag from github.ref,
+          # which is the caller's branch when invoked via workflow_call.
+          tag_name: ${{ env.TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: artifacts/*

@@ -44,6 +44,10 @@ pub struct Theme {
     pub blame_author: Style,
     pub blame_rev_alt: [Style; 12],
 
+    // incremental search (diff / blame popups)
+    pub search_hit: Style,
+    pub search_hit_current: Style,
+
     // popups
     pub popup_border: Color,
     pub confirm_yes: Style,
@@ -92,6 +96,11 @@ impl Default for Theme {
             log_action_modified: Style::default().fg(Color::Yellow),
             log_action_other: Style::default().fg(Color::Magenta),
             blame_author: Style::default().fg(Color::Cyan),
+            search_hit: Style::default().fg(Color::Black).bg(Color::Yellow),
+            search_hit_current: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
             blame_rev_alt: [
                 Style::default().fg(Color::Red),
                 Style::default().fg(Color::Green),

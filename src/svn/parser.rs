@@ -47,6 +47,10 @@ pub fn parse_info(output: &str) -> SvnInfo {
 /// one separating space, then the path starting at byte 8 — the path may
 /// itself begin with spaces, so no extra spaces may be skipped.
 ///
+/// Known plain-text parsing limitations: non-UTF-8 paths become lossy
+/// (the output was decoded with `String::from_utf8_lossy`), and a
+/// filename containing a newline misaligns the affected entry.
+///
 /// `root` is the working copy root: svn reports paths relative to it, so
 /// `is_dir` must be probed against `root`, not the process CWD.
 pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
@@ -57,8 +61,11 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
             continue;
         }
         // Skip continuation lines (tree-conflict descriptions, move
-        // sources): indented text starting with '>'
-        if line.trim_start().starts_with('>') {
+        // sources): svn prints them as exactly six spaces + '>'. Anchor
+        // on that — a looser check would swallow entries whose *path*
+        // (starting at byte 8, possibly with leading spaces) begins
+        // with '>'.
+        if line.starts_with("      >") {
             continue;
         }
         let Some(path) = line.get(8..) else {
@@ -90,9 +97,9 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
 
 /// Parse `svn log -v` output.
 pub fn parse_log(output: &str) -> Vec<LogEntry> {
-    // svn emits a hardcoded 72-dash separator between entries. Matching the
-    // full line keeps a *message* line of dashes from being mistaken for an
-    // entry boundary.
+    // svn emits exactly 72 dashes as the separator between entries.
+    // Require an exact match: a *message* line of dashes (shorter *or*
+    // longer than 72) is content, not an entry boundary.
     const SEP: &str = "------------------------------------------------------------------------";
     let mut entries = Vec::new();
     let mut current: Option<LogEntry> = None;
@@ -103,7 +110,7 @@ pub fn parse_log(output: &str) -> Vec<LogEntry> {
         let line = raw.trim_end_matches('\r');
 
         // Separator line: closes the current entry
-        if line.starts_with(SEP) {
+        if line == SEP {
             if let Some(mut e) = current.take() {
                 e.message = message_lines.join("\n").trim().to_string();
                 entries.push(e);
@@ -461,6 +468,17 @@ Last Changed Rev: 1230
     }
 
     #[test]
+    fn test_parse_status_path_beginning_with_gt() {
+        // A path may begin with '>' (byte 8); only svn's own continuation
+        // prefix (exactly six spaces + '>') marks a continuation line
+        let out = "?       >new.txt\n      >   tree-conflict description\n";
+        let entries = parse_status(out, no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].status, '?');
+        assert_eq!(entries[0].path, ">new.txt");
+    }
+
+    #[test]
     fn test_parse_log() {
         let out = "\
 ------------------------------------------------------------------------
@@ -506,6 +524,20 @@ remove old
         let entries = parse_log(&out);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].message, format!("before\n{dashes40}\nafter"));
+    }
+
+    #[test]
+    fn test_parse_log_message_with_longer_dash_line() {
+        // A message line with MORE than 72 dashes is content too — only an
+        // exact 72-dash line is the entry separator (svn hardcodes 72)
+        let dashes80 = "-".repeat(80);
+        let out = format!(
+            "{sep}\nr7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 3 lines\n\nbefore\n{dashes80}\nafter\n{sep}\n",
+            sep = "-".repeat(72),
+        );
+        let entries = parse_log(&out);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].message, format!("before\n{dashes80}\nafter"));
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! Fuzzy file finder popup (fzf-style): type a keyword, pick a versioned
-//! file, Enter opens its history.
+//! file, Enter opens its history, Ctrl+b opens blame.
 //!
 //! The file list comes from `svn list -R` (loaded async: the popup shows
 //! "Loading..." until `update` delivers it). Matching is delegated to the
 //! `fuzzy-matcher` crate (skim's matcher): subsequence matching with proper
 //! scoring (consecutive/word-boundary bonuses, smart case) plus the matched
-//! character positions, which we highlight in the result list.
+//! character positions, which we highlight in the result list. A bare
+//! letter is always query text, so blame needs the Ctrl modifier here.
 
 use super::{Context, DrawableComponent, EventState};
+use crate::keys::{KeyAction, key_match};
 use crate::ui::{self, style::Theme};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use fuzzy_matcher::FuzzyMatcher;
@@ -109,7 +111,11 @@ impl DrawableComponent for FileFinderPopup {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
             .split(inner);
 
         // input row
@@ -122,6 +128,18 @@ impl DrawableComponent for FileFinderPopup {
                 Span::styled("> ", theme.info),
                 Span::raw(self.query.clone()),
             ]),
+        );
+
+        // footer: key hints (blame needs Ctrl here — bare 'b' is query text)
+        ui::render_line_at(
+            f,
+            chunks[2].x,
+            chunks[2].y,
+            chunks[2].width,
+            &Line::from(Span::styled(
+                "Enter history  ^B blame  Esc close",
+                theme.dim,
+            )),
         );
 
         if self.pending {
@@ -181,6 +199,14 @@ impl DrawableComponent for FileFinderPopup {
         let Event::Key(k) = ev else {
             return Ok(EventState::not_consumed());
         };
+        if key_match(k, KeyAction::BlameFileFinder) {
+            if let Some(path) = self.selected_path() {
+                self.ctx
+                    .queue
+                    .push(crate::queue::InternalEvent::RequestBlame(path));
+            }
+            return Ok(EventState::consumed());
+        }
         match k.code {
             KeyCode::Esc => {
                 self.ctx.queue.push(crate::queue::InternalEvent::ClosePopup);
@@ -329,6 +355,35 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_b_blames_highlighted_file() {
+        let (mut p, q) = comp();
+        type_str(&mut p, "stree");
+        assert_eq!(
+            p.selected_path().as_deref(),
+            Some("src/components/status_tree.rs")
+        );
+        // Ctrl+b requests blame and keeps the finder open (no ClosePopup)
+        let ctrl_b = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(p.event(&ctrl_b).unwrap().consumed);
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RequestBlame(path)) if path == "src/components/status_tree.rs"
+        ));
+        assert!(q.pop().is_none());
+        // a bare 'b' is query text, not blame
+        type_str(&mut p, "b");
+        assert!(q.pop().is_none());
+        // no selection (empty result list): no event
+        let (mut p2, q2) = comp();
+        type_str(&mut p2, "zzz-no-match");
+        p2.event(&ctrl_b).unwrap();
+        assert!(q2.pop().is_none());
+    }
+
+    #[test]
     fn navigation_backspace_esc() {
         let (mut p, q) = comp();
         assert_eq!(p.selected_path().as_deref(), Some("src/main.rs"));
@@ -381,6 +436,7 @@ mod tests {
         let s = ts::dump(&t2);
         assert!(s.contains("Find file"), "{s}");
         assert!(s.contains("a.txt"), "{s}");
+        assert!(s.contains("^B blame"), "{s}");
         // no match state
         type_str(&mut p, "qqq");
         let t3 = ts::render(60, 10, |f| {

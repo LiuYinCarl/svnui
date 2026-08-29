@@ -149,9 +149,13 @@ fn main() -> Result<(), String> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        // LeaveAlternateScreen restores the cursor *position* but not its
+        // *visibility*: without cursor::Show the shell cursor stays
+        // invisible after the app hid it (xterm)
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
+            crossterm::cursor::Show,
             crossterm::event::DisableBracketedPaste
         );
         default_hook(info);
@@ -198,9 +202,12 @@ fn main() -> Result<(), String> {
 
     // teardown
     disable_raw_mode().ok();
+    // cursor::Show: the app hid the cursor at startup and leaving the
+    // alternate screen does not restore its visibility
     let _ = execute!(
         io::stdout(),
         LeaveAlternateScreen,
+        crossterm::cursor::Show,
         crossterm::event::DisableBracketedPaste
     );
 

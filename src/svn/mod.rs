@@ -9,8 +9,10 @@ pub mod parser;
 
 use crossbeam_channel::Sender;
 use models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 /// Result of a finished SVN background operation.
 #[derive(Clone, Debug)]
@@ -51,34 +53,102 @@ pub enum AsyncSvnNotification {
     Resolve(Result<String, String>),
     /// Working copy updated to a specific revision (svn update -r N)
     UpdateToRevision(Result<String, String>),
-    /// Full-history search results (`svn log --search`)
-    LogSearch(Result<Vec<LogEntry>, String>),
-    /// Older revisions appended to the log list (pagination)
-    LogAppend(Result<Vec<LogEntry>, String>),
+    /// Full-history search results (`svn log --search`); `pattern` is the
+    /// search term the request was issued with (correlation: stale results
+    /// for an older pattern must not overwrite a newer search)
+    LogSearch {
+        pattern: String,
+        result: Result<Vec<LogEntry>, String>,
+    },
+    /// Older revisions appended to the log list (pagination); `before_rev`
+    /// is the revision the request was issued with (correlation, as above)
+    LogAppend {
+        before_rev: u64,
+        result: Result<Vec<LogEntry>, String>,
+    },
+    /// `svn diff` of the whole working copy, saved as a patch file
+    CreatePatch(Result<String, String>),
+    /// `svn patch <file>` applied to the working copy
+    ApplyPatch(Result<String, String>),
 }
 
-/// The SVN client. Cheap to clone (path + channel).
+/// The SVN client. Cheap to clone (path + channel + shared lock).
 #[derive(Clone)]
 pub struct Svn {
     cwd: PathBuf,
     tx: Sender<AsyncSvnNotification>,
+    /// Serializes working-copy mutations (`add`, `commit`, `revert`,
+    /// `resolve`, `update`, `apply_patch`). Every op spawns its own worker
+    /// thread; without this lock two mutations could run concurrently —
+    /// e.g. an auto-staging `svn add` racing the following `svn commit` —
+    /// and svn fails those with E155004/E155010 for a legitimate action
+    /// sequence. Read-only ops (status/log/diff/blame/list) never touch
+    /// this lock. Clones share the same lock.
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl Svn {
     pub fn new(cwd: PathBuf, tx: Sender<AsyncSvnNotification>) -> Self {
-        Self { cwd, tx }
+        Self {
+            cwd,
+            tx,
+            mutation_lock: Arc::new(Mutex::new(())),
+        }
     }
 
-    fn spawn<F>(&self, f: F)
+    /// Run `f` on a worker thread and send its notification.
+    ///
+    /// Exactly one notification is delivered even on failure: the caller
+    /// has already bumped `pending`, so a lost notification would wedge
+    /// the spinner forever. `on_err` turns an error message into the
+    /// operation's error notification when the thread cannot be spawned
+    /// or `f` panics.
+    fn spawn<F, E>(&self, f: F, on_err: E)
     where
         F: FnOnce() -> AsyncSvnNotification + Send + 'static,
+        E: FnOnce(String) -> AsyncSvnNotification + Send + Clone + 'static,
     {
         let tx = self.tx.clone();
-        let _ = std::thread::Builder::new()
+        // a failed spawn consumes the worker closure, so the spawn-error
+        // path below needs its own copy of the constructor
+        let worker_on_err = on_err.clone();
+        let spawned = std::thread::Builder::new()
             .name("svn-worker".to_string())
             .spawn(move || {
-                let _ = tx.send(f());
+                let notif = match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+                    Ok(notif) => notif,
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        worker_on_err(format!("worker panicked: {msg}"))
+                    }
+                };
+                let _ = tx.send(notif);
             });
+        if let Err(e) = spawned {
+            let _ = self.tx.send(on_err(format!("failed to spawn worker: {e}")));
+        }
+    }
+
+    /// Like `spawn`, but holds the shared mutation lock while `f` runs.
+    fn spawn_mutating<F, E>(&self, f: F, on_err: E)
+    where
+        F: FnOnce() -> AsyncSvnNotification + Send + 'static,
+        E: FnOnce(String) -> AsyncSvnNotification + Send + Clone + 'static,
+    {
+        let lock = self.mutation_lock.clone();
+        self.spawn(
+            move || {
+                // recover from poisoning: a panicked holder already
+                // reported its error via on_err, don't fail this op too
+                let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                f()
+            },
+            on_err,
+        );
     }
 
     // ----- async entry points -----
@@ -87,47 +157,60 @@ impl Svn {
     /// the parsed URL/branch/revision for display.
     pub fn check_info(&self) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["info"]).map(|text| parser::parse_info(&text));
-            AsyncSvnNotification::Info(result)
-        });
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["info"]).map(|text| parser::parse_info(&text));
+                AsyncSvnNotification::Info(result)
+            },
+            |e| AsyncSvnNotification::Info(Err(e)),
+        );
     }
 
     pub fn status(&self) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["status", "--ignore-externals"])
-                .map(|text| parser::parse_status(&text, &cwd));
-            AsyncSvnNotification::Status(result)
-        });
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["status", "--ignore-externals"])
+                    .map(|text| parser::parse_status(&text, &cwd));
+                AsyncSvnNotification::Status(result)
+            },
+            |e| AsyncSvnNotification::Status(Err(e)),
+        );
     }
 
     pub fn diff(&self, path: &str) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
-        self.spawn(move || {
-            // `svn diff` fails with E155010 for unversioned files, so fall
-            // back to reading the file content in that case too.
-            let diff_result = Self::run_in(&cwd, &["diff", "--", &path]);
-            let result = match diff_result {
-                Ok(out) if out.trim().is_empty() => Self::read_content_fallback(&cwd, &path),
-                Ok(out) => Ok(out),
-                Err(e) => {
-                    if e.contains("E155010") {
-                        Self::read_content_fallback(&cwd, &path)
-                    } else {
-                        Err(e)
-                    }
-                }
-            };
-            AsyncSvnNotification::Diff { path, result }
-        });
+        let err_path = path.clone();
+        self.spawn(
+            move || {
+                // `svn diff` fails with E155010 for unversioned files; only
+                // then fall back to the raw file content. An *empty*
+                // successful diff is legitimate (the change was reverted
+                // between the status fetch and now) — falling back would
+                // show the whole file as added.
+                let result = match Self::run_in(&cwd, &["diff", "--", &path]) {
+                    Ok(out) => Ok(out),
+                    Err(e) if e.contains("E155010") => Self::read_content_fallback(&cwd, &path),
+                    Err(e) => Err(e),
+                };
+                AsyncSvnNotification::Diff { path, result }
+            },
+            move |e| AsyncSvnNotification::Diff {
+                path: err_path,
+                result: Err(e),
+            },
+        );
     }
 
     fn read_content_fallback(cwd: &Path, path: &str) -> Result<String, String> {
         let full = cwd.join(path);
         match std::fs::metadata(&full) {
-            Ok(m) if m.len() > 2_000_000 => Ok(String::new()),
+            // a placeholder beats an empty result: the UI would otherwise
+            // show a misleading "no textual diff" for a huge file
+            Ok(m) if m.len() > 2_000_000 => {
+                Ok(format!("(file too large to display: {} bytes)", m.len()))
+            }
             Ok(_) => {
                 std::fs::read_to_string(&full).map_err(|e| format!("failed to read {path}: {e}"))
             }
@@ -137,39 +220,49 @@ impl Svn {
 
     pub fn log(&self, limit: usize) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            // HEAD:0 so an empty (r0) repository yields no output instead
-            // of an E160006 error
-            let result = Self::run_in(
-                &cwd,
-                &["log", "-v", "-r", "HEAD:0", "-l", &limit.to_string()],
-            )
-            .map(|out| parser::parse_log(&out));
-            AsyncSvnNotification::Log(result)
-        });
+        self.spawn(
+            move || {
+                // HEAD:0 so an empty (r0) repository yields no output instead
+                // of an E160006 error
+                let result = Self::run_in(
+                    &cwd,
+                    &["log", "-v", "-r", "HEAD:0", "-l", &limit.to_string()],
+                )
+                .map(|out| parser::parse_log(&out));
+                AsyncSvnNotification::Log(result)
+            },
+            |e| AsyncSvnNotification::Log(Err(e)),
+        );
     }
 
     /// `svn log` restricted to a single file (its history).
     pub fn file_log(&self, path: &str, limit: usize) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
-        self.spawn(move || {
-            let result = Self::run_in(
-                &cwd,
-                &[
-                    "log",
-                    "-v",
-                    "-r",
-                    "HEAD:0",
-                    "-l",
-                    &limit.to_string(),
-                    "--",
-                    &path,
-                ],
-            )
-            .map(|out| parser::parse_log(&out));
-            AsyncSvnNotification::FileLog { path, result }
-        });
+        let err_path = path.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(
+                    &cwd,
+                    &[
+                        "log",
+                        "-v",
+                        "-r",
+                        "HEAD:0",
+                        "-l",
+                        &limit.to_string(),
+                        "--",
+                        &path,
+                    ],
+                )
+                .map(|out| parser::parse_log(&out));
+                AsyncSvnNotification::FileLog { path, result }
+            },
+            move |e| AsyncSvnNotification::FileLog {
+                path: err_path,
+                result: Err(e),
+            },
+        );
     }
 
     /// Search the full commit history with `svn log --search` (matches
@@ -183,22 +276,37 @@ impl Svn {
     pub fn log_search(&self, pattern: &str) {
         let cwd = self.cwd.clone();
         let pattern = pattern.to_string();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["log", "-v", "-r", "HEAD:0", "--search", &pattern])
-                .map(|out| parser::parse_log(&out));
-            AsyncSvnNotification::LogSearch(result)
-        });
+        let err_pattern = pattern.clone();
+        self.spawn(
+            move || {
+                let result =
+                    Self::run_in(&cwd, &["log", "-v", "-r", "HEAD:0", "--search", &pattern])
+                        .map(|out| parser::parse_log(&out));
+                AsyncSvnNotification::LogSearch { pattern, result }
+            },
+            move |e| AsyncSvnNotification::LogSearch {
+                pattern: err_pattern,
+                result: Err(e),
+            },
+        );
     }
 
     /// Fetch revisions older than `before_rev` (log tab pagination).
     pub fn log_more(&self, before_rev: u64, limit: usize) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let range = format!("{}:0", before_rev - 1);
-            let result = Self::run_in(&cwd, &["log", "-v", "-r", &range, "-l", &limit.to_string()])
-                .map(|out| parser::parse_log(&out));
-            AsyncSvnNotification::LogAppend(result)
-        });
+        self.spawn(
+            move || {
+                let range = format!("{}:0", before_rev - 1);
+                let result =
+                    Self::run_in(&cwd, &["log", "-v", "-r", &range, "-l", &limit.to_string()])
+                        .map(|out| parser::parse_log(&out));
+                AsyncSvnNotification::LogAppend { before_rev, result }
+            },
+            move |e| AsyncSvnNotification::LogAppend {
+                before_rev,
+                result: Err(e),
+            },
+        );
     }
 
     /// List all versioned files in the working copy (`svn list -R`).
@@ -209,118 +317,186 @@ impl Svn {
     /// right after a commit, before update) can be stale or even empty.
     pub fn list_files(&self) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["list", "-R", ".@HEAD"]).map(|out| {
-                out.lines()
-                    .map(|l| l.trim_end_matches('\r'))
-                    .filter(|l| !l.is_empty() && !l.ends_with('/'))
-                    .map(str::to_string)
-                    .collect()
-            });
-            AsyncSvnNotification::ListFiles(result)
-        });
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["list", "-R", ".@HEAD"]).map(|out| {
+                    out.lines()
+                        .map(|l| l.trim_end_matches('\r'))
+                        .filter(|l| !l.is_empty() && !l.ends_with('/'))
+                        .map(str::to_string)
+                        .collect()
+                });
+                AsyncSvnNotification::ListFiles(result)
+            },
+            |e| AsyncSvnNotification::ListFiles(Err(e)),
+        );
     }
 
     pub fn revision_diff(&self, revision: u64) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["diff", "-c", &revision.to_string()]);
-            AsyncSvnNotification::RevisionDiff { revision, result }
-        });
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["diff", "-c", &revision.to_string()]);
+                AsyncSvnNotification::RevisionDiff { revision, result }
+            },
+            move |e| AsyncSvnNotification::RevisionDiff {
+                revision,
+                result: Err(e),
+            },
+        );
     }
 
     /// Combined diff of the revisions `from..=to` (`svn diff -r from-1:to`).
     pub fn range_diff(&self, from: u64, to: u64) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let range = format!("{}:{to}", from.saturating_sub(1));
-            let result = Self::run_in(&cwd, &["diff", "-r", &range]);
-            AsyncSvnNotification::RangeDiff { from, to, result }
-        });
+        self.spawn(
+            move || {
+                let range = format!("{}:{to}", from.saturating_sub(1));
+                let result = Self::run_in(&cwd, &["diff", "-r", &range]);
+                AsyncSvnNotification::RangeDiff { from, to, result }
+            },
+            move |e| AsyncSvnNotification::RangeDiff {
+                from,
+                to,
+                result: Err(e),
+            },
+        );
     }
 
     pub fn blame(&self, path: &str) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
-        self.spawn(move || {
-            let result =
-                Self::run_in(&cwd, &["blame", "--", &path]).map(|out| parser::parse_blame(&out));
-            AsyncSvnNotification::Blame { path, result }
-        });
+        let err_path = path.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["blame", "--", &path])
+                    .map(|out| parser::parse_blame(&out));
+                AsyncSvnNotification::Blame { path, result }
+            },
+            move |e| AsyncSvnNotification::Blame {
+                path: err_path,
+                result: Err(e),
+            },
+        );
     }
 
     pub fn add(&self, paths: &[String]) {
         let cwd = self.cwd.clone();
         let paths = paths.to_vec();
-        self.spawn(move || {
-            let mut args: Vec<String> = vec!["add".into(), "--".into()];
-            args.extend(paths.iter().cloned());
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
-            AsyncSvnNotification::Add(result)
-        });
+        self.spawn_mutating(
+            move || {
+                let mut args: Vec<String> = vec!["add".into(), "--".into()];
+                args.extend(paths.iter().cloned());
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
+                AsyncSvnNotification::Add(result)
+            },
+            |e| AsyncSvnNotification::Add(Err(e)),
+        );
     }
 
     pub fn revert(&self, paths: &[String]) {
         let cwd = self.cwd.clone();
         let paths = paths.to_vec();
-        self.spawn(move || {
-            let mut args: Vec<String> = vec!["revert".into(), "-R".into(), "--".into()];
-            args.extend(paths.iter().cloned());
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
-            AsyncSvnNotification::Revert(result)
-        });
+        self.spawn_mutating(
+            move || {
+                let mut args: Vec<String> = vec!["revert".into(), "-R".into(), "--".into()];
+                args.extend(paths.iter().cloned());
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
+                AsyncSvnNotification::Revert(result)
+            },
+            |e| AsyncSvnNotification::Revert(Err(e)),
+        );
     }
 
     pub fn resolve(&self, path: &str) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["resolve", "--accept=working", "--", &path]);
-            AsyncSvnNotification::Resolve(result.map(|_| path.clone()))
-        });
+        self.spawn_mutating(
+            move || {
+                let result = Self::run_in(&cwd, &["resolve", "--accept=working", "--", &path]);
+                AsyncSvnNotification::Resolve(result.map(|_| path.clone()))
+            },
+            |e| AsyncSvnNotification::Resolve(Err(e)),
+        );
     }
 
     pub fn update(&self) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["update"]);
-            AsyncSvnNotification::Update(result)
-        });
+        self.spawn_mutating(
+            move || {
+                let result = Self::run_in(&cwd, &["update"]);
+                AsyncSvnNotification::Update(result)
+            },
+            |e| AsyncSvnNotification::Update(Err(e)),
+        );
     }
 
     pub fn update_to_revision(&self, revision: u64) {
         let cwd = self.cwd.clone();
-        self.spawn(move || {
-            let result = Self::run_in(&cwd, &["update", "-r", &revision.to_string()]);
-            AsyncSvnNotification::UpdateToRevision(result)
-        });
+        self.spawn_mutating(
+            move || {
+                let result = Self::run_in(&cwd, &["update", "-r", &revision.to_string()]);
+                AsyncSvnNotification::UpdateToRevision(result)
+            },
+            |e| AsyncSvnNotification::UpdateToRevision(Err(e)),
+        );
+    }
+
+    /// `svn diff` over the whole working copy (for saving as a patch file).
+    /// An empty result means there are no local (versioned) changes.
+    pub fn create_patch(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["diff"]);
+                AsyncSvnNotification::CreatePatch(result)
+            },
+            |e| AsyncSvnNotification::CreatePatch(Err(e)),
+        );
+    }
+
+    /// Apply a patch file to the working copy (`svn patch`, svn ≥ 1.7
+    /// handles adds/deletes/moves in the patch).
+    pub fn apply_patch(&self, patch: &Path) {
+        let cwd = self.cwd.clone();
+        let patch = patch.to_string_lossy().into_owned();
+        self.spawn_mutating(
+            move || {
+                let result = Self::run_in(&cwd, &["patch", &patch]);
+                AsyncSvnNotification::ApplyPatch(result)
+            },
+            |e| AsyncSvnNotification::ApplyPatch(Err(e)),
+        );
     }
 
     pub fn commit(&self, message: &str, paths: &[String]) {
         let cwd = self.cwd.clone();
         let message = message.to_string();
         let paths = paths.to_vec();
-        self.spawn(move || {
-            // Explicit file targets are committed exactly as listed (the
-            // obsolete -N/--non-recursive flag is deliberately not used: it
-            // is a no-op for file targets and may disappear in future svn).
-            let mut args: Vec<String> = vec!["commit".into()];
-            // The message is UTF-8; say so explicitly, otherwise svn
-            // interprets -m in the "native" encoding, which is ASCII under
-            // the LC_ALL=C forced by run_in, and non-ASCII messages are
-            // rejected with E000022 ("Can't convert string ... to 'UTF-8'").
-            args.push("--encoding".into());
-            args.push("UTF-8".into());
-            args.push("-m".into());
-            args.push(message);
-            args.push("--".into());
-            args.extend(paths.iter().cloned());
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let result = Self::run_in(&cwd, &arg_refs);
-            AsyncSvnNotification::Commit(result)
-        });
+        self.spawn_mutating(
+            move || {
+                // Explicit file targets are committed exactly as listed (the
+                // obsolete -N/--non-recursive flag is deliberately not used: it
+                // is a no-op for file targets and may disappear in future svn).
+                let mut args: Vec<String> = vec!["commit".into()];
+                // The message is UTF-8; say so explicitly, otherwise svn
+                // interprets -m in the "native" encoding, which is ASCII under
+                // the LC_ALL=C forced by run_in, and non-ASCII messages are
+                // rejected with E000022 ("Can't convert string ... to 'UTF-8'").
+                args.push("--encoding".into());
+                args.push("UTF-8".into());
+                args.push("-m".into());
+                args.push(message);
+                args.push("--".into());
+                args.extend(paths.iter().cloned());
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let result = Self::run_in(&cwd, &arg_refs);
+                AsyncSvnNotification::Commit(result)
+            },
+            |e| AsyncSvnNotification::Commit(Err(e)),
+        );
     }
 
     // ----- static helpers used by worker threads -----
@@ -599,7 +775,10 @@ mod tests {
         // revisions older than r2: just r1
         c.log_more(2, 50);
         match recv(&rx) {
-            AsyncSvnNotification::LogAppend(Ok(entries)) => {
+            AsyncSvnNotification::LogAppend {
+                before_rev: 2,
+                result: Ok(entries),
+            } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].revision, 1);
             }
@@ -617,7 +796,9 @@ mod tests {
         let c = Svn::new(repo.wc.clone(), tx);
         c.log_search("initial");
         match recv(&rx) {
-            AsyncSvnNotification::LogSearch(Ok(entries)) => {
+            AsyncSvnNotification::LogSearch { pattern, result } => {
+                assert_eq!(pattern, "initial");
+                let entries = result.unwrap();
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].revision, 1);
             }
@@ -625,7 +806,10 @@ mod tests {
         }
         c.log_search("no-such-word-xyz");
         match recv(&rx) {
-            AsyncSvnNotification::LogSearch(Ok(entries)) => assert!(entries.is_empty()),
+            AsyncSvnNotification::LogSearch { pattern, result } => {
+                assert_eq!(pattern, "no-such-word-xyz");
+                assert!(result.unwrap().is_empty());
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -723,6 +907,172 @@ mod tests {
         match recv(&rx) {
             AsyncSvnNotification::RevisionDiff { result: Err(e), .. } => {
                 assert!(!e.is_empty(), "expected an error message");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_patch_captures_working_copy_diff() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        // clean working copy → empty diff
+        c.create_patch();
+        match recv(&rx) {
+            AsyncSvnNotification::CreatePatch(Ok(diff)) => {
+                assert!(diff.trim().is_empty(), "{diff}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // a modification shows up in the whole-wc diff
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 42\n");
+        c.create_patch();
+        match recv(&rx) {
+            AsyncSvnNotification::CreatePatch(Ok(diff)) => {
+                assert!(diff.contains("Index: Cargo.toml"), "{diff}");
+                assert!(diff.contains("+version = 42"), "{diff}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_patch_applies_saved_diff() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        // capture a diff, revert, then apply it back via `svn patch`
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 42\n");
+        c.create_patch();
+        let diff = match recv(&rx) {
+            AsyncSvnNotification::CreatePatch(Ok(diff)) => diff,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let patch_file = repo.repo.with_file_name("svnui-test.patch");
+        std::fs::write(&patch_file, &diff).unwrap();
+        repo.svn(&["revert", "-R", "Cargo.toml"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join("Cargo.toml")).unwrap(),
+            "version = 1\n"
+        );
+
+        c.apply_patch(&patch_file);
+        match recv(&rx) {
+            AsyncSvnNotification::ApplyPatch(Ok(out)) => {
+                assert!(out.contains("Cargo.toml"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join("Cargo.toml")).unwrap(),
+            "version = 42\n"
+        );
+        let _ = std::fs::remove_file(&patch_file);
+
+        // error path: a nonexistent patch file fails
+        c.apply_patch(Path::new("/no/such/patch.patch"));
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::ApplyPatch(Err(_))
+        ));
+    }
+
+    /// A panicking worker must still deliver exactly one notification;
+    /// otherwise the caller's `pending` never comes back down and the
+    /// spinner wedges forever.
+    #[test]
+    fn worker_panic_still_notifies() {
+        let (tx, rx) = unbounded();
+        let c = Svn::new(PathBuf::from("."), tx);
+        // panic with a &'static str payload
+        c.spawn(|| panic!("boom"), |e| AsyncSvnNotification::Status(Err(e)));
+        match recv(&rx) {
+            AsyncSvnNotification::Status(Err(e)) => {
+                assert!(e.contains("boom"), "{e}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // panic with a String payload
+        c.spawn(
+            || std::panic::panic_any(String::from("kaboom")),
+            |e| AsyncSvnNotification::Status(Err(e)),
+        );
+        match recv(&rx) {
+            AsyncSvnNotification::Status(Err(e)) => {
+                assert!(e.contains("kaboom"), "{e}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The mutation lock must serialize `svn add` and a following
+    /// `svn commit` even when both are issued back-to-back; concurrent
+    /// execution fails with E155004/E155010.
+    #[test]
+    fn add_and_commit_are_serialized() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        test_support::write_file(&repo.wc.join("staged.txt"), "x\n");
+        c.add(&["staged.txt".to_string()]);
+        c.commit("add staged", &["staged.txt".to_string()]);
+        let (mut added, mut committed) = (false, false);
+        for _ in 0..2 {
+            match recv(&rx) {
+                AsyncSvnNotification::Add(Ok(paths)) => {
+                    assert_eq!(paths, vec!["staged.txt"]);
+                    added = true;
+                }
+                AsyncSvnNotification::Commit(Ok(out)) => {
+                    assert!(out.contains("Committed revision 2"), "{out}");
+                    committed = true;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(added && committed);
+        // the file is versioned and clean now
+        assert!(!repo.svn(&["status"]).contains("staged.txt"));
+    }
+
+    /// An empty successful diff is legitimate (the change was reverted
+    /// between status fetch and diff request) and must stay empty —
+    /// falling back to the raw file content would show the whole file
+    /// as added.
+    #[test]
+    fn diff_clean_file_stays_empty() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).diff("src/main.rs");
+        match recv(&rx) {
+            AsyncSvnNotification::Diff {
+                result: Ok(content),
+                ..
+            } => {
+                assert!(content.is_empty(), "{content}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The size-capped fallback must say *why* nothing is shown instead
+    /// of returning an empty string (which the UI renders as a misleading
+    /// "no textual diff").
+    #[test]
+    fn diff_large_unversioned_file_shows_placeholder() {
+        let Some(repo) = TestRepo::new() else { return };
+        let big = "x".repeat(2_100_000);
+        test_support::write_file(&repo.wc.join("big.bin"), &big);
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).diff("big.bin");
+        match recv(&rx) {
+            AsyncSvnNotification::Diff {
+                result: Ok(content),
+                ..
+            } => {
+                assert!(content.contains("file too large to display"), "{content}");
             }
             other => panic!("unexpected: {other:?}"),
         }

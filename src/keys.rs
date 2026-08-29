@@ -64,6 +64,21 @@ pub enum KeyAction {
     FileHistory,
     OpenFileFinder,
     ToggleMark,
+    ViewCommitInfo,
+    BlameFileFinder,
+    SwitchTabPatches,
+    /// Save the working-copy changes as a patch file (`P`, app-level)
+    SavePatch,
+    /// Patches tab: preview the selected patch (`p`, Enter is separate)
+    PreviewPatch,
+    /// Patches tab: apply the selected patch (`a`)
+    ApplyPatch,
+    /// Patches tab: delete the selected patch file (`d`)
+    DeletePatch,
+    /// Log tab / file history popup: scroll the detail pane down (Ctrl+d)
+    DetailScrollDown,
+    /// Log tab / file history popup: scroll the detail pane up (Ctrl+u)
+    DetailScrollUp,
 }
 
 /// Central keybindings. `KeyAction::None` is used for unbound keys.
@@ -94,6 +109,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::Refresh => is_key(ev, KeyCode::F(5)) || is_key(ev, KeyCode::Char('R')),
         KeyAction::SwitchTabStatus => is_key(ev, KeyCode::Char('1')),
         KeyAction::SwitchTabLog => is_key(ev, KeyCode::Char('2')),
+        KeyAction::SwitchTabPatches => is_key(ev, KeyCode::Char('3')),
         KeyAction::Help => is_key(ev, KeyCode::Char('?')),
         KeyAction::Confirm => is_key(ev, KeyCode::Char('y')) || is_key(ev, KeyCode::Char('Y')),
         KeyAction::Deny => is_key(ev, KeyCode::Char('n')) || is_key(ev, KeyCode::Char('N')),
@@ -106,7 +122,10 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
                 || (is_key(ev, KeyCode::Tab) && ev.modifiers.contains(KeyModifiers::SHIFT))
         }
         KeyAction::CommitConfirm => {
-            (ev.code == KeyCode::Enter && !ev.modifiers.contains(KeyModifiers::SHIFT))
+            (ev.code == KeyCode::Enter
+                && !ev
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT))
                 || (ev.code == KeyCode::Char('s') && ev.modifiers.contains(KeyModifiers::CONTROL))
         }
         KeyAction::OpenRevisionDiff => is_key(ev, KeyCode::Enter) || is_key(ev, KeyCode::Char('d')),
@@ -116,44 +135,120 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
             ev.code == KeyCode::Char('p') && ev.modifiers.contains(KeyModifiers::CONTROL)
         }
         KeyAction::ToggleMark => is_key(ev, KeyCode::Char(' ')),
+        KeyAction::ViewCommitInfo => is_key(ev, KeyCode::Char('v')),
+        // In the file finder a bare 'b' is query text, so blame uses Ctrl+b
+        KeyAction::BlameFileFinder => {
+            ev.code == KeyCode::Char('b') && ev.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        KeyAction::SavePatch => is_key(ev, KeyCode::Char('P')),
+        // plain 'p' is free: the file finder uses Ctrl+p
+        KeyAction::PreviewPatch => is_key(ev, KeyCode::Char('p')),
+        // 'a'/'d' are also AddFiles/DiffFull; the patch actions only exist
+        // in the patches tab, which consumes the key before the status tab
+        // would ever see it
+        KeyAction::ApplyPatch => is_key(ev, KeyCode::Char('a')),
+        KeyAction::DeletePatch => is_key(ev, KeyCode::Char('d')),
+        // Ctrl+d/u scroll the detail pane; plain d/u are separate actions
+        // and are matched without modifiers via `is_key`
+        KeyAction::DetailScrollDown => {
+            ev.code == KeyCode::Char('d') && ev.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        KeyAction::DetailScrollUp => {
+            ev.code == KeyCode::Char('u') && ev.modifiers.contains(KeyModifiers::CONTROL)
+        }
     }
 }
 
-/// Match a single key code ignoring modifiers like SHIFT for letters.
+/// Match a single key code ignoring modifiers like SHIFT for letters,
+/// but rejecting CONTROL/ALT combos (Alt+q must not quit, etc.).
 fn is_key(ev: &KeyEvent, code: KeyCode) -> bool {
-    ev.code == code && !ev.modifiers.contains(KeyModifiers::CONTROL)
+    ev.code == code
+        && !ev
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
-/// Build the default binding list for the help popup.
-pub fn all_bindings() -> Vec<KeyBinding> {
+/// A titled section of the help popup: the bindings of one context
+/// (global keys, one per tab, popup-specific keys).
+pub struct KeyGroup {
+    pub title: &'static str,
+    pub bindings: Vec<KeyBinding>,
+}
+
+/// Build the default binding list for the help popup, grouped by the
+/// context in which the keys are active.
+pub fn all_binding_groups() -> Vec<KeyGroup> {
     vec![
-        KeyBinding::new("q", "Quit svnui"),
-        KeyBinding::new("j / ↓ / k / ↑", "Move selection"),
-        KeyBinding::new("h / ← / l / →", "Collapse / expand directory"),
-        KeyBinding::new("g / G", "Jump to first / last entry"),
-        KeyBinding::new("PgUp / PgDn", "Page up / down"),
-        KeyBinding::new("space", "Stage / unstage (toggle commit set)"),
-        KeyBinding::new("A / U", "Stage all changes / unstage all"),
-        KeyBinding::new("a", "Add selected files (svn add)"),
-        KeyBinding::new("r", "Revert selected files (svn revert)"),
-        KeyBinding::new("x", "Resolve conflict (accept working copy)"),
-        KeyBinding::new("c", "Focus commit message / commit"),
-        KeyBinding::new("Enter", "Commit (in commit input)"),
-        KeyBinding::new("u", "Update working copy (svn update)"),
-        KeyBinding::new("d", "Fullscreen diff"),
-        KeyBinding::new("b", "Blame file (svn blame)"),
-        KeyBinding::new("t", "File history (svn log of selected file)"),
-        KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
-        KeyBinding::new("/", "Filter files / search commits (popup, log tab)"),
-        KeyBinding::new("F5 / R", "Refresh status"),
-        KeyBinding::new("Tab / Shift+Tab", "Cycle pane focus"),
-        KeyBinding::new("Tab", "Commit input: pick a recent message"),
-        KeyBinding::new("1 / 2", "Switch tab: status / log"),
-        KeyBinding::new("Enter / d", "Log tab: diff of selected / marked revisions"),
-        KeyBinding::new("space", "Log tab: mark / unmark revision"),
-        KeyBinding::new("o", "Log tab: update to selected revision"),
-        KeyBinding::new("?", "Show this help"),
-        KeyBinding::new("Esc", "Close popup / cancel"),
+        KeyGroup {
+            title: "Global",
+            bindings: vec![
+                KeyBinding::new("1 / 2 / 3", "Switch tab: status / log / patches"),
+                KeyBinding::new(
+                    "Tab / Shift+Tab",
+                    "Status tab: cycle pane focus; log/patches: switch tab",
+                ),
+                KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
+                KeyBinding::new("P", "Save working-copy changes as a patch file (no revert)"),
+                KeyBinding::new("F5 / R", "Refresh status / log / patch list"),
+                KeyBinding::new("?", "Show this help"),
+                KeyBinding::new("q", "Quit svnui"),
+            ],
+        },
+        KeyGroup {
+            title: "Status tab",
+            bindings: vec![
+                KeyBinding::new("j / ↓ / k / ↑", "Move selection"),
+                KeyBinding::new("h / ← / l / →", "Collapse / expand directory"),
+                KeyBinding::new("g / G", "Jump to first / last entry"),
+                KeyBinding::new("PgUp / PgDn", "Page up / down"),
+                KeyBinding::new("space", "Stage / unstage (toggle commit set)"),
+                KeyBinding::new("A / U", "Stage all changes / unstage all"),
+                KeyBinding::new("a", "Add selected files (svn add)"),
+                KeyBinding::new("r", "Revert selected files (svn revert)"),
+                KeyBinding::new("x", "Resolve conflict (accept working copy)"),
+                KeyBinding::new("Enter / d", "Diff of the selected file"),
+                KeyBinding::new("b", "Blame file (svn blame)"),
+                KeyBinding::new("t", "File history (svn log of selected file)"),
+                KeyBinding::new("/", "Filter files"),
+                KeyBinding::new("c", "Focus commit message / commit"),
+                KeyBinding::new("Enter / Ctrl+s", "Commit (in commit input)"),
+                KeyBinding::new("Tab", "Commit input: pick a recent message"),
+                KeyBinding::new("u", "Update working copy (svn update)"),
+            ],
+        },
+        KeyGroup {
+            title: "Log tab",
+            bindings: vec![
+                KeyBinding::new("Enter / d", "Diff of selected / marked revisions"),
+                KeyBinding::new("space", "Mark / unmark revision (range diff)"),
+                KeyBinding::new("v", "Show full commit info"),
+                KeyBinding::new("o", "Update working copy to selected revision"),
+                KeyBinding::new("/", "Filter loaded commits / search all history"),
+                KeyBinding::new("Ctrl+d / Ctrl+u", "Scroll commit details down / up"),
+            ],
+        },
+        KeyGroup {
+            title: "Patches tab",
+            bindings: vec![
+                KeyBinding::new("Enter / p", "Preview patch (diff view)"),
+                KeyBinding::new("a", "Apply patch (svn patch, confirmed)"),
+                KeyBinding::new("d", "Delete patch file (confirmed)"),
+            ],
+        },
+        KeyGroup {
+            title: "Popups",
+            bindings: vec![
+                KeyBinding::new("/", "Diff / blame popup: search text (live)"),
+                KeyBinding::new("n / N", "Diff / blame search: next / previous match"),
+                KeyBinding::new("Ctrl+b", "File finder: blame highlighted file"),
+                KeyBinding::new("b", "File history popup: blame the file"),
+                KeyBinding::new(
+                    "Ctrl+d / Ctrl+u",
+                    "File history popup: scroll commit message",
+                ),
+                KeyBinding::new("Esc", "Close popup / cancel / clear search highlights"),
+            ],
+        },
     ]
 }
 
@@ -240,6 +335,36 @@ mod tests {
             KeyAction::OpenFileFinder
         ));
         assert!(key_match(&key(KeyCode::Char(' ')), KeyAction::ToggleMark));
+        assert!(key_match(
+            &key(KeyCode::Char('v')),
+            KeyAction::ViewCommitInfo
+        ));
+        // 'v' must not clash with other log-tab actions
+        assert!(!key_match(&key(KeyCode::Char('v')), KeyAction::Blame));
+        assert!(!key_match(&key(KeyCode::Char('v')), KeyAction::Quit));
+        // finder blame is Ctrl+b; plain 'b' is query text there
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(key_match(&ctrl_b, KeyAction::BlameFileFinder));
+        assert!(!key_match(
+            &key(KeyCode::Char('b')),
+            KeyAction::BlameFileFinder
+        ));
+        // ... and plain 'b' stays the regular blame action elsewhere
+        assert!(key_match(&key(KeyCode::Char('b')), KeyAction::Blame));
+        assert!(!key_match(&ctrl_b, KeyAction::Blame));
+        // patch management keys
+        assert!(key_match(&key(KeyCode::Char('P')), KeyAction::SavePatch));
+        assert!(!key_match(&key(KeyCode::Char('p')), KeyAction::SavePatch));
+        assert!(key_match(
+            &key(KeyCode::Char('3')),
+            KeyAction::SwitchTabPatches
+        ));
+        assert!(key_match(&key(KeyCode::Char('p')), KeyAction::PreviewPatch));
+        assert!(key_match(&key(KeyCode::Char('a')), KeyAction::ApplyPatch));
+        assert!(key_match(&key(KeyCode::Char('d')), KeyAction::DeletePatch));
+        // 'p' must not clash with the finder (Ctrl+p) or the save key
+        assert!(!key_match(&ctrl_p, KeyAction::PreviewPatch));
+        assert!(!key_match(&ctrl_p, KeyAction::SavePatch));
     }
 
     #[test]
@@ -263,12 +388,53 @@ mod tests {
     }
 
     #[test]
+    fn modifier_hygiene() {
+        // Alt+letter must not trigger bare-letter actions
+        let alt_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
+        assert!(!key_match(&alt_q, KeyAction::Quit));
+        let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
+        assert!(!key_match(&alt_c, KeyAction::Commit));
+        // Ctrl+Enter / Alt+Enter must not commit
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert!(!key_match(&ctrl_enter, KeyAction::CommitConfirm));
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert!(!key_match(&alt_enter, KeyAction::CommitConfirm));
+        // Shift stays tolerated for letters (caps-lock style typing)
+        let shift_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT);
+        assert!(key_match(&shift_a, KeyAction::AddFiles));
+        assert!(key_match(&shift_a, KeyAction::ApplyPatch));
+        let shift_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT);
+        assert!(key_match(&shift_d, KeyAction::DiffFull));
+        // Ctrl+d/u scroll the detail pane; plain d/u do not
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(key_match(&ctrl_d, KeyAction::DetailScrollDown));
+        assert!(key_match(&ctrl_u, KeyAction::DetailScrollUp));
+        assert!(!key_match(
+            &key(KeyCode::Char('d')),
+            KeyAction::DetailScrollDown
+        ));
+        assert!(!key_match(
+            &key(KeyCode::Char('u')),
+            KeyAction::DetailScrollUp
+        ));
+        assert!(!key_match(&ctrl_d, KeyAction::DetailScrollUp));
+        // ... and the Ctrl combos don't fire the plain-letter actions
+        assert!(!key_match(&ctrl_d, KeyAction::DiffFull));
+        assert!(!key_match(&ctrl_u, KeyAction::UpdateWc));
+    }
+
+    #[test]
     fn bindings_list_is_nonempty_and_sorted_ok() {
-        let bindings = all_bindings();
-        assert!(!bindings.is_empty());
-        for b in &bindings {
-            assert!(!b.keys.is_empty());
-            assert!(!b.description.is_empty());
+        let groups = all_binding_groups();
+        assert!(groups.len() >= 5);
+        for g in &groups {
+            assert!(!g.title.is_empty());
+            assert!(!g.bindings.is_empty());
+            for b in &g.bindings {
+                assert!(!b.keys.is_empty());
+                assert!(!b.description.is_empty());
+            }
         }
     }
 }

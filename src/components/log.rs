@@ -14,6 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use std::cell::Cell;
 
+/// Status-bar shortcut hints shown while the log tab is active.
+pub const HINTS: &str = "enter/d diff  spc mark  v info  o update-to  / search  F5";
+
 pub struct LogComponent {
     ctx: Context,
     pub entries: Vec<LogEntry>,
@@ -173,6 +176,18 @@ impl LogComponent {
         }
     }
 
+    /// Scroll the detail pane (commit message / changed paths) by a
+    /// half-page-ish step, clamped to the content length.
+    fn scroll_detail(&mut self, delta: isize) {
+        let len = self
+            .selection_entry()
+            .map(|e| detail_lines(e, &self.ctx.theme).len())
+            .unwrap_or(0);
+        let next =
+            (self.detail_scroll.get() as isize + delta).clamp(0, len.saturating_sub(1) as isize);
+        self.detail_scroll.set(next as usize);
+    }
+
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
         let Event::Key(k) = ev else {
             return Ok(EventState::not_consumed());
@@ -180,18 +195,35 @@ impl LogComponent {
 
         if key_match(k, KeyAction::MoveUp) {
             self.move_selection(-1);
+            // pagination only follows movement keys — `v`, space, `o`, `/`
+            // at the bottom of the list must not load older revisions
+            self.maybe_load_more();
         } else if key_match(k, KeyAction::MoveDown) {
             self.move_selection(1);
+            self.maybe_load_more();
         } else if key_match(k, KeyAction::PageUp) {
             self.move_selection(-20);
+            self.maybe_load_more();
         } else if key_match(k, KeyAction::PageDown) {
             self.move_selection(20);
+            self.maybe_load_more();
         } else if key_match(k, KeyAction::Home) {
             self.selection = 0;
+            self.maybe_load_more();
         } else if key_match(k, KeyAction::End) {
             self.selection = self.visible_indices().len().saturating_sub(1);
+            self.maybe_load_more();
+        } else if key_match(k, KeyAction::DetailScrollDown) {
+            self.scroll_detail(10);
+        } else if key_match(k, KeyAction::DetailScrollUp) {
+            self.scroll_detail(-10);
         } else if key_match(k, KeyAction::ToggleMark) {
             self.toggle_mark();
+        } else if key_match(k, KeyAction::ViewCommitInfo) {
+            if let Some(e) = self.selection_entry() {
+                let entry = e.clone();
+                self.ctx.queue.push(InternalEvent::ShowCommitInfo(entry));
+            }
         } else if key_match(k, KeyAction::OpenRevisionDiff) {
             self.request_diff();
         } else if key_match(k, KeyAction::Filter) {
@@ -237,7 +269,6 @@ impl LogComponent {
         } else {
             return Ok(EventState::not_consumed());
         }
-        self.maybe_load_more();
         Ok(EventState::consumed())
     }
 }
@@ -474,6 +505,31 @@ mod tests {
             q.pop(),
             Some(InternalEvent::Confirm(ConfirmAction::UpdateToRevision(3)))
         ));
+    }
+
+    #[test]
+    fn view_commit_info_pushes_event() {
+        let (mut c, q) = comp();
+        c.event(&ts::key(crossterm::event::KeyCode::Char('v')))
+            .unwrap();
+        match q.pop() {
+            Some(InternalEvent::ShowCommitInfo(e)) => {
+                assert_eq!(e.revision, 3);
+                assert_eq!(e.author, "alice");
+                assert_eq!(e.message, "third");
+            }
+            other => panic!("expected ShowCommitInfo, got {other:?}"),
+        }
+        // no selection (empty log) → no event
+        let mut empty = LogComponent::new(&Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        });
+        empty.update(vec![]);
+        empty
+            .event(&ts::key(crossterm::event::KeyCode::Char('v')))
+            .unwrap();
+        assert!(q.pop().is_none());
     }
 
     #[test]
@@ -722,5 +778,74 @@ mod tests {
         c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         c.update(vec![entry(9, "x", "only")]);
         assert_eq!(c.selection_revision(), Some(9));
+    }
+
+    fn ctrl(code: crossterm::event::KeyCode) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::CONTROL,
+        ))
+    }
+
+    #[test]
+    fn ctrl_d_u_scroll_the_detail_pane() {
+        let (mut c, _q) = comp();
+        // detail of r3: header + blank + "Changed paths:" + 1 path + blank
+        // + "Message:" + 1 message line = 7 lines
+        assert_eq!(c.detail_scroll.get(), 0);
+        c.event(&ctrl(crossterm::event::KeyCode::Char('d')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 6, "clamped to content length");
+        // clamped at the bottom
+        c.event(&ctrl(crossterm::event::KeyCode::Char('d')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 6);
+        // Ctrl+u goes back up, clamped at 0
+        c.event(&ctrl(crossterm::event::KeyCode::Char('u')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 0);
+        // moving the selection still resets the scroll
+        c.event(&ctrl(crossterm::event::KeyCode::Char('d')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 6);
+        c.move_selection(1);
+        assert_eq!(c.detail_scroll.get(), 0);
+    }
+
+    #[test]
+    fn only_movement_keys_trigger_pagination() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut c = LogComponent::new(&ctx);
+        let entries: Vec<LogEntry> = (2..=60)
+            .rev()
+            .map(|r| entry(r, "a", &format!("commit {r}")))
+            .collect();
+        c.update(entries);
+        // park the selection at the bottom without a movement key
+        c.selection = c.entries.len() - 1;
+        // non-movement keys must not load older revisions (they do push
+        // their own events; only LogLoadMore is forbidden here)
+        for code in [
+            crossterm::event::KeyCode::Char('v'),
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyCode::Char('/'),
+        ] {
+            c.event(&ts::key(code)).unwrap();
+        }
+        assert!(
+            q.drain()
+                .iter()
+                .all(|ev| !matches!(ev, InternalEvent::LogLoadMore)),
+            "non-movement keys must not paginate"
+        );
+        // a movement key does
+        c.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
     }
 }

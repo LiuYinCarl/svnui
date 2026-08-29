@@ -2,14 +2,14 @@
 //!
 //! Opened from the status tab (`t`) or from the file finder. Shows the
 //! revisions that touched the file; Enter/`d` opens the fullscreen diff of
-//! the selected revision.
+//! the selected revision, `b` opens blame for the file.
 
 use super::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
 use crate::queue::InternalEvent;
 use crate::svn::models::LogEntry;
 use crate::ui::{self, style::Theme};
-use crossterm::event::{Event, KeyCode};
+use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -57,6 +57,18 @@ impl FileLogPopup {
         }
         self.selection = ui::clamp_index((self.selection as isize + delta).max(0) as usize, len);
         self.detail_scroll.set(0);
+    }
+
+    /// Scroll the commit-message pane, clamped to the content length.
+    fn scroll_detail(&mut self, delta: isize) {
+        let len = self
+            .entries
+            .get(self.selection)
+            .map(|e| e.message.lines().count().max(1))
+            .unwrap_or(0);
+        let next =
+            (self.detail_scroll.get() as isize + delta).clamp(0, len.saturating_sub(1) as isize);
+        self.detail_scroll.set(next as usize);
     }
 }
 
@@ -160,11 +172,19 @@ impl DrawableComponent for FileLogPopup {
         } else if key_match(k, KeyAction::End) {
             self.selection = self.entries.len().saturating_sub(1);
             self.detail_scroll.set(0);
+        } else if key_match(k, KeyAction::DetailScrollDown) {
+            self.scroll_detail(10);
+        } else if key_match(k, KeyAction::DetailScrollUp) {
+            self.scroll_detail(-10);
         } else if key_match(k, KeyAction::OpenRevisionDiff) {
             if let Some(rev) = self.selection_revision() {
                 self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev));
             }
-        } else if k.code == KeyCode::Char('?') {
+        } else if key_match(k, KeyAction::Blame) {
+            self.ctx
+                .queue
+                .push(InternalEvent::RequestBlame(self.path.clone()));
+        } else if key_match(k, KeyAction::Help) {
             self.ctx.queue.push(InternalEvent::OpenHelp);
         } else {
             return Ok(EventState::not_consumed());
@@ -242,6 +262,13 @@ mod tests {
             q.pop(),
             Some(InternalEvent::RequestRevisionDiff(5))
         ));
+        // 'b' requests blame for the file (regardless of selection)
+        p.event(&ts::key(crossterm::event::KeyCode::Char('b')))
+            .unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RequestBlame(path)) if path == "src/main.rs"
+        ));
         // '?' opens help, 'q' closes
         p.event(&ts::key(crossterm::event::KeyCode::Char('?')))
             .unwrap();
@@ -255,6 +282,30 @@ mod tests {
                 .unwrap()
                 .consumed
         );
+    }
+
+    #[test]
+    fn ctrl_d_u_scroll_the_message_pane() {
+        let (mut p, _q) = comp();
+        let ctrl_d = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let ctrl_u = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        // selection r5, message "five": 1 line — nothing to scroll
+        p.event(&ctrl_d).unwrap();
+        assert_eq!(p.detail_scroll.get(), 0);
+        // r2's message has two lines: Ctrl+d scrolls, clamped to len - 1
+        p.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert_eq!(p.selection_revision(), Some(2));
+        p.event(&ctrl_d).unwrap();
+        assert_eq!(p.detail_scroll.get(), 1);
+        p.event(&ctrl_u).unwrap();
+        assert_eq!(p.detail_scroll.get(), 0);
     }
 
     #[test]

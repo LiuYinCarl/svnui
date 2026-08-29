@@ -50,11 +50,11 @@ impl DrawableComponent for MsgPopup {
             .map(|l| Line::from(Span::styled(l.to_string(), style)))
             .collect();
         f.render_widget(Paragraph::new(msg_lines).wrap(Wrap { trim: false }), inner);
-        // footer hint
-        if area.height > 0 {
-            let y = area.y + area.height.saturating_sub(1);
+        // footer hint, one row above the bottom border
+        if inner.height > 0 {
+            let y = inner.y + inner.height - 1;
             f.buffer_mut()
-                .set_string(area.x + 1, y, "press any key to close", Style::default());
+                .set_string(inner.x, y, "press any key to close", Style::default());
         }
         Ok(())
     }
@@ -109,6 +109,11 @@ mod tests {
         let s = ts::dump(&t);
         assert!(s.contains("Error"), "{s}");
         assert!(s.contains("Error text"), "{s}");
+        // the footer is drawn inside the border, leaving the bottom row intact
+        assert!(s.contains("press any key to close"), "{s}");
+        let bottom = s.lines().last().unwrap();
+        assert!(bottom.starts_with('└') && bottom.ends_with('┘'), "{s}");
+        assert!(!bottom.contains("press any key"), "{s}");
         let p2 = MsgPopup::new(&c, "Info text".to_string(), false);
         let t2 = ts::render(60, 8, |f| {
             p2.draw(f, Rect::new(0, 0, 60, 8)).unwrap();

@@ -177,6 +177,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             q.pop(),
+            Some(crate::queue::InternalEvent::ClosePopup)
+        ));
+        assert!(matches!(
+            q.pop(),
             Some(crate::queue::InternalEvent::Confirmed(_))
         ));
 
