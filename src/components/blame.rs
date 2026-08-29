@@ -467,6 +467,46 @@ mod tests {
     }
 
     #[test]
+    fn search_highlights_stay_aligned_with_hscroll() {
+        // search active + horizontal scroll at the same time: the match
+        // highlight must follow the sliced text, not the pre-slice columns
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut b = BlamePopup::new(&ctx, "f");
+        b.update(vec![
+            line(Some(1), "al", "xx needle yy plus some more text"),
+            line(Some(2), "al", "plain"),
+        ]);
+        b.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        for c in "needle".chars() {
+            b.event(&ts::key(KeyCode::Char(c))).unwrap();
+        }
+        b.event(&ts::key(KeyCode::Enter)).unwrap();
+        assert_eq!(b.search.match_count(), 1);
+        b.event(&ts::key(KeyCode::Char('l'))).unwrap();
+        assert_eq!(b.hscroll.get(), 8);
+        let theme = Theme::default();
+        let t = ts::render(24, 6, |f| {
+            b.draw(f, Rect::new(0, 0, 24, 6)).unwrap();
+        });
+        let buf = t.backend().buffer();
+        // line prefix is rev(7) + ' ' + author(2) + 2 spaces = 12 columns;
+        // skipping 8 leaves 4, so 'needle' (content column 3..9) lands at
+        // screen x = 1 + 4 + 3 = 8. The single match is the current one.
+        let hit_bg = theme.search_hit_current.bg.unwrap();
+        for x in 8..14 {
+            assert_eq!(buf[(x, 1)].bg, hit_bg, "cell {x} must be highlighted");
+        }
+        assert_ne!(buf[(7, 1)].bg, hit_bg, "the match must not shift left");
+        assert_eq!(buf[(8, 1)].symbol(), "n");
+        let s = ts::dump(&t);
+        assert!(s.contains("/needle  [1/1]"), "{s}");
+    }
+
+    #[test]
     fn draw_pending_empty_and_lines() {
         let q = crate::queue::Queue::new();
         let ctx = Context {

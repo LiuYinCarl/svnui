@@ -454,6 +454,72 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_s_pushes_commit_confirm() {
+        let (mut c, q) = comp();
+        c.focus();
+        type_text(&mut c, "fix something");
+        let ctrl_s = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let state = c.event(&ctrl_s).unwrap();
+        assert!(state.consumed);
+        match q.pop() {
+            Some(InternalEvent::Confirm(ConfirmAction::Commit { message, paths })) => {
+                assert_eq!(message, "fix something");
+                assert!(paths.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // the 's' was not inserted as text
+        assert_eq!(c.text(), "fix something");
+    }
+
+    #[test]
+    fn history_picker_swallows_char_keys() {
+        let (mut c, q) = comp();
+        c.focus();
+        c.set_history(vec!["one".to_string(), "two".to_string()]);
+        c.event(&ev(KeyCode::Tab)).unwrap();
+        // while the picker is open, plain chars neither insert text nor
+        // reach the commit shortcuts — the picker is modal
+        let state = c.event(&ev(KeyCode::Char('x'))).unwrap();
+        assert!(state.consumed);
+        assert_eq!(c.text(), "");
+        let ctrl_s = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let state = c.event(&ctrl_s).unwrap();
+        assert!(state.consumed);
+        assert!(q.pop().is_none(), "picker must not leak a commit event");
+        // after Esc closes the picker, typing works again
+        c.event(&ev(KeyCode::Esc)).unwrap();
+        c.event(&ev(KeyCode::Char('x'))).unwrap();
+        assert_eq!(c.text(), "x");
+    }
+
+    #[test]
+    fn set_history_truncates_to_picker_len() {
+        let (mut c, _q) = comp();
+        c.set_history((0..25).map(|i| format!("m{i}")).collect());
+        assert_eq!(c.history.len(), HISTORY_PICKER_LEN);
+        assert_eq!(c.history.last().unwrap(), "m9");
+        // a stale selection beyond the new (shorter) history is clamped
+        c.focus();
+        c.event(&ev(KeyCode::Tab)).unwrap();
+        for _ in 0..9 {
+            c.event(&ev(KeyCode::Down)).unwrap();
+        }
+        assert_eq!(c.history_sel, 9);
+        c.set_history(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(c.history_sel, 2);
+        // Enter now fills the clamped selection, not an out-of-range one
+        c.event(&ev(KeyCode::Enter)).unwrap();
+        assert_eq!(c.text(), "c");
+    }
+
+    #[test]
     fn esc_unfocuses_and_unfocused_ignores() {
         let (mut c, _q) = comp();
         assert!(!c.focused);

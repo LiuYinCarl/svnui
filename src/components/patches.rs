@@ -290,12 +290,16 @@ fn list_patch_files(dir: &Path) -> Vec<PatchFile> {
             });
         }
     }
-    out.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
-            .then_with(|| b.name.cmp(&a.name))
-    });
+    out.sort_by(newer_first);
     out
+}
+
+/// List order: newest modification first; same-second saves (timestamped
+/// names) fall back to name descending, keeping the order deterministic.
+fn newer_first(a: &PatchFile, b: &PatchFile) -> std::cmp::Ordering {
+    b.modified
+        .cmp(&a.modified)
+        .then_with(|| b.name.cmp(&a.name))
 }
 
 // ----- naming & formatting -----
@@ -438,36 +442,69 @@ mod tests {
     }
 
     #[test]
+    fn newer_first_sorts_mtime_desc_then_name_desc() {
+        use std::cmp::Ordering;
+        let new = patch("new.patch", 5, 200);
+        let mid = patch("mid.patch", 1, 150);
+        let old = patch("old.patch", 3, 100);
+        // different mtimes: newest first, regardless of name
+        assert_eq!(newer_first(&new, &mid), Ordering::Less);
+        assert_eq!(newer_first(&old, &mid), Ordering::Greater);
+        assert_eq!(newer_first(&old, &new), Ordering::Greater);
+        // equal mtime: name descending breaks the tie
+        let a = patch("a.patch", 1, 100);
+        let b = patch("b.patch", 1, 100);
+        assert_eq!(newer_first(&a, &b), Ordering::Greater);
+        assert_eq!(newer_first(&b, &a), Ordering::Less);
+        // identical entries are equal
+        assert_eq!(newer_first(&a, &patch("a.patch", 1, 100)), Ordering::Equal);
+        // mtime dominates the name tiebreak
+        assert_eq!(newer_first(&b, &new), Ordering::Greater);
+        // entries without a timestamp sort last
+        let mut unknown = patch("z.patch", 1, 100);
+        unknown.modified = None;
+        assert_eq!(newer_first(&unknown, &old), Ordering::Greater);
+    }
+
+    #[test]
     fn refresh_lists_newest_first() {
         let (c, _q) = ctx();
         let dir = temp_dir("list");
-        write_patch(&dir, "patch-20260101-000000.patch", "a");
-        write_patch(&dir, "patch-20260102-000000.patch", "bb");
+        write_patch(&dir, "a.patch", "a");
+        write_patch(&dir, "b.patch", "bb");
+        write_patch(&dir, "c.patch", "ccc");
         // a subdirectory is not a patch file
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        // pin the mtimes (filesystem timestamps are too coarse to rely on
+        // the write order): b newest, then a, then c
+        let set_mtime = |name: &str, secs: u64| {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap();
+            f.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_mtime("a.patch", 200);
+        set_mtime("b.patch", 300);
+        set_mtime("c.patch", 100);
         let mut comp = PatchesComponent::with_dir(&c, dir.clone());
-        assert_eq!(comp.entries.len(), 2);
-        // sorting is by mtime desc, name desc as tiebreak (covered
-        // deterministically here by the synthetic-order test below)
-        comp.entries = vec![
-            patch("old.patch", 3, 100),
-            patch("new.patch", 5, 200),
-            patch("mid.patch", 1, 150),
-        ];
-        comp.entries.sort_by(|a, b| {
-            b.modified
-                .cmp(&a.modified)
-                .then_with(|| b.name.cmp(&a.name))
-        });
-        assert_eq!(comp.entries[0].name, "new.patch");
-        assert_eq!(comp.entries[1].name, "mid.patch");
-        assert_eq!(comp.entries[2].name, "old.patch");
-        // refresh drops deleted files and clamps the selection
-        comp.selection = 1;
-        std::fs::remove_file(dir.join("patch-20260102-000000.patch")).unwrap();
+        // the directory read itself returns the entries newest first
+        let names: Vec<&str> = comp.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["b.patch", "a.patch", "c.patch"], "{names:?}");
+        // same mtime: the name-descending tiebreak decides
+        set_mtime("c.patch", 300);
         comp.refresh();
-        assert_eq!(comp.entries.len(), 1);
-        assert_eq!(comp.selection, 0);
+        let names: Vec<&str> = comp.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["c.patch", "b.patch", "a.patch"], "{names:?}");
+        // refresh drops deleted files and clamps the selection
+        comp.selection = 2;
+        std::fs::remove_file(dir.join("b.patch")).unwrap();
+        comp.refresh();
+        let names: Vec<&str> = comp.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["c.patch", "a.patch"], "{names:?}");
+        assert_eq!(comp.selection, 1);
+        assert_eq!(comp.selection_entry().unwrap().name, "a.patch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -577,6 +614,34 @@ mod tests {
         let newest = s.find("patch-20260102").unwrap();
         let oldest = s.find("patch-20260101").unwrap();
         assert!(newest < oldest, "{s}");
+        let _ = std::fs::remove_dir_all(comp.dir());
+    }
+
+    #[test]
+    fn scroll_window_follows_selection() {
+        let (c, _q) = ctx();
+        let mut comp = PatchesComponent::with_dir(&c, temp_dir("scroll"));
+        comp.entries = (0..30)
+            .map(|i| patch(&format!("p{i:02}.patch"), 1, 100 + i as u64))
+            .collect();
+        // inner height of a 60x6 block is 4 rows: jumping to the end must
+        // scroll the window so the selection stays visible
+        comp.event(&ts::key(KeyCode::End)).unwrap();
+        assert_eq!(comp.selection, 29);
+        let t = ts::render(60, 6, |f| {
+            comp.draw(f, Rect::new(0, 0, 60, 6)).unwrap();
+        });
+        assert_eq!(comp.scroll.get(), 26);
+        let s = ts::dump(&t);
+        assert!(s.contains("p29.patch"), "{s}");
+        assert!(s.contains("p26.patch"), "{s}");
+        assert!(!s.contains("p25.patch"), "scrolled-out row drawn: {s}");
+        // moving back up scrolls the window up again
+        comp.event(&ts::key(KeyCode::Home)).unwrap();
+        ts::render(60, 6, |f| {
+            comp.draw(f, Rect::new(0, 0, 60, 6)).unwrap();
+        });
+        assert_eq!(comp.scroll.get(), 0);
         let _ = std::fs::remove_dir_all(comp.dir());
     }
 

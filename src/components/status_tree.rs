@@ -915,6 +915,46 @@ mod interaction_tests {
     }
 
     #[test]
+    fn changed_files_sorted_and_dirs_excluded() {
+        let (c, _q) = comp_with(vec![
+            entry('M', "z.txt"),
+            dir_entry('?', "newdir"),
+            entry('A', "a.txt"),
+        ]);
+        let files = c.changed_files();
+        assert_eq!(
+            files,
+            vec![('A', "a.txt".to_string()), ('M', "z.txt".to_string())]
+        );
+    }
+
+    #[test]
+    fn staged_files_sorted_and_unknown_paths_backfilled() {
+        let (mut c, _q) = comp_with(vec![entry('M', "b.txt")]);
+        // staged paths without a status entry (e.g. staged before the first
+        // refresh) fall back to '?'
+        c.set_staged(&["b.txt".into(), "a.txt".into(), "gone.txt".into()]);
+        let files = c.staged_files();
+        assert_eq!(
+            files,
+            vec![
+                ('?', "a.txt".to_string()),
+                ('M', "b.txt".to_string()),
+                ('?', "gone.txt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_char_with_and_without_entry() {
+        let (c, _q) = comp_with(vec![entry('M', "m.txt"), entry('?', "u.txt")]);
+        assert_eq!(c.status_char("m.txt"), 'M');
+        assert_eq!(c.status_char("u.txt"), '?');
+        // no entry: a blank, distinct from unversioned '?'
+        assert_eq!(c.status_char("absent.txt"), ' ');
+    }
+
+    #[test]
     fn navigation_moves_selection() {
         let (mut c, _q) = comp_with(vec![entry('M', "a.txt"), entry('?', "b.txt")]);
         // files sorted: a.txt, b.txt

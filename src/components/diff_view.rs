@@ -670,6 +670,75 @@ Index: Cargo.toml
     }
 
     #[test]
+    fn search_highlights_stay_aligned_with_hscroll() {
+        // search active + horizontal scroll at the same time: the match
+        // highlight must follow the sliced text, not the pre-slice columns
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "aaaa needle zzzz and some more text\nplain\n");
+        v.search_enabled = true;
+        v.search_event(&ts::key(KeyCode::Char('/')));
+        for ch in "needle".chars() {
+            v.search_event(&ts::key(KeyCode::Char(ch)));
+        }
+        v.search_event(&ts::key(KeyCode::Enter));
+        assert_eq!(v.search.match_count(), 1);
+        // skip 8 columns of the 9-wide line-number gutter
+        v.event(&ts::key(KeyCode::Char('l')));
+        assert_eq!(v.hscroll.get(), 8);
+        let theme = Theme::default();
+        let t = ts::render(30, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 30, 6), &v, &theme);
+        });
+        let buf = t.backend().buffer();
+        // 'needle' sits at content column 5..11; on screen: border(1) +
+        // gutter rest(1) + 5 = 7, and the single match is the current one
+        let hit_bg = theme.search_hit_current.bg.unwrap();
+        for x in 7..13 {
+            assert_eq!(buf[(x, 1)].bg, hit_bg, "cell {x} must be highlighted");
+        }
+        assert_ne!(buf[(6, 1)].bg, hit_bg, "the match must not shift left");
+        assert_eq!(buf[(6, 1)].symbol(), " ");
+        assert_eq!(buf[(7, 1)].symbol(), "n");
+        // the search footer is drawn while scrolled
+        let s = ts::dump(&t);
+        assert!(s.contains("/needle  [1/1]"), "{s}");
+    }
+
+    #[test]
+    fn cjk_content_horizontal_scroll_aligns_cells() {
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "修复中文注释 here with more text\nplain\n");
+        let theme = Theme::default();
+        // no hscroll: content starts right after the 9-column gutter
+        let t = ts::render(20, 5, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 20, 5), &v, &theme);
+        });
+        let buf = t.backend().buffer();
+        assert_eq!(buf[(10, 1)].symbol(), "修");
+        assert_eq!(buf[(12, 1)].symbol(), "复");
+        // cut at a column boundary: 修复 (4 columns) are gone, 中 starts it
+        v.hscroll.set(13); // 9 gutter + 4 content columns
+        let t = ts::render(20, 5, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 20, 5), &v, &theme);
+        });
+        let buf = t.backend().buffer();
+        assert_eq!(buf[(1, 1)].symbol(), "中");
+        assert_eq!(buf[(3, 1)].symbol(), "文");
+        // cut through the middle of 修: the straddling char collapses to a
+        // single space instead of rendering a half glyph
+        v.hscroll.set(10);
+        let t = ts::render(20, 5, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 20, 5), &v, &theme);
+        });
+        let buf = t.backend().buffer();
+        assert_eq!(buf[(1, 1)].symbol(), " ");
+        assert_eq!(buf[(2, 1)].symbol(), "复");
+        assert_eq!(buf[(4, 1)].symbol(), "中");
+        let s = ts::dump(&t);
+        assert!(!s.contains('修'), "{s}");
+    }
+
+    #[test]
     fn draw_pending_empty_and_content() {
         let mut v = DiffView::new("Diff");
         v.pending = true;

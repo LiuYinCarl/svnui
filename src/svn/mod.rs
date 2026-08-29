@@ -1049,6 +1049,68 @@ mod tests {
         ));
     }
 
+    /// Guard for the `HEAD:0` trick in `log()`: a fresh r0 repository (no
+    /// commits at all) must yield an empty log, not an E160006 error.
+    /// `TestRepo` always seeds a commit, so this builds the repo by hand.
+    #[test]
+    fn log_on_empty_r0_repo_returns_empty_ok() {
+        let dir = std::env::temp_dir().join(format!("svnui-r0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = dir.join("repo");
+        let wc = dir.join("wc");
+        let ok = std::process::Command::new("svnadmin")
+            .arg("create")
+            .arg(&repo)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+            && std::process::Command::new("svn")
+                .arg("co")
+                .arg(format!("file://{}", repo.display()))
+                .arg(&wc)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        if !ok {
+            // svn unavailable: skip like the TestRepo-based tests
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let (tx, rx) = unbounded();
+        Svn::new(wc, tx).log(50);
+        match recv(&rx) {
+            AsyncSvnNotification::Log(Ok(entries)) => {
+                assert!(entries.is_empty(), "{entries:?}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blame_unversioned_file_errors() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("untracked.txt"), "x\n");
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).blame("untracked.txt");
+        match recv(&rx) {
+            AsyncSvnNotification::Blame { path, result } => {
+                assert_eq!(path, "untracked.txt");
+                assert!(result.is_err(), "blame of unversioned file must fail");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_already_versioned_file_errors() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).add(&["Cargo.toml".to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Err(_))));
+    }
+
     /// A panicking worker must still deliver exactly one notification;
     /// otherwise the caller's `pending` never comes back down and the
     /// spinner wedges forever.

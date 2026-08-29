@@ -1994,6 +1994,73 @@ mod tests {
         assert!(m.message.contains("boom"), "{}", m.message);
     }
 
+    fn bare_tree() -> crate::components::status_tree::StatusTreeComponent {
+        let ctx = Context {
+            queue: Queue::new(),
+            theme: Theme::default(),
+        };
+        crate::components::status_tree::StatusTreeComponent::new(&ctx)
+    }
+
+    fn lines_text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn repo_info_lines_clean_and_up_to_date() {
+        let tree = bare_tree();
+        let theme = Theme::default();
+        // head not newer than the local revision → "(up to date)"
+        let mut head = test_info();
+        head.revision = 3;
+        let text = lines_text(&repo_info_lines(&test_info(), Some(&head), &tree, &theme));
+        assert!(text.contains("HEAD:          r3"), "{text}");
+        assert!(text.contains("(up to date)"), "{text}");
+        assert!(!text.contains("revisions behind"), "{text}");
+        // no changed files → the summary line says "clean"
+        assert!(text.contains("clean"), "{text}");
+        assert!(!text.contains("Staged for commit"), "{text}");
+    }
+
+    #[test]
+    fn repo_info_lines_unknown_statuses_counted_as_other() {
+        let mut tree = bare_tree();
+        // status chars without a label ('I' ignored, '~' obstructed)
+        tree.update(vec![entry('I', "ignored.o"), entry('~', "blocked.txt")]);
+        let text = lines_text(&repo_info_lines(
+            &test_info(),
+            Some(&test_info()),
+            &tree,
+            &Theme::default(),
+        ));
+        assert!(text.contains("2 other"), "{text}");
+        // no labeled breakdown for unknown statuses
+        assert!(!text.contains("modified"), "{text}");
+    }
+
+    #[test]
+    fn repo_info_lines_omit_last_changed_when_rev_zero() {
+        let tree = bare_tree();
+        // an uncommitted / fresh node has no last-changed triple
+        let mut local = test_info();
+        local.last_rev = 0;
+        local.last_author = String::new();
+        local.last_date = String::new();
+        let text = lines_text(&repo_info_lines(
+            &local,
+            Some(&test_info()),
+            &tree,
+            &Theme::default(),
+        ));
+        assert!(!text.contains("Last changed:"), "{text}");
+        // the head's own last-commit line is independent and still shown
+        assert!(text.contains("Last commit:"), "{text}");
+    }
+
     #[test]
     fn commit_confirm_shows_branch_and_file_list() {
         let Some(repo) = TestRepo::new() else { return };
@@ -2018,6 +2085,65 @@ mod tests {
         // only the staged file is listed
         assert!(!p.message.contains("a.txt"), "{}", p.message);
         assert!(p.message.contains("\"my commit\""), "{}", p.message);
+    }
+
+    #[test]
+    fn commit_confirm_truncates_long_file_list() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
+        let names: Vec<String> = (0..10).map(|i| format!("f{i:02}.txt")).collect();
+        app.handle_async(AsyncSvnNotification::Status(Ok(names
+            .iter()
+            .map(|n| entry('M', n))
+            .collect())));
+        app.status.set_staged(&names);
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Commit {
+                message: "many files".into(),
+                paths: vec![],
+            }));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        // only the first MAX_LISTED (8) files are listed, then a summary
+        assert!(p.message.contains("(10 files)"), "{}", p.message);
+        assert!(p.message.contains("  M f00.txt"), "{}", p.message);
+        assert!(p.message.contains("  M f07.txt"), "{}", p.message);
+        assert!(!p.message.contains("f08.txt"), "{}", p.message);
+        assert!(p.message.contains("… and 2 more"), "{}", p.message);
+    }
+
+    #[test]
+    fn patch_confirm_messages_name_the_patch_file() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::ApplyPatch(
+                PathBuf::from("/patches/fix-thing.patch"),
+            )));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p.message.contains(MSG.apply_patch_confirm), "{}", p.message);
+        assert!(p.message.contains("fix-thing.patch"), "{}", p.message);
+        app.popups.clear();
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::DeletePatch(
+                PathBuf::from("/patches/fix-thing.patch"),
+            )));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(
+            p.message.contains(MSG.delete_patch_confirm),
+            "{}",
+            p.message
+        );
+        assert!(p.message.contains("fix-thing.patch"), "{}", p.message);
     }
 
     #[test]
@@ -2168,6 +2294,7 @@ mod tests {
         // oldest is r1 now: the event is a no-op (no svn call)
         app.queue.push(InternalEvent::LogLoadMore);
         app.handle_queue_events();
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
     #[test]

@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn bindings_list_is_nonempty_and_sorted_ok() {
+    fn bindings_list_is_nonempty() {
         let groups = all_binding_groups();
         assert!(groups.len() >= 5);
         for g in &groups {

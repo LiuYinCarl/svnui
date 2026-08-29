@@ -702,6 +702,94 @@ Index: a.txt
         assert_eq!(d.lines[7].old, Some(2));
         assert_eq!(d.lines[7].new, Some(2));
     }
+    #[test]
+    fn test_parse_status_props_column() {
+        // a property-only change sets column 2 and leaves column 1 blank
+        let entries = parse_status(" M      props.txt\n", no_root());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, ' ');
+        assert_eq!(entries[0].props_status, 'M');
+        assert_eq!(entries[0].path, "props.txt");
+    }
+
+    #[test]
+    fn test_parse_status_blank_status_columns_skipped() {
+        // a line whose status columns are all spaces carries no information
+        // (svn prints such padding in some edge outputs); it is skipped
+        let entries = parse_status("        padded.txt\nM       real.txt\n", no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, "real.txt");
+    }
+
+    #[test]
+    fn test_parse_log_entry_without_message() {
+        // an empty commit message ("0 lines") yields an empty message, not
+        // a swallowed entry
+        let out = "\
+------------------------------------------------------------------------
+r3 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 0 lines
+Changed paths:
+   M /trunk/a.txt
+------------------------------------------------------------------------
+";
+        let entries = parse_log(out);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].revision, 3);
+        assert_eq!(entries[0].message, "");
+        assert_eq!(entries[0].changed, vec![('M', "trunk/a.txt".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_diff_no_newline_note_keeps_line_numbers() {
+        // the "\ No newline" note belongs to the previous line and must not
+        // consume an old/new line number itself
+        let out = "\
+Index: f
+===================================================================
+--- f\t(revision 1)
++++ f\t(working copy)
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+";
+        let d = parse_diff(out);
+        assert_eq!(d.lines.len(), 9, "{:?}", d.lines);
+        assert_eq!(d.lines[5].kind, DiffLineKind::Removed);
+        assert_eq!(d.lines[5].old, Some(1));
+        assert_eq!(d.lines[6].kind, DiffLineKind::Note);
+        assert_eq!(d.lines[6].old, None);
+        assert_eq!(d.lines[6].new, None);
+        // if the note had advanced the counters this would be Some(2)
+        assert_eq!(d.lines[7].kind, DiffLineKind::Added);
+        assert_eq!(d.lines[7].new, Some(1));
+        assert_eq!(d.lines[8].kind, DiffLineKind::Note);
+    }
+
+    #[test]
+    fn test_parse_hunk_header_with_function_context() {
+        // svn/git append the enclosing function after the second @@; the
+        // numbers must still parse
+        assert_eq!(parse_hunk(" -1 +1 @@ fn foo"), (Some(1), Some(1)));
+        assert_eq!(
+            parse_hunk(" -10,4 +10,5 @@ impl Bar<T> for"),
+            (Some(10), Some(10))
+        );
+        // ... through a full diff, so following lines are numbered right
+        let d = parse_diff("@@ -5 +5 @@ fn foo\n-a\n+b\n");
+        assert_eq!(d.lines[1].kind, DiffLineKind::Removed);
+        assert_eq!(d.lines[1].old, Some(5));
+        assert_eq!(d.lines[2].kind, DiffLineKind::Added);
+        assert_eq!(d.lines[2].new, Some(5));
+    }
+
+    #[test]
+    fn test_parse_blame_empty_output() {
+        assert!(parse_blame("").is_empty());
+        // whitespace-only lines carry no revision token either
+        assert!(parse_blame("\n   \n").is_empty());
+    }
 }
 
 #[cfg(test)]

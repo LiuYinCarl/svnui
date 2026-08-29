@@ -64,6 +64,9 @@ struct Stats {
     patches: usize,
     refreshes: usize,
     updates: usize,
+    infos: usize,
+    marks: usize,
+    histories: usize,
     benign_errors: usize,
     anomalies: usize,
 }
@@ -73,7 +76,8 @@ impl std::fmt::Display for Stats {
         write!(
             f,
             "commits={} reverts={} diffs={} blames={} searches={} patches={} \
-             refreshes={} updates={} benign_errors={} anomalies={}",
+             refreshes={} updates={} infos={} marks={} histories={} \
+             benign_errors={} anomalies={}",
             self.commits,
             self.reverts,
             self.diffs,
@@ -82,6 +86,9 @@ impl std::fmt::Display for Stats {
             self.patches,
             self.refreshes,
             self.updates,
+            self.infos,
+            self.marks,
+            self.histories,
             self.benign_errors,
             self.anomalies,
         )
@@ -632,6 +639,76 @@ impl Harness {
         self.stats.patches += 1;
     }
 
+    /// Global `i`: the repo info popup (`svn info` + HEAD comparison),
+    /// then close it.
+    fn act_repo_info(&mut self) {
+        self.action = "global/repo-info";
+        self.input(key(KeyCode::Char('i')));
+        self.settle();
+        if !matches!(self.app.popups.last(), Some(Popup::Output(_))) {
+            self.fail("expected repo info popup");
+        }
+        self.draw_once();
+        self.input(key(KeyCode::Esc));
+        self.stats.infos += 1;
+    }
+
+    /// Log tab: mark the selected revision with space (range-diff
+    /// selection), then unmark it so the next round starts clean.
+    fn act_log_mark(&mut self) {
+        self.action = "log/mark";
+        self.goto_tab('2');
+        let len = self.app.log.entries.len();
+        if len == 0 {
+            return;
+        }
+        self.input(key(KeyCode::Home));
+        for _ in 0..self.rng.below(len.min(30)) {
+            self.input(key(KeyCode::Char('j')));
+        }
+        self.settle(); // scrolling near the bottom pages in older revisions
+        let rev = self.app.log.selection_revision().unwrap_or(0);
+        self.input(key(KeyCode::Char(' ')));
+        if !self.app.log.marks.contains(&rev) {
+            self.fail("space did not mark the selected revision");
+        }
+        self.draw_once();
+        // toggle the mark off again; the selection did not move
+        self.input(key(KeyCode::Char(' ')));
+        if !self.app.log.marks.is_empty() {
+            self.fail("marks not cleared after untoggling");
+        }
+        self.stats.marks += 1;
+    }
+
+    /// Status tab: modify a file, open its file history (`t`), close it,
+    /// then revert the change.
+    fn act_file_history(&mut self) {
+        self.action = "status/file-history";
+        self.goto_tab('1');
+        self.ensure_clean();
+        let f = self.files[self.rng.below(self.files.len())].clone();
+        let tag = format!(
+            "svnui stress history round {} {:x}",
+            self.round,
+            self.rng.next()
+        );
+        append_line(&self.wc.join(&f), &format!("// {tag}"));
+        self.input(key(KeyCode::F(5)));
+        self.settle();
+        self.filter_select(&f);
+        self.input(key(KeyCode::Char('t')));
+        self.settle();
+        if !matches!(self.app.popups.last(), Some(Popup::FileLog(_))) {
+            self.fail(&format!("expected file history popup for {f}"));
+        }
+        self.draw_once();
+        self.input(key(KeyCode::Esc));
+        // revert the change so the wc is clean again
+        self.revert_picked(&[f]);
+        self.stats.histories += 1;
+    }
+
     /// F5 refresh; occasionally a full `svn update` (u + y).
     fn act_refresh(&mut self) {
         self.action = "refresh";
@@ -733,12 +810,15 @@ fn stress_workflow() {
     for round in 1..=rounds {
         h.round = round;
         match h.rng.below(100) {
-            0..=14 => h.act_commit_info(),
-            15..=29 => h.act_revision_diff(),
-            30..=44 => h.act_finder_blame(),
-            45..=59 => h.act_log_search(),
-            60..=79 => h.act_modify(),
-            80..=94 => h.act_patch(),
+            0..=11 => h.act_commit_info(),
+            12..=23 => h.act_revision_diff(),
+            24..=35 => h.act_finder_blame(),
+            36..=47 => h.act_log_search(),
+            48..=62 => h.act_modify(),
+            63..=76 => h.act_patch(),
+            77..=82 => h.act_repo_info(),
+            83..=88 => h.act_log_mark(),
+            89..=93 => h.act_file_history(),
             _ => h.act_refresh(),
         }
         h.app.tick(); // spinner tick, as in main.rs

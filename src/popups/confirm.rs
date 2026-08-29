@@ -135,6 +135,26 @@ mod tests {
     }
 
     #[test]
+    fn esc_and_capital_n_deny() {
+        // Esc closes the popup like 'n', without confirming
+        let (c, q) = ctx();
+        let mut p = ConfirmPopup::new(&c, "Do it?".to_string(), ConfirmAction::Update);
+        let state = p.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
+        assert!(state.consumed);
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+        assert!(q.pop().is_none(), "Esc must not confirm");
+        // capital N denies like lowercase n
+        let (c2, q2) = ctx();
+        let mut p2 = ConfirmPopup::new(&c2, "Do it?".to_string(), ConfirmAction::Update);
+        let state = p2
+            .event(&ts::key(crossterm::event::KeyCode::Char('N')))
+            .unwrap();
+        assert!(state.consumed);
+        assert!(matches!(q2.pop(), Some(InternalEvent::ClosePopup)));
+        assert!(q2.pop().is_none(), "N must not confirm");
+    }
+
+    #[test]
     fn other_keys_ignored() {
         let (c, _q) = ctx();
         let mut p = ConfirmPopup::new(&c, "Do it?".to_string(), ConfirmAction::Update);
