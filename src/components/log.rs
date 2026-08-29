@@ -15,7 +15,14 @@ use ratatui::widgets::{Block, Borders};
 use std::cell::Cell;
 
 /// Status-bar shortcut hints shown while the log tab is active.
-pub const HINTS: &str = "enter/d diff  spc mark  v info  o update-to  / search  F5";
+pub const HINTS: &str = "enter/d diff  spc mark  v info  o update-to  / search  tab pane  F5";
+
+/// Which log-tab pane has keyboard focus (Tab toggles).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogPane {
+    List,
+    Detail,
+}
 
 pub struct LogComponent {
     ctx: Context,
@@ -25,6 +32,8 @@ pub struct LogComponent {
     scroll: Cell<usize>,
     detail_scroll: Cell<usize>,
     pub pending: bool,
+    /// Focused pane: `List` (default) or `Detail` (Tab toggles)
+    pub focus: LogPane,
     /// Keyword filter over revision/author/message, set from the search
     /// popup (`/`)
     filter: String,
@@ -46,6 +55,7 @@ impl LogComponent {
             scroll: Cell::new(0),
             detail_scroll: Cell::new(0),
             pending: true,
+            focus: LogPane::List,
             filter: String::new(),
             search: None,
             marks: std::collections::BTreeSet::new(),
@@ -191,6 +201,49 @@ impl LogComponent {
             return Ok(EventState::not_consumed());
         };
 
+        // Tab / Shift+Tab toggle between the list and the detail pane
+        if key_match(k, KeyAction::FocusNext) || key_match(k, KeyAction::FocusPrev) {
+            self.focus = match self.focus {
+                LogPane::List => LogPane::Detail,
+                LogPane::Detail => LogPane::List,
+            };
+            return Ok(EventState::consumed());
+        }
+        // with the detail pane focused, the movement keys scroll it;
+        // every other key (d / space / v / …) falls through to the
+        // normal chain below
+        if self.focus == LogPane::Detail {
+            let scrolled = if key_match(k, KeyAction::MoveDown) {
+                self.scroll_detail(1);
+                true
+            } else if key_match(k, KeyAction::MoveUp) {
+                self.scroll_detail(-1);
+                true
+            } else if key_match(k, KeyAction::PageDown) {
+                self.scroll_detail(20);
+                true
+            } else if key_match(k, KeyAction::PageUp) {
+                self.scroll_detail(-20);
+                true
+            } else if key_match(k, KeyAction::Home) {
+                self.detail_scroll.set(0);
+                true
+            } else if key_match(k, KeyAction::End) {
+                // isize::MAX would overflow scroll_detail's addition
+                let len = self
+                    .selection_entry()
+                    .map(|e| log_entry_lines(e, &self.ctx.theme).len())
+                    .unwrap_or(0);
+                self.detail_scroll.set(len.saturating_sub(1));
+                true
+            } else {
+                false
+            };
+            if scrolled {
+                return Ok(EventState::consumed());
+            }
+        }
+
         if key_match(k, KeyAction::MoveUp) {
             self.move_selection(-1);
             // pagination only follows movement keys — `v`, space, `o`, `/`
@@ -272,8 +325,13 @@ impl LogComponent {
 impl DrawableComponent for LogComponent {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
-        // the log tab owns its area: always the focused border
-        let border = theme.border_focused;
+        let border_of = |pane: LogPane| {
+            if self.focus == pane {
+                theme.border_focused
+            } else {
+                theme.border_unfocused
+            }
+        };
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -297,7 +355,7 @@ impl DrawableComponent for LogComponent {
         }
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(border))
+            .border_style(Style::default().fg(border_of(LogPane::List)))
             .title(title);
         let inner = block.inner(chunks[0]);
         f.render_widget(block, chunks[0]);
@@ -307,7 +365,7 @@ impl DrawableComponent for LogComponent {
         // cells, so a missing border would leave stale content behind
         let block2 = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border_unfocused))
+            .border_style(Style::default().fg(border_of(LogPane::Detail)))
             .title(TITLE.log_detail);
         let inner2 = block2.inner(chunks[1]);
         f.render_widget(block2, chunks[1]);
@@ -778,6 +836,33 @@ mod tests {
             code,
             crossterm::event::KeyModifiers::CONTROL,
         ))
+    }
+
+    #[test]
+    fn tab_toggles_pane_focus_and_movement_scrolls_detail() {
+        let (mut c, _q) = comp();
+        assert_eq!(c.focus, LogPane::List);
+        c.event(&ts::key(crossterm::event::KeyCode::Tab)).unwrap();
+        assert_eq!(c.focus, LogPane::Detail);
+        // j/k scroll the detail pane; the list selection does not move
+        let sel = c.selection;
+        c.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 1);
+        assert_eq!(c.selection, sel);
+        // G/g jump to the detail's end/start (7 lines → clamped to 6)
+        c.event(&ts::key(crossterm::event::KeyCode::Char('G')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 6);
+        c.event(&ts::key(crossterm::event::KeyCode::Char('g')))
+            .unwrap();
+        assert_eq!(c.detail_scroll.get(), 0);
+        // Tab back to the list; j moves the selection again
+        c.event(&ts::key(crossterm::event::KeyCode::Tab)).unwrap();
+        assert_eq!(c.focus, LogPane::List);
+        c.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert_eq!(c.selection, sel + 1);
     }
 
     #[test]

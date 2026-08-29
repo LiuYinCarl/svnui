@@ -188,7 +188,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("1 / 2 / 3", "Switch tab: status / log / patches"),
                 KeyBinding::new(
                     "Tab / Shift+Tab",
-                    "Status tab: cycle pane focus; log/patches: switch tab",
+                    "Cycle pane focus (status: tree/diff/commit, log: list/details)",
                 ),
                 KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
                 KeyBinding::new("P", "Save working-copy changes as a patch file (no revert)"),
@@ -228,6 +228,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("v", "Show full commit info"),
                 KeyBinding::new("o", "Update working copy to selected revision"),
                 KeyBinding::new("/", "Filter loaded commits / search all history"),
+                KeyBinding::new("Tab", "Focus the details pane (j/k scroll it)"),
                 KeyBinding::new("Ctrl+d / Ctrl+u", "Scroll commit details down / up"),
             ],
         },

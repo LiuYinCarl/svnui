@@ -74,7 +74,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `i` | Repository overview (local info + remote HEAD comparison + change summary) |
 | `F5` / `R` | Refresh status / log / patch list |
 | `P` | Save working-copy changes as a patch file (snapshot, no revert) |
-| `Tab` / `Shift+Tab` | Cycle pane focus / switch tabs |
+| `Tab` / `Shift+Tab` | Cycle pane focus within the tab (status: tree/diff/commit, log: list/details); use `1`/`2`/`3` to switch tabs |
 | `1` / `2` / `3` | Status / log / patches tabs |
 | `Enter` / `d` | Log tab: diff of the selected (or marked) revisions |
 | `space` | Log tab: mark / unmark revision |

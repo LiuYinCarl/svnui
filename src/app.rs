@@ -222,22 +222,6 @@ impl App {
         } else if key_match(k, KeyAction::RepoInfo) {
             self.svn.repo_info();
             self.pending += 1;
-        } else if key_match(k, KeyAction::FocusNext) {
-            match self.active_tab {
-                // unreachable: the status tab consumes Tab/Shift+Tab for
-                // its pane focus cycle in `handle_global_key` before the
-                // app-level keys run
-                Tab::Status => {}
-                Tab::Log => self.activate_tab(Tab::Patches),
-                Tab::Patches => self.activate_tab(Tab::Status),
-            }
-        } else if key_match(k, KeyAction::FocusPrev) {
-            match self.active_tab {
-                // unreachable: see FocusNext above
-                Tab::Status => {}
-                Tab::Log => self.activate_tab(Tab::Status),
-                Tab::Patches => self.activate_tab(Tab::Log),
-            }
         } else if key_match(k, KeyAction::SwitchTabStatus) {
             self.activate_tab(Tab::Status);
         } else if key_match(k, KeyAction::SwitchTabLog) {
@@ -245,6 +229,9 @@ impl App {
         } else if key_match(k, KeyAction::SwitchTabPatches) {
             self.activate_tab(Tab::Patches);
         }
+        // Tab / Shift+Tab are pane-focus keys, handled per tab (status:
+        // handle_global_key; log: its own event); they never switch tabs
+        // — that's what 1/2/3 are for
         Ok(())
     }
 
@@ -2676,23 +2663,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         app.patches.set_dir(dir.clone());
 
-        // '2' is queued by the tree; Tab cycles log → patches → status
+        // '2' is queued by the tree; Tab toggles the log pane focus
+        // (list ↔ details), it never switches tabs (that's 1/2/3)
         app.handle_input(&ts_key(KeyCode::Char('2'))).unwrap();
         app.handle_queue_events();
         assert_eq!(app.active_tab, Tab::Log);
         app.handle_input(&ts_key(KeyCode::Tab)).unwrap();
-        assert_eq!(app.active_tab, Tab::Patches);
+        assert_eq!(app.active_tab, Tab::Log);
+        assert_eq!(app.log.focus, crate::components::log::LogPane::Detail);
         app.handle_input(&ts_key(KeyCode::Tab)).unwrap();
-        assert_eq!(app.active_tab, Tab::Status);
-        // Shift+Tab from patches goes back to the log tab
-        app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
-        assert_eq!(app.active_tab, Tab::Patches);
+        assert_eq!(app.log.focus, crate::components::log::LogPane::List);
+        // Shift+Tab toggles back too; in the patches tab Tab is a no-op
         let backtab = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::BackTab,
             crossterm::event::KeyModifiers::SHIFT,
         ));
         app.handle_input(&backtab).unwrap();
-        assert_eq!(app.active_tab, Tab::Log);
+        assert_eq!(app.log.focus, crate::components::log::LogPane::Detail);
+        app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
+        assert_eq!(app.active_tab, Tab::Patches);
+        app.handle_input(&ts_key(KeyCode::Tab)).unwrap();
+        assert_eq!(app.active_tab, Tab::Patches);
 
         // the patches tab draws (empty state) and the status bar lists it
         app.handle_input(&ts_key(KeyCode::Char('3'))).unwrap();
