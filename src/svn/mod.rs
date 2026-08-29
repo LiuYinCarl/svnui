@@ -12,7 +12,9 @@ use models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+
+/// One queued working-copy mutation, executed by the mutation worker.
+type MutationJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Result of a finished SVN background operation.
 #[derive(Clone, Debug)]
@@ -72,28 +74,67 @@ pub enum AsyncSvnNotification {
     ApplyPatch(Result<String, String>),
 }
 
-/// The SVN client. Cheap to clone (path + channel + shared lock).
+/// The SVN client. Cheap to clone (path + channels; clones share the
+/// same mutation queue).
 #[derive(Clone)]
 pub struct Svn {
     cwd: PathBuf,
     tx: Sender<AsyncSvnNotification>,
-    /// Serializes working-copy mutations (`add`, `commit`, `revert`,
-    /// `resolve`, `update`, `apply_patch`). Every op spawns its own worker
-    /// thread; without this lock two mutations could run concurrently —
-    /// e.g. an auto-staging `svn add` racing the following `svn commit` —
-    /// and svn fails those with E155004/E155010 for a legitimate action
-    /// sequence. Read-only ops (status/log/diff/blame/list) never touch
-    /// this lock. Clones share the same lock.
-    mutation_lock: Arc<Mutex<()>>,
+    /// FIFO queue feeding a single dedicated mutation worker thread.
+    /// Working-copy mutations (`add`, `commit`, `revert`, `resolve`,
+    /// `update`, `apply_patch`) must run one at a time AND in issue
+    /// order — e.g. an auto-staging `svn add` must finish before the
+    /// following `svn commit`, or svn fails with E155004/E155010 for a
+    /// legitimate action sequence. A mutex alone would not be enough:
+    /// it serializes execution but lets later-issued ops win the lock.
+    /// Read-only ops (status/log/diff/blame/list) bypass this queue and
+    /// each run on their own thread.
+    mutation_queue: Sender<MutationJob>,
 }
 
 impl Svn {
     pub fn new(cwd: PathBuf, tx: Sender<AsyncSvnNotification>) -> Self {
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<MutationJob>();
+        let worker_rx = job_rx.clone();
+        let worker = std::thread::Builder::new()
+            .name("svn-mutation-worker".to_string())
+            .spawn(move || {
+                // the worker exits when every Svn clone is dropped
+                while let Ok(job) = worker_rx.recv() {
+                    job();
+                }
+            });
+        if worker.is_err() {
+            // no worker: sends on mutation_queue will fail and the
+            // caller runs the job inline (see spawn_mutating)
+            drop(job_rx);
+        }
         Self {
             cwd,
             tx,
-            mutation_lock: Arc::new(Mutex::new(())),
+            mutation_queue: job_tx,
         }
+    }
+
+    /// Run `f`, converting a panic into the operation's error
+    /// notification, and deliver exactly one notification.
+    fn execute<F, E>(f: F, on_err: E, tx: &Sender<AsyncSvnNotification>)
+    where
+        F: FnOnce() -> AsyncSvnNotification,
+        E: FnOnce(String) -> AsyncSvnNotification,
+    {
+        let notif = match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(notif) => notif,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                on_err(format!("worker panicked: {msg}"))
+            }
+        };
+        let _ = tx.send(notif);
     }
 
     /// Run `f` on a worker thread and send its notification.
@@ -114,41 +155,28 @@ impl Svn {
         let worker_on_err = on_err.clone();
         let spawned = std::thread::Builder::new()
             .name("svn-worker".to_string())
-            .spawn(move || {
-                let notif = match std::panic::catch_unwind(AssertUnwindSafe(f)) {
-                    Ok(notif) => notif,
-                    Err(payload) => {
-                        let msg = payload
-                            .downcast_ref::<&str>()
-                            .map(|s| (*s).to_string())
-                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic".to_string());
-                        worker_on_err(format!("worker panicked: {msg}"))
-                    }
-                };
-                let _ = tx.send(notif);
-            });
+            .spawn(move || Self::execute(f, worker_on_err, &tx));
         if let Err(e) = spawned {
             let _ = self.tx.send(on_err(format!("failed to spawn worker: {e}")));
         }
     }
 
-    /// Like `spawn`, but holds the shared mutation lock while `f` runs.
+    /// Like `spawn`, but the job runs on the single mutation worker, so
+    /// mutations execute one at a time in the order they were issued.
     fn spawn_mutating<F, E>(&self, f: F, on_err: E)
     where
         F: FnOnce() -> AsyncSvnNotification + Send + 'static,
         E: FnOnce(String) -> AsyncSvnNotification + Send + Clone + 'static,
     {
-        let lock = self.mutation_lock.clone();
-        self.spawn(
-            move || {
-                // recover from poisoning: a panicked holder already
-                // reported its error via on_err, don't fail this op too
-                let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-                f()
-            },
-            on_err,
-        );
+        let tx = self.tx.clone();
+        let job: MutationJob = Box::new(move || Self::execute(f, on_err, &tx));
+        match self.mutation_queue.send(job) {
+            Ok(()) => {}
+            // the mutation worker was never started (thread spawn failed
+            // in `new`): run the job inline — still one-at-a-time in
+            // issue order, just on the calling thread
+            Err(crossbeam_channel::SendError(job)) => job(),
+        }
     }
 
     // ----- async entry points -----
@@ -1007,9 +1035,10 @@ mod tests {
         }
     }
 
-    /// The mutation lock must serialize `svn add` and a following
-    /// `svn commit` even when both are issued back-to-back; concurrent
-    /// execution fails with E155004/E155010.
+    /// The mutation worker must run `svn add` and a following
+    /// `svn commit` one at a time in issue order, even when both are
+    /// issued back-to-back; concurrent or reordered execution fails with
+    /// E155004/E155010.
     #[test]
     fn add_and_commit_are_serialized() {
         let Some(repo) = TestRepo::new() else { return };
