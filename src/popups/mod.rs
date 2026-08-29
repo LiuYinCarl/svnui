@@ -96,9 +96,6 @@ impl Popup {
     pub fn output(ctx: &Context, title: String, content: &str) -> Self {
         Popup::Output(OutputPopup::new(ctx, title, content))
     }
-    pub fn diff(ctx: &Context, title: String, content: &str) -> Self {
-        Popup::Diff(DiffPopup::new(ctx, title, content))
-    }
     pub fn blame(ctx: &Context, path: &str) -> Self {
         Popup::Blame(super::components::blame::BlamePopup::new(ctx, path))
     }
@@ -147,7 +144,7 @@ mod tests {
             Popup::msg(&c, "m".into(), false),
             Popup::help(&c),
             Popup::output(&c, "t".into(), "c"),
-            Popup::diff(&c, "t".into(), "c"),
+            Popup::Diff(DiffPopup::new(&c, "t".into(), "c")),
             Popup::blame(&c, "p"),
             Popup::file_log(&c, "p"),
             Popup::file_finder(&c),
@@ -208,7 +205,11 @@ mod tests {
         o.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();
 
-        let d = Popup::diff(&c, "d".into(), "Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n");
+        let d = Popup::Diff(DiffPopup::new(
+            &c,
+            "d".into(),
+            "Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n",
+        ));
         let t5 = ts::render(60, 10, |f| {
             d.draw(f, Rect::new(0, 0, 60, 10)).unwrap();
         });

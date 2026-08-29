@@ -218,46 +218,100 @@ fn parse_log_header(line: &str) -> Option<LogEntry> {
     })
 }
 
-/// Parse `svn blame` output.
+/// Parse `svn blame --xml` output into one author per line (None for
+/// uncommitted lines, which have no `<commit>` block). The XML is the only
+/// blame output where authors survive intact: the plain format truncates
+/// the author field to 10 bytes and cannot express names containing
+/// spaces. Only the flat, fixed structure is parsed — no XML library.
 ///
-/// Format (verified against svn 1.14): `%6s %10s %s`
-/// revision right-justified in 6, author right-justified in 10, content.
-/// Those are *minimum* widths: a long author (e.g. CJK, where 10 chars
-/// exceed 10 bytes) or a 7-digit revision pushes the content right, so
-/// parse by whitespace-separated tokens instead of fixed byte offsets.
-pub fn parse_blame(output: &str) -> Vec<BlameLine> {
-    let mut lines = Vec::new();
-    for raw in output.lines() {
-        let line = raw.trim_end_matches('\r');
-        let (rev_str, rest) = next_token(line);
-        if rev_str.is_empty() {
-            continue;
+/// ```xml
+/// <entry
+///    line-number="1">
+/// <commit
+///    revision="1">
+/// <author>Gabi Melman</author>
+/// ...
+/// ```
+pub fn parse_blame_xml(xml: &str) -> Vec<Option<String>> {
+    let mut authors = Vec::new();
+    for chunk in xml.split("<entry").skip(1) {
+        let author = chunk
+            .split_once("<author>")
+            .and_then(|(_, rest)| rest.split_once("</author>"))
+            .map(|(name, _)| xml_unescape(name));
+        authors.push(author);
+    }
+    authors
+}
+
+/// Replace the five predefined XML entities.
+fn xml_unescape(s: &str) -> String {
+    // &amp; first: it introduces the other entities' '&'
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+/// Overlay exact authors from `parse_blame_xml` onto text-parsed blame
+/// lines (matched by position). XML entries shorter than the text output
+/// leave the remaining lines untouched; a None entry (uncommitted line)
+/// also keeps the text-side author ("-").
+pub fn merge_blame_authors(lines: &mut [BlameLine], authors: &[Option<String>]) {
+    for (line, author) in lines.iter_mut().zip(authors.iter()) {
+        if let Some(a) = author {
+            line.author = a.clone();
         }
-        let (author, rest) = next_token(rest);
-        // exactly one separator space follows the author field; the file's
-        // own leading indentation stays in the content
-        let content = rest.strip_prefix(' ').unwrap_or(rest).to_string();
-        let revision = if rev_str == "-" {
+    }
+}
+
+/// Parse `svn blame` plain-text output (raw bytes).
+///
+/// Format (verified against svn 1.14): `%6s %10s %s` — revision
+/// right-justified in *min* 6 bytes (7-digit revisions overflow), one
+/// space, author right-justified in *exactly* 10 bytes (longer names are
+/// byte-truncated, possibly mid-CJK-char), one space, then the content.
+///
+/// Fixed byte columns are required: whitespace-token parsing mistakes an
+/// author containing a space ("Gabi Melma") for content. Fields are
+/// lossy-decoded individually so a mid-char truncation garbles only the
+/// author (overlaid by `parse_blame_xml` upstream), never the content.
+pub fn parse_blame(output: &[u8]) -> Vec<BlameLine> {
+    let mut lines = Vec::new();
+    for raw in output.split(|&b| b == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        // revision token: skip its leading padding, then read to the space
+        let Some(start) = line.iter().position(|&b| b != b' ') else {
+            continue;
+        };
+        let end = line[start..]
+            .iter()
+            .position(|&b| b == b' ')
+            .map(|i| start + i)
+            .unwrap_or(line.len());
+        let rev_str = &line[start..end];
+        // author field: exactly 10 bytes after one separator space
+        let author = String::from_utf8_lossy(line.get(end + 1..end + 11).unwrap_or(&[]))
+            .trim()
+            .to_string();
+        // content follows the author field plus one separator space; a
+        // short line (empty content) simply yields an empty string
+        let content = String::from_utf8_lossy(line.get(end + 12..).unwrap_or(&[])).into_owned();
+        let revision = if rev_str == b"-" {
             None
         } else {
-            rev_str.parse::<u64>().ok()
+            std::str::from_utf8(rev_str)
+                .ok()
+                .and_then(|s| s.parse().ok())
         };
         lines.push(BlameLine {
             revision,
-            author: author.to_string(),
+            author,
             content,
         });
     }
     lines
-}
-
-/// Split off the first space-delimited token, skipping leading spaces.
-fn next_token(s: &str) -> (&str, &str) {
-    let s = s.trim_start_matches(' ');
-    match s.find(' ') {
-        Some(end) => (&s[..end], &s[end..]),
-        None => (s, ""),
-    }
 }
 
 /// Parse `svn diff` output into line-numbered, colorizable lines.
@@ -626,7 +680,7 @@ r7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 1 line
 
     #[test]
     fn test_parse_blame() {
-        let out = "     3    kenshin fn main() {\n     -          -     indented\n";
+        let out = b"     3    kenshin fn main() {\n     -          -     indented\n";
         let lines = parse_blame(out);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].revision, Some(3));
@@ -638,18 +692,97 @@ r7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 1 line
     }
 
     #[test]
-    fn test_parse_blame_cjk_and_long_author() {
-        // CJK author exceeds 10 bytes; 7-digit revision overflows its
-        // 6-wide field — neither may break the column parsing
-        let out = "     3 张三李四王五 fn main() {\n1234567 verylongauthorname x = 1\n";
-        let lines = parse_blame(out);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].revision, Some(3));
-        assert_eq!(lines[0].author, "张三李四王五");
+    fn test_parse_blame_space_author_and_real_cjk_format() {
+        // authors with spaces keep the content intact (the 10-byte author
+        // column makes this unambiguous)
+        let lines = parse_blame(b"     5 Gabi Melma hello\n");
+        assert_eq!(lines[0].author, "Gabi Melma");
+        assert_eq!(lines[0].content, "hello");
+
+        // real svn output: the author field is exactly 10 bytes — short
+        // CJK names are left-padded, long names are byte-truncated
+        // (possibly mid-char); a 7-digit revision shifts everything right
+        let mut out = Vec::new();
+        out.extend_from_slice(b"     3     "); // rev + sep + 4 pad bytes
+        out.extend_from_slice("张三".as_bytes()); // 6 bytes: field full
+        out.extend_from_slice(b" fn main() {\n");
+        // author 张三李四 (12 bytes) truncated to its first 10: the cut
+        // lands inside 四 (e5 9b 9b)
+        out.extend_from_slice(b"     4 ");
+        out.extend_from_slice(&[0xe5, 0xbc, 0xa0, 0xe4, 0xb8, 0x89, 0xe6, 0x9d, 0x8e, 0xe5]);
+        out.extend_from_slice(b" x = 1\n");
+        out.extend_from_slice(b"1234567 verylongau y = 2\n");
+        let lines = parse_blame(&out);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].author, "张三");
         assert_eq!(lines[0].content, "fn main() {");
-        assert_eq!(lines[1].revision, Some(1234567));
-        assert_eq!(lines[1].author, "verylongauthorname");
+        // a mid-char cut garbles only the author, never the content
+        assert_eq!(lines[1].author, "张三李\u{FFFD}");
         assert_eq!(lines[1].content, "x = 1");
+        assert_eq!(lines[2].revision, Some(1234567));
+        assert_eq!(lines[2].author, "verylongau");
+        assert_eq!(lines[2].content, "y = 2");
+    }
+
+    #[test]
+    fn test_parse_blame_xml_and_merge() {
+        let xml = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<blame>
+<target
+   path=\"f.txt\">
+<entry
+   line-number=\"1\">
+<commit
+   revision=\"1\">
+<author>Gabi Melman</author>
+<date>2026-08-29T15:43:00.081617Z</date>
+</commit>
+</entry>
+<entry
+   line-number=\"2\">
+</entry>
+<entry
+   line-number=\"3\">
+<commit
+   revision=\"3\">
+<author>张 &amp; 三</author>
+<date>2026-08-29T15:43:02.062569Z</date>
+</commit>
+</entry>
+</target>
+</blame>";
+        let authors = parse_blame_xml(xml);
+        assert_eq!(authors.len(), 3);
+        assert_eq!(authors[0].as_deref(), Some("Gabi Melman"));
+        assert_eq!(authors[1], None); // uncommitted line: no <commit>
+        assert_eq!(authors[2].as_deref(), Some("张 & 三")); // entities decoded
+
+        let mut lines = vec![
+            BlameLine {
+                revision: Some(1),
+                author: "Gabi Melma".into(),
+                content: "a".into(),
+            },
+            BlameLine {
+                revision: None,
+                author: "-".into(),
+                content: "b".into(),
+            },
+            BlameLine {
+                revision: Some(3),
+                author: "garbled".into(),
+                content: "c".into(),
+            },
+        ];
+        merge_blame_authors(&mut lines, &authors);
+        assert_eq!(lines[0].author, "Gabi Melman");
+        assert_eq!(lines[1].author, "-", "uncommitted keeps the text side");
+        assert_eq!(lines[2].author, "张 & 三");
+        // absent/short xml leaves everything untouched
+        let mut same = lines.clone();
+        merge_blame_authors(&mut same, &[]);
+        assert_eq!(same[0].author, "Gabi Melman");
     }
 
     #[test]
@@ -786,9 +919,9 @@ Index: f
 
     #[test]
     fn test_parse_blame_empty_output() {
-        assert!(parse_blame("").is_empty());
+        assert!(parse_blame(b"").is_empty());
         // whitespace-only lines carry no revision token either
-        assert!(parse_blame("\n   \n").is_empty());
+        assert!(parse_blame(b"\n   \n").is_empty());
     }
 }
 

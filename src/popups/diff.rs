@@ -3,6 +3,7 @@
 use super::super::components::{
     Context, DrawableComponent, EventState,
     diff_view::{DiffView, draw_diff_block},
+    text_search::EscAction,
 };
 use crate::keys::{KeyAction, key_match};
 use crate::queue::InternalEvent;
@@ -42,11 +43,7 @@ impl DrawableComponent for DiffPopup {
         if let Event::Key(k) = ev
             && key_match(k, KeyAction::ClosePopup)
         {
-            if self.view.search.is_input_mode() {
-                self.view.search.cancel();
-            } else if self.view.search.is_active() {
-                self.view.search.clear();
-            } else {
+            if self.view.search.esc() == EscAction::ClosePopup {
                 self.ctx.queue.push(InternalEvent::ClosePopup);
             }
             return Ok(EventState::consumed());

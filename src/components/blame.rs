@@ -1,6 +1,6 @@
 //! Blame popup: shows `svn blame` output with per-revision coloring.
 
-use super::text_search::{InputOutcome, TextSearch, highlight_spans};
+use super::text_search::{EscAction, InputOutcome, TextSearch, highlight_spans};
 use super::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
 use crate::queue::InternalEvent;
@@ -13,6 +13,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear};
 use std::cell::Cell;
+use unicode_width::UnicodeWidthStr;
 
 pub struct BlamePopup {
     ctx: Context,
@@ -27,6 +28,8 @@ pub struct BlamePopup {
     hscroll: Cell<usize>,
     /// Display width of the widest rendered line (for clamping)
     max_width: Cell<usize>,
+    /// Display column width of the author field (widest author in the file)
+    author_w: Cell<usize>,
     /// Incremental search over the blame content (`/`, n/N)
     pub search: TextSearch,
 }
@@ -42,21 +45,26 @@ impl BlamePopup {
             selected: Cell::new(0),
             hscroll: Cell::new(0),
             max_width: Cell::new(0),
+            author_w: Cell::new(0),
             search: TextSearch::new(),
         }
     }
 
     pub fn update(&mut self, lines: Vec<BlameLine>) {
-        use unicode_width::UnicodeWidthStr;
         self.pending = false;
-        // rendered line: 7-col revision + space + author + 2 spaces + content
+        // the author column is padded to the widest author in the file so
+        // the content stays left-aligned
+        let author_w = lines
+            .iter()
+            .map(|l| UnicodeWidthStr::width(l.author.as_str()))
+            .max()
+            .unwrap_or(0);
+        self.author_w.set(author_w);
+        // rendered line: 7-col revision + space + author_w + 2 spaces + content
         self.max_width.set(
             lines
                 .iter()
-                .map(|l| {
-                    10 + UnicodeWidthStr::width(l.author.as_str())
-                        + UnicodeWidthStr::width(l.content.as_str())
-                })
+                .map(|l| 10 + author_w + UnicodeWidthStr::width(l.content.as_str()))
                 .max()
                 .unwrap_or(0),
         );
@@ -83,11 +91,7 @@ impl BlamePopup {
         if let Event::Key(k) = ev
             && key_match(k, KeyAction::ClosePopup)
         {
-            if self.search.is_input_mode() {
-                self.search.cancel();
-            } else if self.search.is_active() {
-                self.search.clear();
-            } else {
+            if self.search.esc() == EscAction::ClosePopup {
                 self.ctx.queue.push(InternalEvent::ClosePopup);
             }
             return Ok(EventState::consumed());
@@ -178,7 +182,10 @@ impl DrawableComponent for BlamePopup {
 
         if self.pending {
             f.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(Span::styled("Loading...", theme.dim))),
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    crate::strings::MSG.loading,
+                    theme.dim,
+                ))),
                 inner,
             );
             return Ok(());
@@ -196,19 +203,7 @@ impl DrawableComponent for BlamePopup {
 
         // Virtualized rendering: only build the visible window of lines.
         // While a search is active the bottom row is a `/pattern` footer.
-        let (inner, footer) = if self.search.is_active() && inner.height > 1 {
-            (
-                Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
-                Some(Rect::new(
-                    inner.x,
-                    inner.y + inner.height - 1,
-                    inner.width,
-                    1,
-                )),
-            )
-        } else {
-            (inner, None)
-        };
+        let (inner, footer) = ui::split_search_footer(inner, self.search.is_active());
         let total = self.lines.len();
         let selected = ui::clamp_index(self.selected.get(), total);
         self.selected.set(selected);
@@ -226,13 +221,20 @@ impl DrawableComponent for BlamePopup {
         let mut lines: Vec<Line> = Vec::with_capacity(end - scroll);
         for i in scroll..end {
             let (ranges, current) = self.search.line_ranges(i);
-            lines.push(blame_line(&self.lines[i], theme, &ranges, current));
+            lines.push(blame_line(
+                &self.lines[i],
+                theme,
+                &ranges,
+                current,
+                self.author_w.get(),
+            ));
         }
         // clamp the horizontal offset against the widest line
-        let h_off = self
-            .hscroll
-            .get()
-            .min(self.max_width.get().saturating_sub(inner.width as usize));
+        let h_off = ui::clamp_hscroll(
+            self.hscroll.get(),
+            self.max_width.get(),
+            inner.width as usize,
+        );
         self.hscroll.set(h_off);
         // `lines` is the pre-sliced window, so the highlight index is
         // relative to it
@@ -256,6 +258,7 @@ fn blame_line(
     theme: &Theme,
     matches: &[(usize, usize)],
     current: Option<usize>,
+    author_w: usize,
 ) -> Line<'static> {
     let mut spans = Vec::new();
     match bl.revision {
@@ -268,7 +271,15 @@ fn blame_line(
         }
     }
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(bl.author.clone(), theme.blame_author));
+    // pad to the file's widest author (unicode-width aware) so contents
+    // line up in one column
+    let aw = UnicodeWidthStr::width(bl.author.as_str());
+    let author = if aw >= author_w {
+        bl.author.clone()
+    } else {
+        format!("{}{}", bl.author, " ".repeat(author_w - aw))
+    };
+    spans.push(Span::styled(author, theme.blame_author));
     spans.push(Span::raw("  "));
     // search hits inside the content get the hit styles
     spans.extend(highlight_spans(
@@ -384,6 +395,28 @@ mod tests {
         b.update(vec![line(Some(1), "a", "x")]);
         assert_eq!(b.hscroll.get(), 0);
         assert_eq!(b.max_width.get(), 12);
+    }
+
+    #[test]
+    fn author_column_padded_to_widest() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut b = BlamePopup::new(&ctx, "f");
+        b.update(vec![
+            line(Some(1), "al", "short"),
+            line(Some(2), "Gabi Melman", "x"),
+        ]);
+        assert_eq!(b.author_w.get(), 11);
+        let t = ts::render(60, 6, |f| {
+            b.draw(f, Rect::new(0, 0, 60, 6)).unwrap();
+        });
+        let buf = t.backend().buffer();
+        // content column: 1 (border) + 7 (rev) + 1 + 11 (author) + 2 = 22
+        assert_eq!(buf[(22, 1)].symbol(), "s", "short content");
+        assert_eq!(buf[(22, 2)].symbol(), "x", "long-author content");
     }
 
     fn blame_with_lines() -> (BlamePopup, crate::queue::Queue) {

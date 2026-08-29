@@ -272,15 +272,6 @@ impl DiffView {
             self.scroll.set(line);
         }
     }
-
-    /// Build the styled lines for this diff.
-    pub fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
-        let mut out = Vec::with_capacity(self.parsed.lines.len());
-        for dl in &self.parsed.lines {
-            out.push(diff_line(dl, theme, &[], None));
-        }
-        out
-    }
 }
 
 /// Build a single styled diff line with line numbers.
@@ -341,7 +332,7 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
         theme.border_unfocused
     };
     let title = if view.pending {
-        format!("{}  (loading…)", view.title)
+        format!("{}  {}", view.title, crate::strings::MSG.loading_suffix)
     } else {
         view.title.clone()
     };
@@ -361,7 +352,10 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     }
     if view.pending {
         f.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(Span::styled("Loading...", theme.dim))),
+            ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                crate::strings::MSG.loading,
+                theme.dim,
+            ))),
             inner,
         );
         return;
@@ -396,27 +390,16 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     // Virtualized rendering: only the visible window of lines is built, so
     // drawing a huge diff costs O(screen height), not O(diff size).
     // While a search is active the bottom row is a `/pattern [x/y]` footer.
-    let (inner, footer) = if view.search.is_active() && inner.height > 1 {
-        (
-            Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
-            Some(Rect::new(
-                inner.x,
-                inner.y + inner.height - 1,
-                inner.width,
-                1,
-            )),
-        )
-    } else {
-        (inner, None)
-    };
+    let (inner, footer) = ui::split_search_footer(inner, view.search.is_active());
     let total = view.parsed.lines.len();
     let scroll = ui::clamp_scroll(view.scroll.get(), total, inner.height as usize);
     view.scroll.set(scroll);
     // clamp the horizontal offset against the widest line
-    let h_off = view
-        .hscroll
-        .get()
-        .min(view.max_width.get().saturating_sub(inner.width as usize));
+    let h_off = ui::clamp_hscroll(
+        view.hscroll.get(),
+        view.max_width.get(),
+        inner.width as usize,
+    );
     view.hscroll.set(h_off);
     let end = (scroll + inner.height as usize).min(total);
     let mut lines = Vec::with_capacity(end - scroll);
@@ -588,7 +571,12 @@ Index: Cargo.toml
         assert_eq!(add.kind, DiffLineKind::Added);
         assert_eq!(add.new, Some(2));
         let theme = Theme::default();
-        let lines = v.lines(&theme);
+        let lines: Vec<Line> = v
+            .parsed
+            .lines
+            .iter()
+            .map(|dl| diff_line(dl, &theme, &[], None))
+            .collect();
         assert!(lines.len() >= 7);
         // line numbers rendered
         let rendered = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();

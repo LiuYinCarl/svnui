@@ -23,6 +23,21 @@ pub fn clamp_index(idx: usize, len: usize) -> usize {
     idx.min(len - 1)
 }
 
+/// Adjust `scroll` so `selection` stays inside the visible window of
+/// `view_h` rows, scrolling minimally; the result is clamped against the
+/// content length `len` via [`clamp_scroll`].
+pub fn scroll_follow(selection: usize, scroll: usize, len: usize, view_h: usize) -> usize {
+    let mut scroll = scroll;
+    if view_h > 0 {
+        if selection < scroll {
+            scroll = selection;
+        } else if selection >= scroll + view_h {
+            scroll = selection - view_h + 1;
+        }
+    }
+    clamp_scroll(scroll, len, view_h)
+}
+
 /// Render a slice of styled lines into `area` with a scroll offset.
 /// `highlights` is a list of (line index, style) applied as full-width
 /// backgrounds before drawing the text (used for selection & staged marks).
@@ -105,6 +120,31 @@ fn slice_line_left(line: &Line, skip: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Clamp a horizontal scroll offset so the view cannot scroll past the
+/// right edge of the widest line.
+pub fn clamp_hscroll(hscroll: usize, max_width: usize, width: usize) -> usize {
+    hscroll.min(max_width.saturating_sub(width))
+}
+
+/// Split off a one-row footer (e.g. the `/pattern` search line) from the
+/// bottom of `inner` when `active`. Returns the (shrunk) content area and
+/// the footer rect.
+pub fn split_search_footer(inner: Rect, active: bool) -> (Rect, Option<Rect>) {
+    if active && inner.height > 1 {
+        (
+            Rect::new(inner.x, inner.y, inner.width, inner.height - 1),
+            Some(Rect::new(
+                inner.x,
+                inner.y + inner.height - 1,
+                inner.width,
+                1,
+            )),
+        )
+    } else {
+        (inner, None)
+    }
+}
+
 /// Compute a centered popup rect with the given width/height constraints.
 pub fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     // u32 intermediates: `width * percent` overflows u16 on wide terminals
@@ -153,6 +193,22 @@ mod tests {
     }
 
     #[test]
+    fn scroll_follow_keeps_selection_visible() {
+        // selection above the window pulls the scroll up
+        assert_eq!(scroll_follow(2, 5, 50, 10), 2);
+        // selection below the window pulls the scroll down
+        assert_eq!(scroll_follow(15, 5, 50, 10), 6);
+        // selection inside the window: scroll unchanged
+        assert_eq!(scroll_follow(7, 5, 50, 10), 5);
+        // clamped against the content length
+        assert_eq!(scroll_follow(49, 45, 50, 10), 40);
+        // zero-height view: no follow, just the clamp
+        assert_eq!(scroll_follow(3, 7, 50, 0), 0);
+        // content shorter than the view: scroll resets to 0
+        assert_eq!(scroll_follow(0, 3, 5, 10), 0);
+    }
+
+    #[test]
     fn popup_area_centered_and_bounded() {
         let r = popup_area(Rect::new(0, 0, 100, 40), 50, 50);
         assert_eq!(r.width, 50);
@@ -184,6 +240,26 @@ mod tests {
             seen.insert(spinner_frame(i));
         }
         assert_eq!(seen.len(), 10);
+    }
+
+    #[test]
+    fn clamp_hscroll_bounds_at_widest_line() {
+        assert_eq!(clamp_hscroll(100, 50, 20), 30);
+        assert_eq!(clamp_hscroll(10, 50, 20), 10);
+        // content narrower than the view: no scrolling at all
+        assert_eq!(clamp_hscroll(10, 10, 20), 0);
+    }
+
+    #[test]
+    fn split_search_footer_carves_bottom_row() {
+        let inner = Rect::new(1, 2, 40, 10);
+        let (content, footer) = split_search_footer(inner, true);
+        assert_eq!(content, Rect::new(1, 2, 40, 9));
+        assert_eq!(footer, Some(Rect::new(1, 11, 40, 1)));
+        // inactive or too small: the area is returned untouched
+        assert_eq!(split_search_footer(inner, false), (inner, None));
+        let tiny = Rect::new(1, 2, 40, 1);
+        assert_eq!(split_search_footer(tiny, true), (tiny, None));
     }
 
     #[test]

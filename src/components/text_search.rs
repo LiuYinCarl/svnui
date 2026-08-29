@@ -9,9 +9,9 @@
 //!   view scrolls to the first match at or after the current scroll offset.
 //! - `Enter` leaves input mode but keeps the highlights; `n`/`N` then cycle
 //!   the current match (wrapping) and update the `[x/y]` counter.
-//! - `Esc` in input mode cancels the search (pattern + highlights cleared);
-//!   `Esc` with confirmed highlights clears them; a further `Esc` closes
-//!   the popup (handled by the popup, which owns the close action).
+//! - the Esc three-state lives in [`TextSearch::esc`]: cancel the input,
+//!   clear confirmed highlights, or — with no search state — signal the
+//!   popup to close (the popup owns the close action).
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::style::Style;
@@ -36,6 +36,18 @@ pub enum InputOutcome {
     Cancelled,
     /// Event ignored (e.g. cursor keys); input mode continues.
     Ignored,
+}
+
+/// What an Esc keypress did, given the search state (the three-state Esc
+/// shared by the fullscreen diff popup and the blame popup).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscAction {
+    /// In input mode: the input was cancelled (pattern + highlights dropped).
+    CancelInput,
+    /// Confirmed highlights were showing and are now cleared.
+    ClearHighlights,
+    /// No search state at all: the caller should close the popup.
+    ClosePopup,
 }
 
 /// Incremental-search state: pattern, matches and the current-match cursor.
@@ -83,6 +95,21 @@ impl TextSearch {
     /// Cancel the search: leave input mode, drop pattern and highlights.
     pub fn cancel(&mut self) {
         self.clear();
+    }
+
+    /// The Esc three-state shared by the scrollable text popups: cancel an
+    /// in-progress input, clear confirmed highlights, or — with no search
+    /// state at all — signal that the popup itself should close.
+    pub fn esc(&mut self) -> EscAction {
+        if self.is_input_mode() {
+            self.cancel();
+            EscAction::CancelInput
+        } else if self.is_active() {
+            self.clear();
+            EscAction::ClearHighlights
+        } else {
+            EscAction::ClosePopup
+        }
     }
 
     /// Drop pattern, matches and input mode.
@@ -390,6 +417,23 @@ mod tests {
         assert!(!s2.is_input_mode());
         assert!(!s2.is_active());
         assert_eq!(s2.match_count(), 0);
+    }
+
+    #[test]
+    fn esc_three_states() {
+        // input mode: cancel
+        let mut s = search_with("foo", 0);
+        assert!(s.is_input_mode());
+        assert_eq!(s.esc(), EscAction::CancelInput);
+        assert!(!s.is_active());
+        // confirmed highlights: clear, popup stays open
+        let mut s = search_with("foo", 0);
+        s.input_event(&ts::key(KeyCode::Enter));
+        assert!(s.is_active());
+        assert_eq!(s.esc(), EscAction::ClearHighlights);
+        assert!(!s.is_active());
+        // no search state: the caller closes the popup
+        assert_eq!(s.esc(), EscAction::ClosePopup);
     }
 
     #[test]

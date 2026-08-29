@@ -144,7 +144,10 @@ impl DrawableComponent for FileFinderPopup {
 
         if self.pending {
             f.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(Span::styled("Loading...", theme.dim))),
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    crate::strings::MSG.loading,
+                    theme.dim,
+                ))),
                 chunks[1],
             );
             return Ok(());
@@ -161,15 +164,12 @@ impl DrawableComponent for FileFinderPopup {
         }
 
         let view_h = chunks[1].height as usize;
-        let mut scroll = self.scroll.get();
-        if view_h > 0 {
-            if self.selection < scroll {
-                scroll = self.selection;
-            } else if self.selection >= scroll + view_h {
-                scroll = self.selection - view_h + 1;
-            }
-        }
-        scroll = ui::clamp_scroll(scroll, self.filtered.len(), view_h);
+        let scroll = ui::scroll_follow(
+            self.selection,
+            self.scroll.get(),
+            self.filtered.len(),
+            view_h,
+        );
         self.scroll.set(scroll);
 
         let end = (scroll + view_h).min(self.filtered.len());

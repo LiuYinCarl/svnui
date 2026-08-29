@@ -89,7 +89,10 @@ impl DrawableComponent for FileLogPopup {
 
         if self.pending {
             f.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(Span::styled("Loading...", theme.dim))),
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    crate::strings::MSG.loading,
+                    theme.dim,
+                ))),
                 inner,
             );
             return Ok(());
@@ -116,16 +119,8 @@ impl DrawableComponent for FileLogPopup {
             .iter()
             .map(|e| revision_line(e, theme))
             .collect();
-        let mut scroll = self.scroll.get();
         let view_h = chunks[0].height as usize;
-        if view_h > 0 {
-            if self.selection < scroll {
-                scroll = self.selection;
-            } else if self.selection >= scroll + view_h {
-                scroll = self.selection - view_h + 1;
-            }
-        }
-        scroll = ui::clamp_scroll(scroll, lines.len(), view_h);
+        let scroll = ui::scroll_follow(self.selection, self.scroll.get(), lines.len(), view_h);
         self.scroll.set(scroll);
         let highlights = vec![(self.selection, Style::default().bg(theme.selection_bg))];
         ui::render_lines(f, chunks[0], &lines, scroll, &highlights);

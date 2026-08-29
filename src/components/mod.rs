@@ -9,6 +9,7 @@ pub mod help;
 pub mod log;
 pub mod log_search;
 pub mod patches;
+pub mod repo_info;
 pub mod status_filter;
 pub mod status_tree;
 pub mod text_search;

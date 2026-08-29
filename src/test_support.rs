@@ -12,7 +12,6 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// A temporary SVN repository + working copy, cleaned up on drop.
 pub struct TestRepo {
     dir: PathBuf,
-    #[allow(dead_code)]
     pub repo: PathBuf,
     pub wc: PathBuf,
 }

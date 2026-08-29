@@ -106,7 +106,8 @@ impl StatusTab {
     }
 
     /// Request a diff for the currently selected file if it changed.
-    /// Returns true when a request was issued (caller bumps pending counter).
+    /// Returns the path when a request was issued (caller bumps the
+    /// pending counter).
     pub fn maybe_request_diff(&mut self) -> Option<String> {
         let sel = self.tree.selection_path();
         let is_file = self.tree.selection_entry().is_some();

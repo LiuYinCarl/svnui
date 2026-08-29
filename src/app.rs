@@ -3,8 +3,9 @@
 
 use crate::components::{
     Context, DrawableComponent, diff_view,
-    log::LogComponent,
+    log::{self, LogComponent},
     patches::{self, PatchesComponent},
+    repo_info,
 };
 use crate::keys::{KeyAction, key_match};
 use crate::popups::{DiffPopup, OutputPopup, Popup};
@@ -36,160 +37,6 @@ fn patch_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-/// Compose the repo-info popup lines (global `i`): local `svn info`, the
-/// remote HEAD comparison, and a working-copy change summary. Important
-/// values are styled: section headers bold, revisions yellow, authors
-/// cyan, the behind/up-to-date state yellow/green, status counts in
-/// their usual status colors.
-fn repo_info_lines(
-    local: &SvnInfo,
-    head: Option<&SvnInfo>,
-    tree: &crate::components::status_tree::StatusTreeComponent,
-    theme: &crate::ui::style::Theme,
-) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let section = |out: &mut Vec<Line<'static>>, title: &str| {
-        if !out.is_empty() {
-            out.push(Line::default());
-        }
-        out.push(Line::from(Span::styled(
-            title.to_string(),
-            theme.diff_header,
-        )));
-    };
-    let field = |label: &str, value: Span<'static>| {
-        Line::from(vec![
-            Span::styled(format!("  {label:<15}"), theme.dim),
-            value,
-        ])
-    };
-    let changed_spans = |prefix: &str, rev: u64, author: &str, date: &str| {
-        Line::from(vec![
-            Span::styled(format!("  {prefix:<15}"), theme.dim),
-            Span::styled(format!("r{rev}"), theme.log_revision),
-            Span::styled(" by ", theme.dim),
-            Span::styled(author.to_string(), theme.log_author),
-            Span::styled(format!(" ({date})"), theme.dim),
-        ])
-    };
-
-    section(&mut out, "Working copy");
-    out.push(field(
-        "Path:",
-        Span::styled(local.wc_root.clone(), theme.text),
-    ));
-    out.push(field("URL:", Span::styled(local.url.clone(), theme.text)));
-    out.push(field(
-        "Branch:",
-        Span::styled(local.branch_label().to_string(), theme.log_author),
-    ));
-    out.push(field(
-        "Revision:",
-        Span::styled(format!("r{}", local.revision), theme.log_revision),
-    ));
-    if local.last_rev > 0 {
-        out.push(changed_spans(
-            "Last changed:",
-            local.last_rev,
-            &local.last_author,
-            &local.last_date,
-        ));
-    }
-
-    section(&mut out, "Repository");
-    out.push(field(
-        "Root:",
-        Span::styled(local.repo_root.clone(), theme.text),
-    ));
-    out.push(field("UUID:", Span::styled(local.uuid.clone(), theme.text)));
-    match head {
-        Some(h) => {
-            // SVN wcs are mixed-revision; this compares the root BASE
-            let state = if h.revision > local.revision {
-                Span::styled(
-                    format!(
-                        "  (working copy is {} revisions behind)",
-                        h.revision - local.revision
-                    ),
-                    theme.status_modified,
-                )
-            } else {
-                Span::styled("  (up to date)".to_string(), theme.status_added)
-            };
-            out.push(Line::from(vec![
-                Span::styled(format!("  {:<15}", "HEAD:"), theme.dim),
-                Span::styled(format!("r{}", h.revision), theme.log_revision),
-                state,
-            ]));
-            if h.last_rev > 0 {
-                out.push(changed_spans(
-                    "Last commit:",
-                    h.last_rev,
-                    &h.last_author,
-                    &h.last_date,
-                ));
-            }
-        }
-        None => {
-            out.push(field(
-                "HEAD:",
-                Span::styled("unknown (repository unreachable)".to_string(), theme.error),
-            ));
-        }
-    }
-
-    section(&mut out, "Working copy changes");
-    let mut counts: std::collections::BTreeMap<char, usize> = Default::default();
-    for (c, _) in tree.changed_files() {
-        *counts.entry(c).or_default() += 1;
-    }
-    let labels = [
-        ('M', "modified"),
-        ('A', "added"),
-        ('D', "deleted"),
-        ('C', "conflicted"),
-        ('!', "missing"),
-        ('?', "unversioned"),
-    ];
-    let mut known = 0;
-    // (text, style of the count) pairs joined by dim separators
-    let mut parts: Vec<(String, Option<char>)> = Vec::new();
-    for (c, label) in labels {
-        if let Some(n) = counts.get(&c) {
-            known += n;
-            parts.push((format!("{n} {label}"), Some(c)));
-        }
-    }
-    let total: usize = counts.values().sum();
-    if total > known {
-        parts.push((format!("{} other", total - known), None));
-    }
-    if parts.is_empty() {
-        out.push(Line::from(Span::styled(
-            "  clean".to_string(),
-            theme.status_added,
-        )));
-    } else {
-        let mut spans = vec![Span::raw("  ")];
-        for (i, (text, c)) in parts.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(", ", theme.dim));
-            }
-            let style = c.map(|c| theme.status_style(c)).unwrap_or(theme.text);
-            spans.push(Span::styled(text.clone(), style));
-        }
-        out.push(Line::from(spans));
-    }
-    let staged = tree.staged_count();
-    if staged > 0 {
-        out.push(Line::from(vec![
-            Span::styled("  Staged for commit: ".to_string(), theme.dim),
-            Span::styled(staged.to_string(), theme.diff_added),
-        ]));
-    }
-    out
 }
 
 /// Cap for the patch preview: the file is read and parsed synchronously
@@ -280,37 +127,11 @@ impl App {
     }
 
     /// Full commit info of a log entry: revision, author, date, the
-    /// complete message and the changed paths (scrollable popup, styled
-    /// like the log tab: revision yellow, author cyan, action chars in
-    /// their A/D/M colors).
+    /// complete message and the changed paths (scrollable popup). Shares
+    /// the line building of the log tab's detail pane
+    /// (`log::log_entry_lines`).
     fn show_commit_info(&mut self, entry: &LogEntry) {
-        let theme = &self.ctx.theme;
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled(format!("r{}", entry.revision), theme.log_revision),
-            Span::styled(" | ", theme.dim),
-            Span::styled(entry.author.clone(), theme.log_author),
-            Span::styled(" | ", theme.dim),
-            Span::styled(entry.date.clone(), theme.dim),
-        ]));
-        if !entry.changed.is_empty() {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Changed paths:",
-                theme.diff_header,
-            )));
-            for (action, path) in &entry.changed {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {action}"), theme.log_action_style(*action)),
-                    Span::styled(format!("  {path}"), theme.text),
-                ]));
-            }
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled("Message:", theme.diff_header)));
-        for l in entry.message.trim_end().lines() {
-            lines.push(Line::from(Span::styled(l.to_string(), theme.text)));
-        }
+        let lines = log::log_entry_lines(entry, &self.ctx.theme);
         let ctx = self.ctx.clone();
         self.push_popup(Popup::Output(OutputPopup::from_lines(
             &ctx,
@@ -366,10 +187,9 @@ impl App {
             let ctx = self.ctx.clone();
             self.push_popup(Popup::help(&ctx));
         } else if key_match(k, KeyAction::OpenFileFinder) {
-            let ctx = self.ctx.clone();
-            self.push_popup(Popup::file_finder(&ctx));
-            self.svn.list_files();
-            self.pending += 1;
+            // routed through the queue like every other component request
+            // (drained by `handle_queue_events` right after `handle_input`)
+            self.queue.push(InternalEvent::OpenFileFinder);
         } else if key_match(k, KeyAction::SavePatch) {
             self.svn.create_patch();
             self.pending += 1;
@@ -438,11 +258,12 @@ impl App {
     fn handle_internal(&mut self, ev: InternalEvent) {
         match ev {
             InternalEvent::Update(flags) => {
-                if flags.contains(NeedsUpdate::STATUS) || flags.contains(NeedsUpdate::ALL) {
+                // ALL = STATUS | LOG, so a plain `contains` covers it
+                if flags.contains(NeedsUpdate::STATUS) {
                     self.svn.status();
                     self.pending += 1;
                 }
-                if flags.contains(NeedsUpdate::LOG) || flags.contains(NeedsUpdate::ALL) {
+                if flags.contains(NeedsUpdate::LOG) {
                     self.svn.log(50);
                     self.pending += 1;
                 }
@@ -789,8 +610,13 @@ impl App {
             AsyncSvnNotification::RepoInfo(result) => match result {
                 Ok(pair) => {
                     let (local, head) = *pair;
-                    let lines =
-                        repo_info_lines(&local, head.as_ref(), &self.status.tree, &self.ctx.theme);
+                    let lines = repo_info::repo_info_lines(
+                        &local,
+                        head.as_ref(),
+                        &self.status.tree.changed_files(),
+                        self.status.tree.staged_count(),
+                        &self.ctx.theme,
+                    );
                     let ctx = self.ctx.clone();
                     self.push_popup(Popup::Output(OutputPopup::from_lines(
                         &ctx,
@@ -1994,73 +1820,6 @@ mod tests {
         assert!(m.message.contains("boom"), "{}", m.message);
     }
 
-    fn bare_tree() -> crate::components::status_tree::StatusTreeComponent {
-        let ctx = Context {
-            queue: Queue::new(),
-            theme: Theme::default(),
-        };
-        crate::components::status_tree::StatusTreeComponent::new(&ctx)
-    }
-
-    fn lines_text(lines: &[Line]) -> String {
-        lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn repo_info_lines_clean_and_up_to_date() {
-        let tree = bare_tree();
-        let theme = Theme::default();
-        // head not newer than the local revision → "(up to date)"
-        let mut head = test_info();
-        head.revision = 3;
-        let text = lines_text(&repo_info_lines(&test_info(), Some(&head), &tree, &theme));
-        assert!(text.contains("HEAD:          r3"), "{text}");
-        assert!(text.contains("(up to date)"), "{text}");
-        assert!(!text.contains("revisions behind"), "{text}");
-        // no changed files → the summary line says "clean"
-        assert!(text.contains("clean"), "{text}");
-        assert!(!text.contains("Staged for commit"), "{text}");
-    }
-
-    #[test]
-    fn repo_info_lines_unknown_statuses_counted_as_other() {
-        let mut tree = bare_tree();
-        // status chars without a label ('I' ignored, '~' obstructed)
-        tree.update(vec![entry('I', "ignored.o"), entry('~', "blocked.txt")]);
-        let text = lines_text(&repo_info_lines(
-            &test_info(),
-            Some(&test_info()),
-            &tree,
-            &Theme::default(),
-        ));
-        assert!(text.contains("2 other"), "{text}");
-        // no labeled breakdown for unknown statuses
-        assert!(!text.contains("modified"), "{text}");
-    }
-
-    #[test]
-    fn repo_info_lines_omit_last_changed_when_rev_zero() {
-        let tree = bare_tree();
-        // an uncommitted / fresh node has no last-changed triple
-        let mut local = test_info();
-        local.last_rev = 0;
-        local.last_author = String::new();
-        local.last_date = String::new();
-        let text = lines_text(&repo_info_lines(
-            &local,
-            Some(&test_info()),
-            &tree,
-            &Theme::default(),
-        ));
-        assert!(!text.contains("Last changed:"), "{text}");
-        // the head's own last-commit line is independent and still shown
-        assert!(text.contains("Last commit:"), "{text}");
-    }
-
     #[test]
     fn commit_confirm_shows_branch_and_file_list() {
         let Some(repo) = TestRepo::new() else { return };
@@ -2502,6 +2261,9 @@ mod tests {
             crossterm::event::KeyModifiers::CONTROL,
         ));
         app.handle_input(&ctrl_p).unwrap();
+        // Ctrl+p pushes OpenFileFinder onto the queue; the main loop drains
+        // it right after handle_input
+        app.handle_queue_events();
         assert!(matches!(app.popups.last(), Some(Popup::FileFinder(_))));
     }
 

@@ -32,6 +32,7 @@ pub const TITLE: Title = Title {
 
 pub struct Msg {
     pub loading: &'static str,
+    pub loading_suffix: &'static str,
     pub no_working_copy: &'static str,
     pub empty_log: &'static str,
     pub empty_log_filtered: &'static str,
@@ -55,6 +56,7 @@ pub struct Msg {
 
 pub const MSG: Msg = Msg {
     loading: "Loading...",
+    loading_suffix: "(loading…)",
     no_working_copy: "Error: not an SVN working copy (svn info failed)",
     empty_log: "No revisions found",
     empty_log_filtered: "No match in loaded commits — press / then Enter to search all history",

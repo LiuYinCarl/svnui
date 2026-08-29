@@ -426,8 +426,23 @@ impl Svn {
         let err_path = path.clone();
         self.spawn(
             move || {
-                let result = Self::run_in(&cwd, &["blame", "--", &Self::peg(&path)])
-                    .map(|out| parser::parse_blame(&out));
+                // Raw bytes for the text output: the author field is
+                // byte-truncated, and decoding first would shift the fixed
+                // columns. `--xml` is queried in the same thread for exact
+                // authors (names with spaces / CJK / >10 bytes survive only
+                // there); its failure just keeps the text-side authors.
+                let result = Self::run_in_raw(&cwd, &["blame", "--", &Self::peg(&path)]).map(|b| {
+                    let mut lines = parser::parse_blame(&b);
+                    if let Ok(xml) =
+                        Self::run_in_raw(&cwd, &["blame", "--xml", "--", &Self::peg(&path)])
+                    {
+                        parser::merge_blame_authors(
+                            &mut lines,
+                            &parser::parse_blame_xml(&String::from_utf8_lossy(&xml)),
+                        );
+                    }
+                    lines
+                });
                 AsyncSvnNotification::Blame { path, result }
             },
             move |e| AsyncSvnNotification::Blame {
@@ -570,6 +585,14 @@ impl Svn {
     }
 
     fn run_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
+        Self::run_in_raw(cwd, args).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// Same as [`run_in`] but returns the raw stdout bytes. `svn blame`
+    /// needs this: its author field is byte-truncated and can cut a
+    /// multi-byte UTF-8 char in half — decoding the whole output first
+    /// would inflate the line with U+FFFD and shift the fixed columns.
+    fn run_in_raw(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         let out = Command::new("svn")
             .arg("--non-interactive")
             // Keep svn's messages English (the parsers match "Changed
@@ -587,7 +610,7 @@ impl Svn {
             .output()
             .map_err(|e| format!("failed to run svn: {e}"))?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            Ok(out.stdout)
         } else {
             let err = String::from_utf8_lossy(&out.stderr);
             Err(err.trim().to_string())
@@ -1102,6 +1125,31 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blame merges the plain output (content) with `--xml` (exact
+    /// authors): names with spaces / CJK / longer than 10 bytes survive.
+    #[test]
+    fn blame_merges_exact_xml_authors() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("f.txt"), "one\ntwo\n");
+        repo.svn(&["add", "f.txt"]);
+        repo.svn(&["commit", "-m", "c1", "--username", "Gabi Melman"]);
+        test_support::write_file(&repo.wc.join("f.txt"), "one\ntwo\nthree\n");
+        repo.svn(&["commit", "-m", "c2", "--username", "张三李四王五"]);
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).blame("f.txt");
+        match recv(&rx) {
+            AsyncSvnNotification::Blame { result, .. } => {
+                let lines = result.unwrap();
+                assert_eq!(lines.len(), 3);
+                assert_eq!(lines[0].author, "Gabi Melman", "{lines:?}");
+                assert_eq!(lines[0].content, "one");
+                assert_eq!(lines[2].author, "张三李四王五", "{lines:?}");
+                assert_eq!(lines[2].content, "three");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

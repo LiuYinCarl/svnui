@@ -25,7 +25,6 @@ pub struct LogComponent {
     scroll: Cell<usize>,
     detail_scroll: Cell<usize>,
     pub pending: bool,
-    pub focused: bool,
     /// Keyword filter over revision/author/message, set from the search
     /// popup (`/`)
     filter: String,
@@ -47,7 +46,6 @@ impl LogComponent {
             scroll: Cell::new(0),
             detail_scroll: Cell::new(0),
             pending: true,
-            focused: true,
             filter: String::new(),
             search: None,
             marks: std::collections::BTreeSet::new(),
@@ -181,7 +179,7 @@ impl LogComponent {
     fn scroll_detail(&mut self, delta: isize) {
         let len = self
             .selection_entry()
-            .map(|e| detail_lines(e, &self.ctx.theme).len())
+            .map(|e| log_entry_lines(e, &self.ctx.theme).len())
             .unwrap_or(0);
         let next =
             (self.detail_scroll.get() as isize + delta).clamp(0, len.saturating_sub(1) as isize);
@@ -264,8 +262,6 @@ impl LogComponent {
             self.ctx
                 .queue
                 .push(InternalEvent::SwitchTab(crate::queue::Tab::Log));
-        } else if key_match(k, KeyAction::Blame) {
-            // not used in log tab
         } else {
             return Ok(EventState::not_consumed());
         }
@@ -276,11 +272,8 @@ impl LogComponent {
 impl DrawableComponent for LogComponent {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
-        let border = if self.focused {
-            theme.border_focused
-        } else {
-            theme.border_unfocused
-        };
+        // the log tab owns its area: always the focused border
+        let border = theme.border_focused;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -321,7 +314,10 @@ impl DrawableComponent for LogComponent {
 
         if self.pending {
             f.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(Span::styled("Loading...", theme.dim))),
+                ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+                    crate::strings::MSG.loading,
+                    theme.dim,
+                ))),
                 inner,
             );
             return Ok(());
@@ -351,15 +347,7 @@ impl DrawableComponent for LogComponent {
                 theme,
             ));
         }
-        let mut scroll = self.scroll.get();
-        if view_h > 0 {
-            if self.selection < scroll {
-                scroll = self.selection;
-            } else if self.selection >= scroll + view_h {
-                scroll = self.selection - view_h + 1;
-            }
-        }
-        scroll = ui::clamp_scroll(scroll, lines.len(), view_h);
+        let scroll = ui::scroll_follow(self.selection, self.scroll.get(), lines.len(), view_h);
         self.scroll.set(scroll);
 
         let highlights = vec![(self.selection, Style::default().bg(theme.selection_bg))];
@@ -367,7 +355,7 @@ impl DrawableComponent for LogComponent {
 
         // ---- right: details content ----
         if let Some(e) = self.selection_entry() {
-            let detail = detail_lines(e, theme);
+            let detail = log_entry_lines(e, theme);
             let mut dscroll = self.detail_scroll.get();
             dscroll = ui::clamp_scroll(dscroll, detail.len(), inner2.height as usize);
             self.detail_scroll.set(dscroll);
@@ -396,32 +384,37 @@ fn log_list_line(e: &LogEntry, marked: bool, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-fn detail_lines(e: &LogEntry, theme: &Theme) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    out.push(Line::from(Span::styled(
-        format!("r{} | {} | {}", e.revision, e.author, e.date),
-        theme.log_revision,
-    )));
-    out.push(Line::from(""));
+/// Full detail view of a log entry: `r<N> | author | date`, the changed
+/// paths (action chars in their A/D/M colors) and the complete message.
+/// Shared by the log tab's detail pane and the commit-info popup (`v`).
+pub fn log_entry_lines(e: &LogEntry, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(format!("r{}", e.revision), theme.log_revision),
+        Span::styled(" | ", theme.dim),
+        Span::styled(e.author.clone(), theme.log_author),
+        Span::styled(" | ", theme.dim),
+        Span::styled(e.date.clone(), theme.dim),
+    ]));
     if !e.changed.is_empty() {
-        out.push(Line::from(Span::styled("Changed paths:", theme.dim)));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Changed paths:",
+            theme.diff_header,
+        )));
         for (action, path) in &e.changed {
-            let style = theme.log_action_style(*action);
-            out.push(Line::from(vec![
-                Span::styled(format!(" {action} "), style),
-                Span::styled(path.clone(), theme.log_message),
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {action}"), theme.log_action_style(*action)),
+                Span::styled(format!("  {path}"), theme.text),
             ]));
         }
-        out.push(Line::from(""));
     }
-    out.push(Line::from(Span::styled("Message:", theme.dim)));
-    for line in e.message.lines() {
-        out.push(Line::from(Span::styled(
-            line.to_string(),
-            theme.log_message,
-        )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("Message:", theme.diff_header)));
+    for l in e.message.trim_end().lines() {
+        lines.push(Line::from(Span::styled(l.to_string(), theme.text)));
     }
-    out
+    lines
 }
 
 #[cfg(test)]

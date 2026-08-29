@@ -83,7 +83,7 @@ pub enum KeyAction {
     DetailScrollUp,
 }
 
-/// Central keybindings. `KeyAction::None` is used for unbound keys.
+/// Central keybindings: every `KeyAction` maps to one or more keys.
 pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
     match action {
         KeyAction::MoveUp => is_key(ev, KeyCode::Up) || is_key(ev, KeyCode::Char('k')),

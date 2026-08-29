@@ -10,13 +10,14 @@ use crate::svn::models::LogEntry;
 
 /// Which parts of the app need a refresh/redraw.
 ///
-/// Hand-rolled bit flags — three flags don't justify the bitflags crate.
+/// Hand-rolled bit flags — two flags plus their combination don't justify
+/// the bitflags crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NeedsUpdate(u32);
 
 impl NeedsUpdate {
-    /// redraw everything
-    pub const ALL: Self = Self(0b0111);
+    /// redraw everything (all component flags combined)
+    pub const ALL: Self = Self(Self::STATUS.0 | Self::LOG.0);
     /// status tree / diff may have changed
     pub const STATUS: Self = Self(0b0010);
     /// log view may have changed

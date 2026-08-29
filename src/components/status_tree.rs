@@ -173,24 +173,6 @@ impl StatusTreeComponent {
         (added, Vec::new())
     }
 
-    pub fn toggle_stage_paths(&mut self, paths: &[String]) -> (Vec<String>, Vec<String>) {
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        for p in paths {
-            if self.staged.contains(p) {
-                self.staged.remove(p);
-                removed.push(p.clone());
-            } else {
-                self.staged.insert(p.clone());
-                added.push(p.clone());
-            }
-        }
-        if !added.is_empty() || !removed.is_empty() {
-            self.counts_dirty.set(true);
-        }
-        (added, removed)
-    }
-
     pub fn set_staged(&mut self, paths: &[String]) {
         for p in paths {
             self.staged.insert(p.clone());
@@ -487,8 +469,6 @@ impl StatusTreeComponent {
             self.ctx
                 .queue
                 .push(InternalEvent::SwitchTab(crate::queue::Tab::Status));
-        } else if key_match(k, KeyAction::OpenRevisionDiff) {
-            // 'd'/'Enter' handled above as DiffFull; nothing here
         } else {
             return Ok(EventState::not_consumed());
         }
@@ -523,7 +503,7 @@ impl DrawableComponent for StatusTreeComponent {
         };
         let mut title = TITLE.status.to_string();
         if self.pending {
-            title.push_str("  (loading)");
+            title.push_str(&format!("  {}", strings::MSG.loading_suffix));
         } else if !self.filter.is_empty() {
             title.push_str(&format!("  filter: \"{}\"", self.filter));
         }
@@ -542,15 +522,7 @@ impl DrawableComponent for StatusTreeComponent {
 
         let total = self.visible.len();
         // keep selection visible with minimal scrolling
-        let mut scroll = self.scroll.get();
-        if view_height > 0 {
-            if self.selection < scroll {
-                scroll = self.selection;
-            } else if self.selection >= scroll + view_height {
-                scroll = self.selection - view_height + 1;
-            }
-        }
-        scroll = ui::clamp_scroll(scroll, total, view_height);
+        let scroll = ui::scroll_follow(self.selection, self.scroll.get(), total, view_height);
         self.scroll.set(scroll);
 
         if total > 0 {
@@ -1467,7 +1439,7 @@ mod perf_tests {
         draw(&c);
         assert!(!c.counts_dirty.get(), "subsequent draws must reuse cache");
         // staging invalidates the cache
-        c.toggle_stage_paths(&["file_000000.rs".to_string()]);
+        c.set_staged(&["file_000000.rs".to_string()]);
         assert!(c.counts_dirty.get());
         draw(&c);
         assert!(!c.counts_dirty.get());
