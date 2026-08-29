@@ -280,18 +280,43 @@ impl App {
     }
 
     /// Full commit info of a log entry: revision, author, date, the
-    /// complete message and the changed paths (scrollable popup).
+    /// complete message and the changed paths (scrollable popup, styled
+    /// like the log tab: revision yellow, author cyan, action chars in
+    /// their A/D/M colors).
     fn show_commit_info(&mut self, entry: &LogEntry) {
-        let mut out = format!("r{} | {} | {}\n", entry.revision, entry.author, entry.date);
+        let theme = &self.ctx.theme;
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(format!("r{}", entry.revision), theme.log_revision),
+            Span::styled(" | ", theme.dim),
+            Span::styled(entry.author.clone(), theme.log_author),
+            Span::styled(" | ", theme.dim),
+            Span::styled(entry.date.clone(), theme.dim),
+        ]));
         if !entry.changed.is_empty() {
-            out.push_str("\nChanged paths:\n");
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Changed paths:",
+                theme.diff_header,
+            )));
             for (action, path) in &entry.changed {
-                out.push_str(&format!("  {action}  {path}\n"));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {action}"), theme.log_action_style(*action)),
+                    Span::styled(format!("  {path}"), theme.text),
+                ]));
             }
         }
-        out.push_str("\nMessage:\n");
-        out.push_str(entry.message.trim_end());
-        self.show_output(format!("Commit r{}", entry.revision), &out);
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("Message:", theme.diff_header)));
+        for l in entry.message.trim_end().lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), theme.text)));
+        }
+        let ctx = self.ctx.clone();
+        self.push_popup(Popup::Output(OutputPopup::from_lines(
+            &ctx,
+            format!("Commit r{}", entry.revision),
+            lines,
+        )));
     }
 
     // ----- startup -----
@@ -1369,6 +1394,23 @@ mod tests {
         assert!(text.contains("M  src/main.rs"), "{text}");
         assert!(text.contains("full message"), "{text}");
         assert!(text.contains("second line"), "{text}");
+        // styling: revision yellow, author cyan, action char in its M color
+        let header = &p.lines[0];
+        assert_eq!(
+            header.spans[0].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+        assert_eq!(header.spans[2].style.fg, Some(ratatui::style::Color::Cyan));
+        let changed = p
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("src/main.rs"))
+            .unwrap();
+        assert_eq!(
+            changed.spans[0].style.fg,
+            Some(ratatui::style::Color::Yellow),
+            "M action color"
+        );
         // Esc/q close the popup (OutputPopup behavior): simulate the queue
         app.popups.clear();
         let _ = rx;

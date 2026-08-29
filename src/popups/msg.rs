@@ -54,7 +54,7 @@ impl DrawableComponent for MsgPopup {
         if inner.height > 0 {
             let y = inner.y + inner.height - 1;
             f.buffer_mut()
-                .set_string(inner.x, y, "press any key to close", Style::default());
+                .set_string(inner.x, y, "press any key to close", theme.dim);
         }
         Ok(())
     }
