@@ -264,10 +264,6 @@ impl LogComponent {
         } else if key_match(k, KeyAction::End) {
             self.selection = self.visible_indices().len().saturating_sub(1);
             self.maybe_load_more();
-        } else if key_match(k, KeyAction::DetailScrollDown) {
-            self.scroll_detail(10);
-        } else if key_match(k, KeyAction::DetailScrollUp) {
-            self.scroll_detail(-10);
         } else if key_match(k, KeyAction::ToggleMark) {
             self.toggle_mark();
         } else if key_match(k, KeyAction::ViewCommitInfo) {
@@ -866,24 +862,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_u_scroll_the_detail_pane() {
+    fn ctrl_d_u_are_inert_in_the_log_tab() {
         let (mut c, _q) = comp();
-        // detail of r3: header + blank + "Changed paths:" + 1 path + blank
-        // + "Message:" + 1 message line = 7 lines
-        assert_eq!(c.detail_scroll.get(), 0);
+        // the detail pane scrolls via Tab focus + movement keys now;
+        // Ctrl+d/u stay reserved for the file-history popup
         c.event(&ctrl(crossterm::event::KeyCode::Char('d')))
             .unwrap();
-        assert_eq!(c.detail_scroll.get(), 6, "clamped to content length");
-        // clamped at the bottom
-        c.event(&ctrl(crossterm::event::KeyCode::Char('d')))
-            .unwrap();
-        assert_eq!(c.detail_scroll.get(), 6);
-        // Ctrl+u goes back up, clamped at 0
         c.event(&ctrl(crossterm::event::KeyCode::Char('u')))
             .unwrap();
         assert_eq!(c.detail_scroll.get(), 0);
-        // moving the selection still resets the scroll
-        c.event(&ctrl(crossterm::event::KeyCode::Char('d')))
+        // selection resets the detail scroll regardless
+        c.event(&ts::key(crossterm::event::KeyCode::Tab)).unwrap();
+        c.event(&ts::key(crossterm::event::KeyCode::Char('G')))
             .unwrap();
         assert_eq!(c.detail_scroll.get(), 6);
         c.move_selection(1);

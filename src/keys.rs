@@ -77,9 +77,9 @@ pub enum KeyAction {
     ApplyPatch,
     /// Patches tab: delete the selected patch file (`d`)
     DeletePatch,
-    /// Log tab / file history popup: scroll the detail pane down (Ctrl+d)
+    /// File history popup: scroll the commit message down (Ctrl+d)
     DetailScrollDown,
-    /// Log tab / file history popup: scroll the detail pane up (Ctrl+u)
+    /// File history popup: scroll the commit message up (Ctrl+u)
     DetailScrollUp,
 }
 
@@ -151,8 +151,9 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         // would ever see it
         KeyAction::ApplyPatch => is_key(ev, KeyCode::Char('a')),
         KeyAction::DeletePatch => is_key(ev, KeyCode::Char('d')),
-        // Ctrl+d/u scroll the detail pane; plain d/u are separate actions
-        // and are matched without modifiers via `is_key`
+        // Ctrl+d/u scroll the file-history popup's message pane; plain
+        // d/u are separate actions and are matched without modifiers
+        // via `is_key`
         KeyAction::DetailScrollDown => {
             ev.code == KeyCode::Char('d') && ev.modifiers.contains(KeyModifiers::CONTROL)
         }
@@ -229,7 +230,6 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("o", "Update working copy to selected revision"),
                 KeyBinding::new("/", "Filter loaded commits / search all history"),
                 KeyBinding::new("Tab", "Focus the details pane (j/k scroll it)"),
-                KeyBinding::new("Ctrl+d / Ctrl+u", "Scroll commit details down / up"),
             ],
         },
         KeyGroup {
@@ -416,7 +416,8 @@ mod tests {
         assert!(key_match(&shift_a, KeyAction::ApplyPatch));
         let shift_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT);
         assert!(key_match(&shift_d, KeyAction::DiffFull));
-        // Ctrl+d/u scroll the detail pane; plain d/u do not
+        // Ctrl+d/u are the file-history popup's scroll keys; plain d/u
+        // do not match them
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
         assert!(key_match(&ctrl_d, KeyAction::DetailScrollDown));
