@@ -120,11 +120,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y subversion
       - name: Clone git2svn and build it
         run: |
-          git clone -q --depth 1 https://github.com/LiuYinCarl/git2svn target/tmp/git2svn
-          (cd target/tmp/git2svn && go build -o git2svn .)
+          # keep it out of target/, which rust-cache restores (a stale copy
+          # from a previous run would make git clone fail)
+          git clone -q --depth 1 https://github.com/LiuYinCarl/git2svn "$RUNNER_TEMP/git2svn"
+          (cd "$RUNNER_TEMP/git2svn" && go build -o git2svn .)
       - name: Convert and stress
         run: |
-          GIT2SVN_DIR="$PWD/target/tmp/git2svn" \
+          GIT2SVN_DIR="$RUNNER_TEMP/git2svn" \
           STRESS_GIT_URL="${{ matrix.url }}" \
           SVNUI_STRESS_ROUNDS=60 \
             scripts/stress_test.sh
