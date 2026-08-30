@@ -4,7 +4,27 @@
 
 An SVN (Subversion) terminal UI client inspired by [gitui](https://github.com/gitui-org/gitui), written in Rust with [ratatui](https://github.com/ratatui/ratatui).
 
-![svnui demo](https://github.com/LiuYinCarl/svnui/releases/download/assets/svnui.gif)
+## Screenshots & recordings
+
+Demo data is the public [spdlog](https://github.com/gabime/spdlog) commit history (converted to SVN
+with git2svn). The recording pipeline is asciinema + agg; see `scripts/record_demos.sh`
+(regenerates all assets below).
+
+| Status tab: tree / staging commit set / path filter | Commit: commit set + message + confirm |
+| --- | --- |
+| ![status tab](docs/screenshots/status.gif) | ![commit flow](docs/screenshots/commit.gif) |
+
+| Log tab: revision diff / marked range diff / full-history search | File finder → file history → blame → in-popup search |
+| --- | --- |
+| ![log tab](docs/screenshots/log.gif) | ![blame](docs/screenshots/blame.gif) |
+
+| Patch management: save / preview / revert / apply | Help popup (`?`) |
+| --- | --- |
+| ![patches](docs/screenshots/patches.gif) | ![help](docs/screenshots/help.png) |
+
+| Repository overview (`i`) | |
+| --- | --- |
+| ![repo info](docs/screenshots/info.png) | |
 
 ## Features
 
@@ -29,27 +49,6 @@ Covers the most common daily SVN operations:
 | **Help** | `?` shows all key bindings |
 | **Async execution** | Every svn command runs on a background thread; the UI never blocks and shows a spinner |
 
-## Screenshots & recordings
-
-Demo data is the public [spdlog](https://github.com/gabime/spdlog) commit history (converted to SVN
-with git2svn). The recording pipeline is asciinema + agg; see `scripts/record_demos.sh`
-(regenerates all assets below).
-
-| Status tab: tree / staging commit set / path filter | Commit: commit set + message + confirm |
-| --- | --- |
-| ![status tab](docs/screenshots/status.gif) | ![commit flow](docs/screenshots/commit.gif) |
-
-| Log tab: revision diff / marked range diff / full-history search | File finder → file history → blame → in-popup search |
-| --- | --- |
-| ![log tab](docs/screenshots/log.gif) | ![blame](docs/screenshots/blame.gif) |
-
-| Patch management: save / preview / revert / apply | Help popup (`?`) |
-| --- | --- |
-| ![patches](docs/screenshots/patches.gif) | ![help](docs/screenshots/help.png) |
-
-| Repository overview (`i`) | |
-| --- | --- |
-| ![repo info](docs/screenshots/info.png) | |
 
 ## Install & run
 
@@ -111,7 +110,11 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 ## CI/CD
 
 [![CI](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml)
-[![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/release.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/release.yml)
+[![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml)
+
+> Note: day-to-day releasing is carried by bump.yml (it bumps the version, then calls release.yml
+> to build and publish). GitHub attributes reusable-workflow runs to the caller, so release.yml's
+> own badge was stuck on early failed manual tag pushes — the badge above shows bump.yml instead.
 
 `.github/workflows/` contains three pipelines:
 

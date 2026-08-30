@@ -4,7 +4,26 @@
 
 一个受 [gitui](https://github.com/gitui-org/gitui) 启发的 SVN (Subversion) 终端 UI 客户端，使用 Rust + [ratatui](https://github.com/ratatui/ratatui) 编写。
 
-![svnui 演示](https://github.com/LiuYinCarl/svnui/releases/download/assets/svnui.gif)
+## 功能预览（截图与操作录屏）
+
+演示数据为公开的 [spdlog](https://github.com/gabime/spdlog) 提交历史（经 git2svn 转换为 SVN 仓库），
+录制管线为 asciinema + agg，一条命令可重复生成全部素材：`scripts/record_demos.sh`。
+
+| 状态页：目录树 / 暂存提交集 / 路径过滤 | 提交：提交集 + 信息输入 + 确认 |
+| --- | --- |
+| ![状态页](docs/screenshots/status.gif) | ![提交](docs/screenshots/commit.gif) |
+
+| 日志页：修订 diff / 标记区间 diff / 全历史搜索 | 文件查找 → 文件历史 → Blame → 弹窗内搜索 |
+| --- | --- |
+| ![日志页](docs/screenshots/log.gif) | ![Blame](docs/screenshots/blame.gif) |
+
+| 补丁管理：保存 / 预览 / 还原 / 应用 | 帮助弹窗（`?`） |
+| --- | --- |
+| ![补丁](docs/screenshots/patches.gif) | ![帮助](docs/screenshots/help.png) |
+
+| 仓库概览（`i`） | |
+| --- | --- |
+| ![仓库概览](docs/screenshots/info.png) | |
 
 ## 功能
 
@@ -28,27 +47,6 @@
 | **仓库信息** | `i` 全局快捷键打开仓库概览弹窗：工作副本信息（路径/URL/分支/修订/最后变更）、远端 HEAD 对比（落后多少修订、最后一次提交）、当前改动统计（按状态分类计数 + 提交集大小） |
 | **帮助** | `?` 查看全部快捷键 |
 | **异步执行** | 所有 svn 命令在后台线程执行，UI 不卡顿，带 spinner 指示 |
-
-## 功能预览（截图与操作录屏）
-
-演示数据为公开的 [spdlog](https://github.com/gabime/spdlog) 提交历史（经 git2svn 转换为 SVN 仓库），
-录制管线为 asciinema + agg，脚本见 `scripts/record_demos.sh`（可重复生成下列全部素材）。
-
-| 状态页：目录树 / 暂存提交集 / 路径过滤 | 提交：提交集 + 信息输入 + 确认 |
-| --- | --- |
-| ![状态页](docs/screenshots/status.gif) | ![提交](docs/screenshots/commit.gif) |
-
-| 日志页：修订 diff / 标记区间 diff / 全历史搜索 | 文件查找 → 文件历史 → Blame → 弹窗内搜索 |
-| --- | --- |
-| ![日志页](docs/screenshots/log.gif) | ![Blame](docs/screenshots/blame.gif) |
-
-| 补丁管理：保存 / 预览 / 还原 / 应用 | 帮助弹窗（`?`） |
-| --- | --- |
-| ![补丁](docs/screenshots/patches.gif) | ![帮助](docs/screenshots/help.png) |
-
-| 仓库概览（`i`） | |
-| --- | --- |
-| ![仓库概览](docs/screenshots/info.png) | |
 
 ## 安装与运行
 
@@ -107,7 +105,11 @@ svnui /path/to/working-copy
 ## CI/CD
 
 [![CI](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml)
-[![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/release.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/release.yml)
+[![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml)
+
+> 注：日常发布由 bump.yml 承载（bump 版本号后调用 release.yml 构建发版）；可复用工作流的运行
+> 记录在 GitHub 上归属于调用方，因此 release.yml 自身的徽章永远停在早期手动打标签的失败
+> 记录上，这里改为展示 bump.yml 的状态。
 
 `.github/workflows/` 包含三条流水线：
 

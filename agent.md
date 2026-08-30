@@ -241,3 +241,7 @@ SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
   `git reset --hard origin/<branch>`，避免排队任务算出过期版本号。
 - **release.yml**：推送 `v*` 标签触发（也供 bump.yml 复用）；先校验标签与 Cargo.toml 版本一致，
   再构建 Linux/macOS/Windows 二进制并创建 Release。发版流程见 README「发布新版本」。
+  注意：`cargo build --locked` 要求 Cargo.lock 与 Cargo.toml 版本同步（bump.yml 用
+  `cargo check` 重写 lock；手动改版本号发 tag 前必须同步提交 Cargo.lock）。
+  README 的 Release 徽章指向 bump.yml——可复用工作流的运行记录归属调用方，
+  release.yml 自身徽章会停在早期手动 tag 的失败记录上。
