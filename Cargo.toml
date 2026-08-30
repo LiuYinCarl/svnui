@@ -1,6 +1,6 @@
 [package]
 name = "svnui"
-version = "0.4.20"
+version = "0.4.21"
 edition = "2024"
 description = "A terminal UI client for SVN (Subversion), inspired by gitui"
 repository = "https://github.com/LiuYinCarl/svnui"
