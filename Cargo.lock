@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "svnui"
-version = "0.4.16"
+version = "0.4.17"
 dependencies = [
  "criterion",
  "crossbeam-channel",
