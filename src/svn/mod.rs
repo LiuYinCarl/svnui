@@ -12,6 +12,8 @@ use models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One queued working-copy mutation, executed by the mutation worker.
 type MutationJob = Box<dyn FnOnce() + Send + 'static>;
@@ -30,7 +32,10 @@ pub enum AsyncSvnNotification {
     /// Repository overview for the info popup (global `i` key): local +
     /// remote HEAD info. Boxed: two SvnInfo would make the enum huge.
     RepoInfo(Result<Box<(SvnInfo, Option<SvnInfo>)>, String>),
-    Status(Result<Vec<StatusEntry>, String>),
+    /// `svn status` result. The id is a per-`Svn` request sequence number,
+    /// allocated monotonically at issue time, so the app layer can drop
+    /// stale results that arrive out of order.
+    Status(u64, Result<Vec<StatusEntry>, String>),
     Diff {
         path: String,
         /// Fullscreen-request token: `Some(id)` when the request came from
@@ -38,7 +43,8 @@ pub enum AsyncSvnNotification {
         req: Option<u64>,
         result: Result<String, String>,
     },
-    Log(Result<Vec<LogEntry>, String>),
+    /// `svn log` result; the id is a request sequence number, as on `Status`
+    Log(u64, Result<Vec<LogEntry>, String>),
     /// `svn log` restricted to a single file
     FileLog {
         path: String,
@@ -106,6 +112,11 @@ pub struct Svn {
     /// Read-only ops (status/log/diff/blame/list) bypass this queue and
     /// each run on their own thread.
     mutation_queue: Sender<MutationJob>,
+    /// Request sequence counter shared by every clone of this client. Ids
+    /// are handed out at issue time on the calling thread, so they are
+    /// monotonically increasing across both the read-only worker threads
+    /// and the single mutation worker (same counter).
+    request_seq: Arc<AtomicU64>,
 }
 
 impl Svn {
@@ -129,7 +140,13 @@ impl Svn {
             cwd,
             tx,
             mutation_queue: job_tx,
+            request_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Allocate the next request sequence number (see `request_seq`).
+    fn next_request_id(&self) -> u64 {
+        self.request_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Run `f`, converting a panic into the operation's error
@@ -245,13 +262,14 @@ impl Svn {
 
     pub fn status(&self) {
         let cwd = self.cwd.clone();
+        let id = self.next_request_id();
         self.spawn(
             move || {
                 let result = Self::run_in(&cwd, &["status", "--ignore-externals"])
                     .map(|text| parser::parse_status(&text, &cwd));
-                AsyncSvnNotification::Status(result)
+                AsyncSvnNotification::Status(id, result)
             },
-            |e| AsyncSvnNotification::Status(Err(e)),
+            move |e| AsyncSvnNotification::Status(id, Err(e)),
         );
     }
 
@@ -294,14 +312,21 @@ impl Svn {
                 Ok(format!("(file too large to display: {} bytes)", m.len()))
             }
             Ok(_) => {
-                std::fs::read_to_string(&full).map_err(|e| format!("failed to read {path}: {e}"))
+                // a read failure (non-UTF-8 binary, permissions, ...) must
+                // not become an error notification: the user merely moved
+                // the selection onto the file. Show a placeholder, like the
+                // size-capped branch above.
+                Ok(std::fs::read_to_string(&full)
+                    .unwrap_or_else(|_| "(binary or unreadable file, content not shown)".into()))
             }
+            // vanished between the status fetch and now: empty, not an error
             Err(_) => Ok(String::new()),
         }
     }
 
     pub fn log(&self, limit: usize) {
         let cwd = self.cwd.clone();
+        let id = self.next_request_id();
         self.spawn(
             move || {
                 // HEAD:0 so an empty (r0) repository yields no output instead
@@ -311,9 +336,9 @@ impl Svn {
                     &["log", "-v", "-r", "HEAD:0", "-l", &limit.to_string()],
                 )
                 .map(|out| parser::parse_log(&out));
-                AsyncSvnNotification::Log(result)
+                AsyncSvnNotification::Log(id, result)
             },
-            |e| AsyncSvnNotification::Log(Err(e)),
+            move |e| AsyncSvnNotification::Log(id, Err(e)),
         );
     }
 
@@ -379,7 +404,9 @@ impl Svn {
         let cwd = self.cwd.clone();
         self.spawn(
             move || {
-                let range = format!("{}:0", before_rev - 1);
+                // saturating like range_diff: before_rev 0/1 both mean
+                // "0:0" (no older revisions), not an underflow panic
+                let range = format!("{}:0", before_rev.saturating_sub(1));
                 let result =
                     Self::run_in(&cwd, &["log", "-v", "-r", &range, "-l", &limit.to_string()])
                         .map(|out| parser::parse_log(&out));
@@ -576,14 +603,20 @@ impl Svn {
         let patch = patch.to_string_lossy().into_owned();
         self.spawn_mutating(
             move || {
-                let result = Self::run_in(&cwd, &["patch", &patch]);
+                // The patch path gets the same treatment as wc targets:
+                // without an empty peg, a path whose final `@`-suffix
+                // parses as a revision (e.g. `fix@HEAD.patch`) is
+                // misparsed as `path@REV` and fails with E200009.
+                // Verified on svn 1.14.5: `svn patch` accepts both `--`
+                // and a trailing empty peg on the patch file argument.
+                let result = Self::run_in(&cwd, &["patch", "--", &Self::peg(&patch)]);
                 AsyncSvnNotification::ApplyPatch(result)
             },
             |e| AsyncSvnNotification::ApplyPatch(Err(e)),
         );
     }
 
-    pub fn commit(&self, message: &str, paths: &[String]) {
+    pub fn commit(&self, message: &str, paths: &[String], depth_empty: bool) {
         let cwd = self.cwd.clone();
         let message = message.to_string();
         let paths = paths.to_vec();
@@ -592,7 +625,16 @@ impl Svn {
                 // Explicit file targets are committed exactly as listed (the
                 // obsolete -N/--non-recursive flag is deliberately not used: it
                 // is a no-op for file targets and may disappear in future svn).
+                // `depth_empty` adds `--depth empty`, which keeps *directory*
+                // targets from recursing: only the directory's own prop/deletion
+                // changes are committed, leaving unstaged descendants in the
+                // working copy. File targets are unaffected by the depth
+                // (verified on svn 1.14.5 with mixed `dir@ file@` targets).
                 let mut args: Vec<String> = vec!["commit".into()];
+                if depth_empty {
+                    args.push("--depth".into());
+                    args.push("empty".into());
+                }
                 // The message is UTF-8; say so explicitly, otherwise svn
                 // interprets -m in the "native" encoding, which is ASCII under
                 // the LC_ALL=C forced by run_in, and non-ASCII messages are
@@ -719,7 +761,7 @@ mod tests {
         let (tx, rx) = unbounded();
         Svn::new(repo.wc.clone(), tx).status();
         match recv(&rx) {
-            AsyncSvnNotification::Status(Ok(entries)) => {
+            AsyncSvnNotification::Status(_, Ok(entries)) => {
                 let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
                 assert!(paths.contains(&"new.txt"), "{paths:?}");
                 assert!(paths.contains(&"Cargo.toml"));
@@ -771,7 +813,7 @@ mod tests {
         let (tx, rx) = unbounded();
         Svn::new(repo.wc.clone(), tx).log(50);
         match recv(&rx) {
-            AsyncSvnNotification::Log(Ok(entries)) => {
+            AsyncSvnNotification::Log(_, Ok(entries)) => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].revision, 2);
                 assert_eq!(entries[0].message, "second");
@@ -843,7 +885,7 @@ mod tests {
 
         // modify + commit
         test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 9\n");
-        c.commit("bump version", &["Cargo.toml".to_string()]);
+        c.commit("bump version", &["Cargo.toml".to_string()], false);
         match recv(&rx) {
             AsyncSvnNotification::Commit(Ok(out)) => {
                 assert!(out.contains("Committed revision 2"), "{out}");
@@ -852,7 +894,7 @@ mod tests {
         }
         // commit with empty paths = all changes
         test_support::write_file(&repo.wc.join("docs/readme.md"), "# docs v2\n");
-        c.commit("update the readme", &[]);
+        c.commit("update the readme", &[], false);
         match recv(&rx) {
             AsyncSvnNotification::Commit(Ok(out)) => {
                 assert!(out.contains("Committed revision 3"), "{out}");
@@ -902,7 +944,7 @@ mod tests {
         let c = Svn::new(repo.wc.clone(), tx);
 
         test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
-        c.commit("测试一下提交吧", &["Cargo.toml".to_string()]);
+        c.commit("测试一下提交吧", &["Cargo.toml".to_string()], false);
         match recv(&rx) {
             AsyncSvnNotification::Commit(Ok(out)) => {
                 assert!(out.contains("Committed revision 2"), "{out}");
@@ -912,7 +954,7 @@ mod tests {
 
         c.log(1);
         match recv(&rx) {
-            AsyncSvnNotification::Log(Ok(entries)) => {
+            AsyncSvnNotification::Log(_, Ok(entries)) => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].message, "测试一下提交吧");
             }
@@ -1170,7 +1212,7 @@ mod tests {
         let (tx, rx) = unbounded();
         Svn::new(wc, tx).log(50);
         match recv(&rx) {
-            AsyncSvnNotification::Log(Ok(entries)) => {
+            AsyncSvnNotification::Log(_, Ok(entries)) => {
                 assert!(entries.is_empty(), "{entries:?}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1230,7 +1272,7 @@ mod tests {
         let c = Svn::new(repo.wc.clone(), tx);
         c.add(&[name.to_string()]);
         assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Ok(_))));
-        c.commit("add unit template", &[name.to_string()]);
+        c.commit("add unit template", &[name.to_string()], false);
         match recv(&rx) {
             AsyncSvnNotification::Commit(Ok(out)) => {
                 assert!(out.contains("Committed revision"), "{out}");
@@ -1266,7 +1308,7 @@ mod tests {
         assert!(matches!(recv(&rx), AsyncSvnNotification::Revert(Ok(_))));
         c.status();
         match recv(&rx) {
-            AsyncSvnNotification::Status(Ok(entries)) => {
+            AsyncSvnNotification::Status(_, Ok(entries)) => {
                 assert!(entries.is_empty(), "{entries:?}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1289,9 +1331,12 @@ mod tests {
         let (tx, rx) = unbounded();
         let c = Svn::new(PathBuf::from("."), tx);
         // panic with a &'static str payload
-        c.spawn(|| panic!("boom"), |e| AsyncSvnNotification::Status(Err(e)));
+        c.spawn(
+            || panic!("boom"),
+            |e| AsyncSvnNotification::Status(0, Err(e)),
+        );
         match recv(&rx) {
-            AsyncSvnNotification::Status(Err(e)) => {
+            AsyncSvnNotification::Status(_, Err(e)) => {
                 assert!(e.contains("boom"), "{e}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1299,10 +1344,10 @@ mod tests {
         // panic with a String payload
         c.spawn(
             || std::panic::panic_any(String::from("kaboom")),
-            |e| AsyncSvnNotification::Status(Err(e)),
+            |e| AsyncSvnNotification::Status(0, Err(e)),
         );
         match recv(&rx) {
-            AsyncSvnNotification::Status(Err(e)) => {
+            AsyncSvnNotification::Status(_, Err(e)) => {
                 assert!(e.contains("kaboom"), "{e}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1320,7 +1365,7 @@ mod tests {
         let c = Svn::new(repo.wc.clone(), tx);
         test_support::write_file(&repo.wc.join("staged.txt"), "x\n");
         c.add(&["staged.txt".to_string()]);
-        c.commit("add staged", &["staged.txt".to_string()]);
+        c.commit("add staged", &["staged.txt".to_string()], false);
         let (mut added, mut committed) = (false, false);
         for _ in 0..2 {
             match recv(&rx) {
@@ -1379,5 +1424,146 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// A non-UTF-8 unversioned file must not turn into an error
+    /// notification (the user may have just moved the selection onto it):
+    /// show a placeholder, like the size-capped branch.
+    #[test]
+    fn diff_binary_unversioned_file_shows_placeholder() {
+        let Some(repo) = TestRepo::new() else { return };
+        std::fs::write(repo.wc.join("bin.dat"), [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).diff("bin.dat", None);
+        match recv(&rx) {
+            AsyncSvnNotification::Diff {
+                result: Ok(content),
+                ..
+            } => {
+                assert!(content.contains("binary or unreadable"), "{content}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A patch file whose path contains '@' (e.g. `fix@HEAD.patch`, or a
+    /// patch dir under `user@host/...`) must still apply: without the empty
+    /// peg suffix svn misparses it as `path@REV` (E200009).
+    #[test]
+    fn apply_patch_with_at_sign_in_path() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 42\n");
+        c.create_patch();
+        let diff = match recv(&rx) {
+            AsyncSvnNotification::CreatePatch(Ok(diff)) => diff,
+            other => panic!("unexpected: {other:?}"),
+        };
+        // "@HEAD" is the suffix svn would otherwise parse as a peg revision
+        let patch_file = repo.repo.with_file_name("svnui-test@HEAD.patch");
+        std::fs::write(&patch_file, &diff).unwrap();
+        repo.svn(&["revert", "-R", "Cargo.toml"]);
+
+        c.apply_patch(&patch_file);
+        match recv(&rx) {
+            AsyncSvnNotification::ApplyPatch(Ok(out)) => {
+                assert!(out.contains("Cargo.toml"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join("Cargo.toml")).unwrap(),
+            "version = 42\n"
+        );
+        let _ = std::fs::remove_file(&patch_file);
+    }
+
+    /// `log_more` computes `before_rev - 1`; at the boundary (0/1) that must
+    /// saturate to the empty range `0:0` instead of underflowing.
+    #[test]
+    fn log_more_saturates_at_revision_zero() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        for before_rev in [0, 1] {
+            c.log_more(before_rev, 50);
+            match recv(&rx) {
+                AsyncSvnNotification::LogAppend { result, .. } => {
+                    assert!(result.unwrap().is_empty());
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// With `depth_empty`, a directory target commits only the directory
+    /// itself (props/deletions) — unstaged descendant changes stay in the
+    /// working copy — while an explicitly listed file target is committed
+    /// fully (verified against svn 1.14.5).
+    #[test]
+    fn commit_depth_empty_keeps_unstaged_descendants() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        // seed a directory with two files
+        test_support::write_file(&repo.wc.join("d/f1.txt"), "one\n");
+        test_support::write_file(&repo.wc.join("d/f2.txt"), "two\n");
+        repo.svn(&["add", "d"]);
+        repo.svn(&["commit", "-m", "seed d"]);
+        // dir prop change + modify both children
+        repo.svn(&["propset", "myprop", "myval", "d"]);
+        test_support::write_file(&repo.wc.join("d/f1.txt"), "one v2\n");
+        test_support::write_file(&repo.wc.join("d/f2.txt"), "two v2\n");
+
+        c.commit(
+            "dir props + f1",
+            &["d".to_string(), "d/f1.txt".to_string()],
+            true,
+        );
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(out)) => {
+                assert!(out.contains("Committed revision"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // the dir props and f1 were committed; f2's change stayed local
+        let status = repo.svn(&["status"]);
+        assert!(status.contains("d/f2.txt"), "{status}");
+        assert!(!status.contains("d/f1.txt"), "{status}");
+        assert_eq!(
+            repo.svn(&["propget", "myprop", "-r", "HEAD", "d"]).trim(),
+            "myval"
+        );
+        assert_eq!(repo.svn(&["cat", "-r", "HEAD", "d/f1.txt"]), "one v2\n");
+        assert_eq!(repo.svn(&["cat", "-r", "HEAD", "d/f2.txt"]), "two\n");
+    }
+
+    /// Status/Log notifications carry request sequence numbers allocated at
+    /// issue time from one counter shared by all clones (read-only and
+    /// mutation workers alike). Arrival order may differ from issue order,
+    /// so compare the sorted set.
+    #[test]
+    fn status_log_ids_come_from_one_shared_counter() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.status();
+        c.log(1);
+        c.clone().status();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            match recv(&rx) {
+                AsyncSvnNotification::Status(id, _) | AsyncSvnNotification::Log(id, _) => {
+                    ids.push(id);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 }

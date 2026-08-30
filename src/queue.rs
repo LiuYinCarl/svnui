@@ -16,12 +16,13 @@ use crate::svn::models::LogEntry;
 pub struct NeedsUpdate(u32);
 
 impl NeedsUpdate {
-    /// redraw everything (all component flags combined)
+    /// refresh every view covered by these flags (status and log; the
+    /// patches tab manages its own refresh and has no flag)
     pub const ALL: Self = Self(Self::STATUS.0 | Self::LOG.0);
     /// status tree / diff may have changed
-    pub const STATUS: Self = Self(0b0010);
+    pub const STATUS: Self = Self(0b0001);
     /// log view may have changed
-    pub const LOG: Self = Self(0b0100);
+    pub const LOG: Self = Self(0b0010);
 
     /// Whether all bits of `other` are set in `self`.
     pub fn contains(self, other: Self) -> bool {
@@ -176,8 +177,11 @@ mod tests {
         let all = NeedsUpdate::ALL;
         assert!(all.contains(NeedsUpdate::STATUS));
         assert!(all.contains(NeedsUpdate::LOG));
+        assert_eq!(NeedsUpdate::STATUS | NeedsUpdate::LOG, all);
+        // distinct, non-overlapping bits
+        assert!(!NeedsUpdate::STATUS.contains(NeedsUpdate::LOG));
+        assert!(!NeedsUpdate::LOG.contains(NeedsUpdate::STATUS));
         let s = NeedsUpdate::STATUS;
-        assert!(!s.contains(NeedsUpdate::LOG));
         assert_eq!(s | NeedsUpdate::LOG, NeedsUpdate::STATUS | NeedsUpdate::LOG);
     }
 }

@@ -17,6 +17,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear};
 use std::cell::Cell;
 
+/// How many revisions the file history loads (`svn log -l`). When the
+/// list reaches this cap the history is silently truncated, so the title
+/// says so.
+pub const FILE_LOG_LIMIT: usize = 50;
+
 pub struct FileLogPopup {
     ctx: Context,
     pub path: String,
@@ -76,14 +81,20 @@ impl DrawableComponent for FileLogPopup {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
         f.render_widget(Clear, area);
+        let mut title = format!(
+            "{}: {}",
+            crate::strings::TITLE.file_history,
+            ui::truncate(&self.path, 50)
+        );
+        if self.entries.len() >= FILE_LOG_LIMIT {
+            // the list is capped at FILE_LOG_LIMIT revisions: older
+            // history exists but is not shown
+            title.push_str(&format!("  (latest {FILE_LOG_LIMIT})"));
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.popup_border))
-            .title(format!(
-                "{}: {}",
-                crate::strings::TITLE.file_history,
-                ui::truncate(&self.path, 50)
-            ));
+            .title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -301,6 +312,34 @@ mod tests {
         assert_eq!(p.detail_scroll.get(), 1);
         p.event(&ctrl_u).unwrap();
         assert_eq!(p.detail_scroll.get(), 0);
+    }
+
+    #[test]
+    fn full_list_shows_the_latest_limit_hint() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q,
+            theme: Theme::default(),
+        };
+        let mut p = FileLogPopup::new(&ctx, "src/main.rs");
+        // below the cap: no truncation hint
+        p.update(vec![entry(5, "five")]);
+        let t = ts::render(80, 12, |f| {
+            p.draw(f, Rect::new(0, 0, 80, 12)).unwrap();
+        });
+        assert!(!ts::dump(&t).contains("latest"));
+        // a full page: the history is truncated, and the title says so
+        p.update(
+            (1..=FILE_LOG_LIMIT as u64)
+                .rev()
+                .map(|r| entry(r, "m"))
+                .collect(),
+        );
+        let t2 = ts::render(80, 12, |f| {
+            p.draw(f, Rect::new(0, 0, 80, 12)).unwrap();
+        });
+        let s2 = ts::dump(&t2);
+        assert!(s2.contains(&format!("latest {FILE_LOG_LIMIT}")), "{s2}");
     }
 
     #[test]

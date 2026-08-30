@@ -3,7 +3,7 @@
 //! Run with: `cargo bench` (or `cargo bench -- --quick` for a fast pass).
 //! CI guards the same paths with timed tests (see `perf_tests` modules).
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
@@ -33,10 +33,16 @@ fn bench_status_tree(c: &mut Criterion) {
         let entries = gen_status_entries(n, wide);
         group.bench_function(format!("update_{label}"), |b| {
             let mut comp = StatusTreeComponent::new(&ctx());
-            b.iter(|| {
-                comp.update(entries.clone());
-                black_box(comp.visible_len());
-            });
+            // clone the entries in the untimed setup so the measurement
+            // only covers `update` itself
+            b.iter_batched(
+                || entries.clone(),
+                |entries| {
+                    comp.update(entries);
+                    black_box(comp.visible_len());
+                },
+                BatchSize::SmallInput,
+            );
         });
         group.bench_function(format!("draw_{label}"), |b| {
             let mut comp = StatusTreeComponent::new(&ctx());

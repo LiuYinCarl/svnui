@@ -79,10 +79,21 @@ impl BlamePopup {
             }
             return Ok(EventState::consumed());
         }
-        // search input mode / `/` / n/N: a match reveals its line under the cursor
-        {
-            let lines: Vec<&str> = self.lines.iter().map(|l| l.content.as_str()).collect();
-            match self.tv.search_event(ev, &lines, self.selected.get()) {
+        // search input mode / `/` / n/N: a match reveals its line under the
+        // cursor. No data yet (pending / empty blame): search stays off so
+        // an arriving update() cannot discard a half-typed pattern.
+        if !self.lines.is_empty() {
+            // The plain-text line index is only built while typing in
+            // input mode (each keystroke recomputes the matches). `/`
+            // just starts input and n/N step through the stored matches,
+            // so plain scrolling keys pay no 100k-entry Vec allocation.
+            let outcome = if self.tv.search.is_input_mode() {
+                let lines: Vec<&str> = self.lines.iter().map(|l| l.content.as_str()).collect();
+                self.tv.search_event(ev, &lines, self.selected.get())
+            } else {
+                self.tv.search_event(ev, &[], self.selected.get())
+            };
+            match outcome {
                 SearchOutcome::Reveal(line) => {
                     self.selected.set(line);
                     return Ok(EventState::consumed());
@@ -454,6 +465,41 @@ mod tests {
         // q outside input mode still closes
         b.event(&ts::key(KeyCode::Char('q'))).unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+    }
+
+    #[test]
+    fn search_input_stays_closed_until_data_arrives() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut b = BlamePopup::new(&ctx, "f");
+        // pending: '/' must not enter input mode — a half-typed pattern
+        // would be discarded when update() lands and resets the view
+        assert!(b.pending);
+        b.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        assert!(!b.tv.search.is_input_mode());
+        // empty blame data: same, there is nothing to search
+        b.update(vec![]);
+        b.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        assert!(!b.tv.search.is_input_mode());
+        // once lines arrive, search works normally
+        b.update(vec![
+            line(Some(1), "a", "needle here"),
+            line(Some(2), "a", "plain"),
+        ]);
+        b.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        assert!(b.tv.search.is_input_mode());
+        for c in "needle".chars() {
+            b.event(&ts::key(KeyCode::Char(c))).unwrap();
+        }
+        assert_eq!(b.tv.search.match_count(), 1);
+        assert_eq!(b.selected.get(), 0);
+        // Enter confirms, n/N keep cycling (stored matches, no re-feed)
+        b.event(&ts::key(KeyCode::Enter)).unwrap();
+        b.event(&ts::key(KeyCode::Char('n'))).unwrap();
+        assert_eq!(b.selected.get(), 0);
     }
 
     #[test]

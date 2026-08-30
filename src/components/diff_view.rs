@@ -79,6 +79,41 @@ pub struct DiffView {
     /// Search is only consulted when `search_enabled` is set (fullscreen
     /// popup) — the status-tab diff pane leaves search off.
     pub search_enabled: bool,
+    /// Column width of one line-number field (≥3), sized to the largest
+    /// line number in the diff. Rendering and the h-scroll clamp both
+    /// derive the gutter width from this, so they can never disagree.
+    num_w: usize,
+}
+
+/// Column width of one line-number field: at least 3, widened to fit the
+/// largest line number in the diff so 4+-digit numbers stay aligned.
+fn line_number_width(parsed: &ParsedDiff) -> usize {
+    let max_n = parsed
+        .lines
+        .iter()
+        .filter_map(|dl| dl.old.max(dl.new))
+        .max()
+        .unwrap_or(0);
+    let digits = max_n.checked_ilog10().map_or(1, |d| d as usize + 1);
+    digits.max(3)
+}
+
+/// Decide whether raw content is a unified diff (vs. plain text, e.g. an
+/// unversioned file shown as all-added lines). Only the *start* of the
+/// content counts: every file section of real `svn diff` output begins
+/// with "Index: ", property-only diffs with "Property changes on:", and
+/// patch files (previewed through the diff popup) may be git-format
+/// ("diff --git ") or plain `diff -u` output (a "--- "/"+++ " header
+/// pair). A hunk header ("@@ ...") mid-file is just text.
+fn looks_like_diff(content: &str) -> bool {
+    let mut lines = content.trim_start().lines();
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    first.starts_with("Index: ")
+        || first.starts_with("Property changes on:")
+        || first.starts_with("diff --git ")
+        || (first.starts_with("--- ") && lines.next().is_some_and(|l| l.starts_with("+++ ")))
 }
 
 impl DiffView {
@@ -92,6 +127,7 @@ impl DiffView {
             focused: true,
             header: Vec::new(),
             search_enabled: false,
+            num_w: 3,
         }
     }
 
@@ -118,6 +154,7 @@ impl DiffView {
         self.pending = false;
         self.empty_reason = Some(reason);
         self.parsed = ParsedDiff::default();
+        self.num_w = 3;
         self.tv.reset();
     }
 
@@ -126,36 +163,35 @@ impl DiffView {
         self.title = title;
         self.pending = false;
         self.tv.reset();
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
+        if content.trim().is_empty() {
             self.empty_reason = Some("No textual diff".to_string());
             self.parsed = ParsedDiff::default();
-        } else if trimmed.starts_with("Index:")
-            // a hunk header only counts at line start: raw text containing
-            // "@@" mid-line is not a diff
-            || content.lines().any(|l| l.starts_with("@@ "))
-            || trimmed.starts_with("Property changes on:")
-        {
+        } else if looks_like_diff(content) {
             self.parsed = parse_diff(content);
             self.empty_reason = None;
         } else {
             self.parsed = parse_new_file_content(content);
             self.empty_reason = None;
         }
+        self.num_w = line_number_width(&self.parsed);
         self.tv.max_width.set(self.compute_max_width());
     }
 
     /// Display width of the widest rendered line, including the
-    /// line-number gutter (" 12  34 │ ", 9 columns) for numbered lines.
+    /// line-number gutter (" 12  34 │ ", 2*num_w + 3 columns) for
+    /// numbered lines.
     fn compute_max_width(&self) -> usize {
         use unicode_width::UnicodeWidthStr;
+        let gutter = 2 * self.num_w + 3;
         self.parsed
             .lines
             .iter()
             .map(|dl| {
                 let w = UnicodeWidthStr::width(dl.content.as_str());
                 match dl.kind {
-                    DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed => w + 9,
+                    DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed => {
+                        w + gutter
+                    }
                     _ => w,
                 }
             })
@@ -200,12 +236,14 @@ impl DiffView {
 /// `matches`/`current` highlight incremental-search hits inside the
 /// content: `matches` are the byte ranges on this line (from
 /// `TextSearch::line_ranges`) and `current` the index of the current
-/// match within them (distinct style).
+/// match within them (distinct style). `num_w` is the column width of
+/// one line-number field (see `line_number_width`).
 pub fn diff_line(
     dl: &DiffLine,
     theme: &Theme,
     matches: &[(usize, usize)],
     current: Option<usize>,
+    num_w: usize,
 ) -> Line<'static> {
     let (kind_style, need_numbers) = match dl.kind {
         DiffLineKind::Header => (theme.diff_header, false),
@@ -231,8 +269,8 @@ pub fn diff_line(
 
     let num = |n: Option<u64>| -> String {
         match n {
-            Some(n) => format!("{n:>3}"),
-            None => "   ".to_string(),
+            Some(n) => format!("{n:>num_w$}"),
+            None => " ".repeat(num_w),
         }
     };
     let mut spans = vec![
@@ -317,7 +355,13 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     let mut lines = Vec::with_capacity(end - scroll);
     for i in scroll..end {
         let (ranges, current) = view.tv.search.line_ranges(i);
-        lines.push(diff_line(&view.parsed.lines[i], theme, &ranges, current));
+        lines.push(diff_line(
+            &view.parsed.lines[i],
+            theme,
+            &ranges,
+            current,
+            view.num_w,
+        ));
     }
     ui::render_lines_h(f, inner, &lines, 0, &[], view.tv.hscroll.get());
     if let Some(footer) = footer {
@@ -486,7 +530,7 @@ Index: Cargo.toml
             .parsed
             .lines
             .iter()
-            .map(|dl| diff_line(dl, &theme, &[], None))
+            .map(|dl| diff_line(dl, &theme, &[], None, v.num_w))
             .collect();
         assert!(lines.len() >= 7);
         // line numbers rendered
@@ -540,6 +584,93 @@ Index: Cargo.toml
         let mut v2 = DiffView::new("t");
         v2.set_content("Cargo.toml".into(), DIFF);
         assert!(v2.parsed.lines.iter().any(|l| l.kind == DiffLineKind::Hunk));
+    }
+
+    #[test]
+    fn at_at_line_start_inside_plain_text_is_not_a_diff() {
+        // plain text whose *first* line is ordinary but a middle line
+        // starts with "@@ " (patch excerpt, mail quote) must render as
+        // all-added lines, not be misparsed as a diff
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "notes.txt".into(),
+            "patch draft:\n@@ -1 +1 @@\n+not a diff line\n",
+        );
+        assert!(v.empty_reason.is_none());
+        assert_eq!(v.parsed.lines.len(), 3);
+        for (i, line) in v.parsed.lines.iter().enumerate() {
+            assert_eq!(line.kind, DiffLineKind::Added);
+            assert_eq!(line.new, Some(i as u64 + 1));
+        }
+        // the "@@ " line keeps its characters (no stripped prefix)
+        assert_eq!(v.parsed.lines[1].content, "@@ -1 +1 @@");
+        assert_eq!(v.parsed.lines[2].content, "+not a diff line");
+        // rendered with line numbers, content intact
+        let t = ts::render(40, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 40, 6), &v, &Theme::default());
+        });
+        let s = ts::dump(&t);
+        assert!(s.contains("@@ -1 +1 @@"), "{s}");
+        assert!(s.contains("+not a diff line"), "{s}");
+    }
+
+    #[test]
+    fn patch_files_without_index_header_are_still_diffs() {
+        // patch preview feeds raw patch files into the diff popup: both
+        // git-format and plain `diff -u` patches lack the "Index: " header
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "p.patch".into(),
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        assert!(v.parsed.lines.iter().any(|l| l.kind == DiffLineKind::Hunk));
+        let mut v2 = DiffView::new("t");
+        v2.set_content("q.patch".into(), "--- f.orig\n+++ f\n@@ -1 +1 @@\n-a\n+b\n");
+        assert!(v2.parsed.lines.iter().any(|l| l.kind == DiffLineKind::Hunk));
+        // but YAML front matter ("---" followed by a key) is plain text
+        let mut v3 = DiffView::new("t");
+        v3.set_content("doc.md".into(), "---\ntitle: hello\n---\nbody\n");
+        assert!(
+            v3.parsed
+                .lines
+                .iter()
+                .all(|l| l.kind == DiffLineKind::Added),
+            "markdown front matter must not parse as a diff"
+        );
+    }
+
+    #[test]
+    fn four_digit_line_numbers_widen_gutter_and_hscroll_reaches_line_end() {
+        let mut v = DiffView::new("t");
+        let content = format!("Index: f\n@@ -1000 +1000 @@\n {}\n", "x".repeat(200));
+        v.set_content("t".into(), &content);
+        // 4-digit line numbers: gutter = 2*4 + 3 = 11 columns, and the
+        // h-scroll clamp accounts for the full gutter
+        assert_eq!(v.tv.max_width.get(), 200 + 11);
+        let t = ts::render(40, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 40, 6), &v, &Theme::default());
+        });
+        let buf = t.backend().buffer();
+        // the context line is row 3 (border + "Index: f" + hunk header);
+        // the gutter is right-aligned: "1000 1000 │ xxxx"
+        assert_eq!(buf[(1, 3)].symbol(), "1");
+        assert_eq!(buf[(4, 3)].symbol(), "0");
+        assert_eq!(buf[(5, 3)].symbol(), " ");
+        assert_eq!(buf[(6, 3)].symbol(), "1");
+        assert_eq!(buf[(10, 3)].symbol(), "│");
+        assert_eq!(buf[(12, 3)].symbol(), "x");
+        // scrolling far right clamps at max_width - inner width (38) and
+        // the line tail is actually reachable
+        for _ in 0..40 {
+            v.event(&ts::key(KeyCode::Char('l')));
+        }
+        let t = ts::render(40, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 40, 6), &v, &Theme::default());
+        });
+        assert_eq!(v.tv.hscroll.get(), 211 - 38);
+        let buf = t.backend().buffer();
+        assert_eq!(buf[(38, 3)].symbol(), "x", "line end must be reachable");
+        assert_eq!(buf[(1, 3)].symbol(), "x", "no gutter residue when scrolled");
     }
 
     #[test]

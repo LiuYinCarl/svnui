@@ -91,11 +91,26 @@ pub fn parse_info(output: &str) -> SvnInfo {
 /// `is_dir` must be probed against `root`, not the process CWD.
 pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
     let mut entries = Vec::new();
+    let mut in_conflict_summary = false;
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
+        // Conflict trailer (printed last when the wc has conflicts):
+        // "Summary of conflicts:" plus its indented detail lines
+        // ("  Text conflicts: 1", ...). Skip both explicitly — the first
+        // line would otherwise yield a phantom 'S' entry with path
+        // "of conflicts:", and the detail lines must not rely on the
+        // blank-column check below happening to reject them.
+        if line == "Summary of conflicts:" {
+            in_conflict_summary = true;
+            continue;
+        }
+        if in_conflict_summary && line.starts_with("  ") {
+            continue;
+        }
+        in_conflict_summary = false;
         // Skip continuation lines (tree-conflict descriptions, move
         // sources): svn prints them as exactly six spaces + '>'. Anchor
         // on that — a looser check would swallow entries whose *path*
@@ -132,6 +147,11 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
 }
 
 /// Parse `svn log -v` output.
+///
+/// The header's line count — not the separator — bounds the message
+/// body: a message line of exactly 72 dashes, or one that looks like a
+/// header ("r99 | fake | ..."), is content. The entry still ends at an
+/// exact 72-dash separator line after the message has been consumed.
 pub fn parse_log(output: &str) -> Vec<LogEntry> {
     // svn emits exactly 72 dashes as the separator between entries.
     // Require an exact match: a *message* line of dashes (shorter *or*
@@ -140,67 +160,95 @@ pub fn parse_log(output: &str) -> Vec<LogEntry> {
     let mut entries = Vec::new();
     let mut current: Option<LogEntry> = None;
     let mut message_lines: Vec<String> = Vec::new();
-    let mut in_message = false;
+    // Per-entry phase: changed-paths block → message body (the header's
+    // line count lines, whatever they look like) → done (wait for the
+    // separator)
+    enum Phase {
+        Paths,
+        Message(u64),
+        Done,
+    }
+    let mut phase = Phase::Paths;
 
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
 
-        // Separator line: closes the current entry
-        if line == SEP {
+        // Separator line: closes the current entry — but not inside the
+        // message body, where a 72-dash line is content
+        if line == SEP && !matches!(phase, Phase::Message(_)) {
             if let Some(mut e) = current.take() {
                 e.message = message_lines.join("\n").trim().to_string();
                 entries.push(e);
             }
             message_lines.clear();
-            in_message = false;
+            phase = Phase::Paths;
             continue;
         }
 
-        if current.is_none() {
+        let Some(entry) = current.as_mut() else {
             // Header line: r123 | author | date | N lines
-            if let Some(entry) = parse_log_header(line) {
-                current = Some(entry);
-                in_message = false;
+            if let Some(e) = parse_log_header(line) {
+                current = Some(e);
             }
             continue;
-        }
+        };
 
-        // We have a current entry
-        if line.is_empty() {
-            if in_message {
-                message_lines.push(String::new());
+        match phase {
+            // Message body: consume exactly line_count lines (dashes,
+            // header-looking lines, blank lines — all content)
+            Phase::Message(rem) => {
+                message_lines.push(line.to_string());
+                phase = if rem > 1 {
+                    Phase::Message(rem - 1)
+                } else {
+                    Phase::Done
+                };
             }
-            continue;
-        }
-
-        // The "Changed paths:" marker only appears between the header and
-        // the message; once inside the message, such a line is content
-        if !in_message && line == "Changed paths:" {
-            continue;
-        }
-
-        // Changed path line: "   M /trunk/foo.txt" (3 leading spaces, '/')
-        if !in_message && line.starts_with("   ") {
-            let trimmed = line.trim_start();
-            let mut chars = trimmed.chars();
-            let (action, sep, rest) = (chars.next(), chars.next(), chars.as_str());
-            // `rest` is taken via `chars.as_str()` so slicing stays on char
-            // boundaries even when the line starts with CJK text
-            if let (Some(action), Some(' ')) = (action, sep)
-                && matches!(action, 'M' | 'A' | 'D' | 'R' | 'I' | 'X' | 'C' | '?')
-                && rest.starts_with('/')
-            {
-                let path = rest.trim().trim_start_matches('/').to_string();
-                if let Some(e) = current.as_mut() {
-                    e.changed.push((action, path));
+            Phase::Done => {}
+            // Changed-paths phase: "Changed paths:" block, then a blank
+            // line, then the message. svn always prints the blank line,
+            // but tolerate its absence: a non-path line starts the
+            // message directly.
+            Phase::Paths => {
+                if line.is_empty() {
+                    phase = if entry.line_count > 0 {
+                        Phase::Message(entry.line_count)
+                    } else {
+                        Phase::Done
+                    };
+                    continue;
                 }
-                continue;
+                if line == "Changed paths:" {
+                    continue;
+                }
+
+                // Changed path: "   M /trunk/foo.txt" (3 spaces, then '/')
+                if line.starts_with("   ") {
+                    let trimmed = line.trim_start();
+                    let mut chars = trimmed.chars();
+                    let (action, sep, rest) = (chars.next(), chars.next(), chars.as_str());
+                    // `rest` is taken via `chars.as_str()` so slicing stays
+                    // on char boundaries even with leading CJK text
+                    if let (Some(action), Some(' ')) = (action, sep)
+                        && matches!(action, 'M' | 'A' | 'D' | 'R' | 'I' | 'X' | 'C' | '?')
+                        && rest.starts_with('/')
+                    {
+                        let path = rest.trim().trim_start_matches('/').to_string();
+                        entry.changed.push((action, path));
+                        continue;
+                    }
+                }
+
+                // Anything else: first message line (the blank separator
+                // line between changed paths and message is missing)
+                message_lines.push(line.to_string());
+                phase = if entry.line_count > 1 {
+                    Phase::Message(entry.line_count - 1)
+                } else {
+                    Phase::Done
+                };
             }
         }
-
-        // Anything else: message body
-        in_message = true;
-        message_lines.push(line.to_string());
     }
 
     // Flush trailing entry (in case output has no trailing separator)
@@ -213,12 +261,14 @@ pub fn parse_log(output: &str) -> Vec<LogEntry> {
 
 fn parse_log_header(line: &str) -> Option<LogEntry> {
     // "r123 | author | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 3 lines"
+    // svn does not sanitize the author, which may itself contain " | " —
+    // so anchor the revision at the left and the line count + date at
+    // the right; whatever remains in the middle is the author.
     let rest = line.strip_prefix('r')?;
-    let mut parts = rest.splitn(4, " | ");
-    let revision: u64 = parts.next()?.trim().parse().ok()?;
-    let author = parts.next()?.trim().to_string();
-    let date = parts.next()?.trim().to_string();
-    let line_count_str = parts.next()?.trim();
+    let (rev_str, rest) = rest.split_once(" | ")?;
+    let revision: u64 = rev_str.trim().parse().ok()?;
+    let (middle, line_count_str) = rest.rsplit_once(" | ")?;
+    let (author, date) = middle.rsplit_once(" | ")?;
     let line_count: u64 = line_count_str
         .split_whitespace()
         .next()?
@@ -226,19 +276,20 @@ fn parse_log_header(line: &str) -> Option<LogEntry> {
         .unwrap_or(0);
     Some(LogEntry {
         revision,
-        author,
-        date,
+        author: author.trim().to_string(),
+        date: date.trim().to_string(),
         line_count,
         changed: Vec::new(),
         message: String::new(),
     })
 }
 
-/// Parse `svn blame --xml` output into one author per line (None for
-/// uncommitted lines, which have no `<commit>` block). The XML is the only
-/// blame output where authors survive intact: the plain format truncates
-/// the author field to 10 bytes and cannot express names containing
-/// spaces. Only the flat, fixed structure is parsed — no XML library.
+/// Parse `svn blame --xml` output into (line number, author) pairs (None
+/// author for uncommitted lines, which have no `<commit>` block). The XML
+/// is the only blame output where authors survive intact: the plain
+/// format truncates the author field to 10 bytes and cannot express names
+/// containing spaces. Only the flat, fixed structure is parsed — no XML
+/// library.
 ///
 /// ```xml
 /// <entry
@@ -248,16 +299,21 @@ fn parse_log_header(line: &str) -> Option<LogEntry> {
 /// <author>Gabi Melman</author>
 /// ...
 /// ```
-pub fn parse_blame_xml(xml: &str) -> Vec<Option<String>> {
-    let mut authors = Vec::new();
+pub fn parse_blame_xml(xml: &str) -> Vec<(u64, Option<String>)> {
+    let mut entries = Vec::new();
     for chunk in xml.split("<entry").skip(1) {
+        let line_number = chunk
+            .split_once("line-number=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or(0);
         let author = chunk
             .split_once("<author>")
             .and_then(|(_, rest)| rest.split_once("</author>"))
             .map(|(name, _)| xml_unescape(name));
-        authors.push(author);
+        entries.push((line_number, author));
     }
-    authors
+    entries
 }
 
 /// Replace the five predefined XML entities.
@@ -271,13 +327,23 @@ fn xml_unescape(s: &str) -> String {
 }
 
 /// Overlay exact authors from `parse_blame_xml` onto text-parsed blame
-/// lines (matched by position). XML entries shorter than the text output
-/// leave the remaining lines untouched; a None entry (uncommitted line)
-/// also keeps the text-side author ("-").
-pub fn merge_blame_authors(lines: &mut [BlameLine], authors: &[Option<String>]) {
-    for (line, author) in lines.iter_mut().zip(authors.iter()) {
+/// lines, matched by line number (the text side's position + 1). A None
+/// entry (uncommitted line) keeps the text-side author ("-"). When the
+/// two sides disagree — different line counts, or a line number outside
+/// the text output — the merge is abandoned silently and the text-parsed
+/// authors are kept (the two blame runs must have seen different
+/// content, so positional pairing would misattribute authors).
+pub fn merge_blame_authors(lines: &mut [BlameLine], authors: &[(u64, Option<String>)]) {
+    if authors.len() != lines.len()
+        || authors
+            .iter()
+            .any(|(n, _)| *n == 0 || *n > lines.len() as u64)
+    {
+        return;
+    }
+    for (n, author) in authors {
         if let Some(a) = author {
-            line.author = a.clone();
+            lines[(*n - 1) as usize].author = a.clone();
         }
     }
 }
@@ -369,6 +435,33 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
             let (o, n) = parse_hunk(rest);
             old_line = o;
             new_line = n;
+            lines.push(DiffLine {
+                old: None,
+                new: None,
+                kind: DiffLineKind::Hunk,
+                content: line.to_string(),
+            });
+            continue;
+        }
+        // Property change section: in a mixed diff the text hunks are
+        // followed by a blank line, "Property changes on: f", a line of
+        // underscores, and "## -0,0 +1 ##" property hunk headers. None of
+        // these carry text line numbers — reset the counters so the
+        // property lines are not numbered with the text hunk's offsets.
+        if line.starts_with("Property changes on:") {
+            old_line = None;
+            new_line = None;
+            lines.push(DiffLine {
+                old: None,
+                new: None,
+                kind: DiffLineKind::Header,
+                content: line.to_string(),
+            });
+            continue;
+        }
+        if line.starts_with("## ") {
+            old_line = None;
+            new_line = None;
             lines.push(DiffLine {
                 old: None,
                 new: None,
@@ -786,9 +879,9 @@ r7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 1 line
 </blame>";
         let authors = parse_blame_xml(xml);
         assert_eq!(authors.len(), 3);
-        assert_eq!(authors[0].as_deref(), Some("Gabi Melman"));
-        assert_eq!(authors[1], None); // uncommitted line: no <commit>
-        assert_eq!(authors[2].as_deref(), Some("张 & 三")); // entities decoded
+        assert_eq!(authors[0], (1, Some("Gabi Melman".to_string())));
+        assert_eq!(authors[1], (2, None)); // uncommitted line: no <commit>
+        assert_eq!(authors[2], (3, Some("张 & 三".to_string()))); // entities decoded
 
         let mut lines = vec![
             BlameLine {
@@ -811,10 +904,73 @@ r7 | alice | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 1 line
         assert_eq!(lines[0].author, "Gabi Melman");
         assert_eq!(lines[1].author, "-", "uncommitted keeps the text side");
         assert_eq!(lines[2].author, "张 & 三");
-        // absent/short xml leaves everything untouched
+        // absent xml leaves everything untouched
         let mut same = lines.clone();
         merge_blame_authors(&mut same, &[]);
         assert_eq!(same[0].author, "Gabi Melman");
+    }
+
+    #[test]
+    fn test_merge_blame_authors_matches_by_line_number() {
+        // xml entries out of order still land on the right text line
+        let mut lines = vec![
+            BlameLine {
+                revision: Some(1),
+                author: "truncated1".into(),
+                content: "a".into(),
+            },
+            BlameLine {
+                revision: Some(2),
+                author: "truncated2".into(),
+                content: "b".into(),
+            },
+        ];
+        let authors = vec![
+            (2, Some("Second Author".to_string())),
+            (1, Some("First Author".to_string())),
+        ];
+        merge_blame_authors(&mut lines, &authors);
+        assert_eq!(lines[0].author, "First Author");
+        assert_eq!(lines[1].author, "Second Author");
+    }
+
+    #[test]
+    fn test_merge_blame_authors_misaligned_gives_up() {
+        let make = || {
+            vec![
+                BlameLine {
+                    revision: Some(1),
+                    author: "text-a".into(),
+                    content: "a".into(),
+                },
+                BlameLine {
+                    revision: Some(2),
+                    author: "text-b".into(),
+                    content: "b".into(),
+                },
+            ]
+        };
+        // fewer xml entries than text lines: no partial merge
+        let mut lines = make();
+        merge_blame_authors(&mut lines, &[(1, Some("xml-a".to_string()))]);
+        assert_eq!(lines[0].author, "text-a");
+        // line number out of range: the two runs disagree, keep text side
+        let mut lines = make();
+        merge_blame_authors(
+            &mut lines,
+            &[
+                (1, Some("xml-a".to_string())),
+                (5, Some("xml-b".to_string())),
+            ],
+        );
+        assert_eq!(lines[0].author, "text-a");
+        assert_eq!(lines[1].author, "text-b");
+        // a missing line-number attribute parses as 0: same degradation
+        let authors = parse_blame_xml("<blame><entry>\n</entry>\n</blame>");
+        assert_eq!(authors, vec![(0, None)]);
+        let mut lines = make();
+        merge_blame_authors(&mut lines, &authors);
+        assert_eq!(lines[0].author, "text-a");
     }
 
     #[test]
@@ -954,6 +1110,129 @@ Index: f
         assert!(parse_blame(b"").is_empty());
         // whitespace-only lines carry no revision token either
         assert!(parse_blame(b"\n   \n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_status_skips_conflict_summary() {
+        // Real svn 1.14 output with conflicts: a "Summary of conflicts:"
+        // trailer with indented detail lines. Neither may become an entry
+        // ("Summary"[..7] would otherwise parse as status 'S' with path
+        // "of conflicts:")
+        let out = "\
+C       f.txt
+?       f.txt.mine
+Summary of conflicts:
+  Text conflicts: 1
+";
+        let entries = parse_status(out, no_root());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].status, 'C');
+        assert_eq!(entries[0].path, "f.txt");
+        assert_eq!(entries[1].path, "f.txt.mine");
+        // property-conflict variant of the trailer
+        let out = " C      g.txt\nSummary of conflicts:\n  Property conflicts: 1\n";
+        let entries = parse_status(out, no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].props_status, 'C');
+        assert!(entries[0].is_conflicted());
+    }
+
+    #[test]
+    fn test_parse_log_message_with_exact_separator_and_fake_header() {
+        // Real svn 1.14 output for a message containing an exact 72-dash
+        // line and a header-looking line: the header's line count bounds
+        // the message, so neither truncates the entry nor spawns a
+        // phantom revision
+        let sep = "-".repeat(72);
+        let out = format!(
+            "{sep}\nr5 | kenshin | 2026-08-30 11:57:12 +0800 (Sun, 30 Aug 2026) | 4 lines\nChanged paths:\n   M /f.txt\n\nbefore\n{sep}\nr99 | fake | not-a-date | 1 line\nafter\n{sep}\n"
+        );
+        let entries = parse_log(&out);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].revision, 5);
+        assert_eq!(entries[0].line_count, 4);
+        assert_eq!(
+            entries[0].message,
+            format!("before\n{sep}\nr99 | fake | not-a-date | 1 line\nafter")
+        );
+        assert_eq!(entries[0].changed, vec![('M', "f.txt".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_log_header_author_with_pipe() {
+        // svn does not sanitize the author; one containing " | " must not
+        // shift the date/line_count fields
+        let out = "\
+------------------------------------------------------------------------
+r7 | Gabi | Melman | 2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026) | 1 line
+msg
+------------------------------------------------------------------------
+";
+        let entries = parse_log(out);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].revision, 7);
+        assert_eq!(entries[0].author, "Gabi | Melman");
+        assert_eq!(
+            entries[0].date,
+            "2026-08-26 21:41:52 +0800 (Wed, 26 Aug 2026)"
+        );
+        assert_eq!(entries[0].line_count, 1);
+        assert_eq!(entries[0].message, "msg");
+    }
+
+    #[test]
+    fn test_parse_diff_property_section() {
+        // Real svn 1.14 mixed text+property diff: the property section
+        // must not inherit the text hunk's line numbers
+        let out = "\
+Index: f.txt
+===================================================================
+--- f.txt\t(revision 1)
++++ f.txt\t(working copy)
+@@ -1 +1 @@
+-base
++changed
+
+Property changes on: f.txt
+___________________________________________________________________
+Added: Id
+## -0,0 +1 ##
++x
+\\ No newline at end of property
+";
+        let d = parse_diff(out);
+        let kinds: Vec<_> = d.lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DiffLineKind::Header,     // Index:
+                DiffLineKind::Header,     // ===
+                DiffLineKind::FileHeader, // ---
+                DiffLineKind::FileHeader, // +++
+                DiffLineKind::Hunk,       // @@
+                DiffLineKind::Removed,    // -base
+                DiffLineKind::Added,      // +changed
+                DiffLineKind::Context,    // blank separator line
+                DiffLineKind::Header,     // Property changes on:
+                DiffLineKind::Context,    // ____ separator
+                DiffLineKind::Context,    // Added: Id
+                DiffLineKind::Hunk,       // ## -0,0 +1 ##
+                DiffLineKind::Added,      // +x
+                DiffLineKind::Note,       // \ No newline at end of property
+            ],
+            "{:?}",
+            d.lines
+        );
+        // text hunk keeps its numbers...
+        assert_eq!(d.lines[5].old, Some(1));
+        assert_eq!(d.lines[6].new, Some(1));
+        // ...but the property section is unnumbered
+        for l in &d.lines[8..] {
+            assert_eq!(l.old, None, "{l:?}");
+            assert_eq!(l.new, None, "{l:?}");
+        }
+        assert_eq!(d.lines[12].content, "x");
+        assert_eq!(d.lines[13].content, "\\ No newline at end of property");
     }
 }
 

@@ -108,7 +108,14 @@ impl CommitComponent {
             KeyCode::Up => {
                 self.history_sel = self.history_sel.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Tab => {
+            // Tab without SHIFT moves the selection down; Shift+Tab
+            // (reported as Tab+SHIFT by some terminals, as BackTab by
+            // others) is swallowed like any other key — the picker is
+            // modal — but must not move the selection
+            KeyCode::Tab if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.history_sel = (self.history_sel + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Down => {
                 self.history_sel = (self.history_sel + 1).min(len.saturating_sub(1));
             }
             KeyCode::Enter => {
@@ -497,6 +504,38 @@ mod tests {
         c.event(&ev(KeyCode::Esc)).unwrap();
         c.event(&ev(KeyCode::Char('x'))).unwrap();
         assert_eq!(c.text(), "x");
+    }
+
+    #[test]
+    fn picker_shift_tab_does_not_move_selection() {
+        let (mut c, _q) = comp();
+        c.focus();
+        c.set_history(vec![
+            "one".to_string(),
+            "two".to_string(),
+            "three".to_string(),
+        ]);
+        c.event(&ev(KeyCode::Tab)).unwrap();
+        // plain Tab moves the selection down
+        c.event(&ev(KeyCode::Tab)).unwrap();
+        assert_eq!(c.history_sel, 1);
+        // Shift+Tab reported as Tab+SHIFT must not move the selection
+        let shift_tab = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::SHIFT,
+        ));
+        let state = c.event(&shift_tab).unwrap();
+        assert!(state.consumed, "the picker is modal");
+        assert_eq!(c.history_sel, 1);
+        // the BackTab encoding is swallowed without moving too
+        let state = c.event(&ev(KeyCode::BackTab)).unwrap();
+        assert!(state.consumed);
+        assert_eq!(c.history_sel, 1);
+        // Shift+Tab when the picker is closed still cycles focus (the
+        // open branch rejects it, so it is not consumed here)
+        c.event(&ev(KeyCode::Esc)).unwrap();
+        let state = c.event(&shift_tab).unwrap();
+        assert!(!state.consumed);
     }
 
     #[test]

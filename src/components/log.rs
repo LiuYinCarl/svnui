@@ -44,6 +44,10 @@ pub struct LogComponent {
     pub marks: std::collections::BTreeSet<u64>,
     /// A load-older-revisions request is in flight (pagination guard)
     loading_more: bool,
+    /// The oldest loaded revision is the start of the path's history
+    /// (svn E195012 on the last page): stop paginating until the next
+    /// full reload (`update`)
+    history_exhausted: bool,
 }
 
 impl LogComponent {
@@ -60,12 +64,15 @@ impl LogComponent {
             search: None,
             marks: std::collections::BTreeSet::new(),
             loading_more: false,
+            history_exhausted: false,
         }
     }
 
     pub fn update(&mut self, entries: Vec<LogEntry>) {
         self.pending = false;
         self.loading_more = false;
+        // a full reload starts pagination from scratch
+        self.history_exhausted = false;
         self.entries = entries;
         let len = self.visible_indices().len();
         self.selection = self.selection.min(len.saturating_sub(1));
@@ -80,6 +87,14 @@ impl LogComponent {
     /// A pagination request failed; allow retrying on the next scroll.
     pub fn append_failed(&mut self) {
         self.loading_more = false;
+    }
+
+    /// The path's history starts at the oldest loaded revision (svn
+    /// E195012): release the pagination guard and stop asking for older
+    /// pages until the next full reload.
+    pub fn mark_history_exhausted(&mut self) {
+        self.loading_more = false;
+        self.history_exhausted = true;
     }
 
     /// Back to the normal latest-revisions view (called when a plain
@@ -172,8 +187,9 @@ impl LogComponent {
     /// Near the bottom of the list, request the next page of older
     /// revisions (once per in-flight request). Search results are not
     /// paged: `log_search` already scans and returns the full history.
+    /// Nor is an exhausted history (svn E195012 at the path's start).
     fn maybe_load_more(&mut self) {
-        if self.loading_more || self.search.is_some() {
+        if self.loading_more || self.search.is_some() || self.history_exhausted {
             return;
         }
         let len = self.visible_indices().len();
@@ -393,19 +409,31 @@ impl DrawableComponent for LogComponent {
         }
 
         let view_h = inner.height as usize;
-        let mut lines: Vec<Line> = Vec::with_capacity(visible.len().min(view_h.max(1)));
-        for &i in &visible {
+        let total = visible.len();
+        let scroll = ui::scroll_follow(self.selection, self.scroll.get(), total, view_h);
+        self.scroll.set(scroll);
+
+        // Virtualized rendering: only the visible window of lines is
+        // built, so drawing a huge log costs O(screen height), not
+        // O(loaded entries).
+        let end = (scroll + view_h).min(total);
+        let mut lines: Vec<Line> = Vec::with_capacity(end - scroll);
+        for &i in &visible[scroll..end] {
             lines.push(log_list_line(
                 &self.entries[i],
                 self.marks.contains(&self.entries[i].revision),
                 theme,
             ));
         }
-        let scroll = ui::scroll_follow(self.selection, self.scroll.get(), lines.len(), view_h);
-        self.scroll.set(scroll);
-
-        let highlights = vec![(self.selection, Style::default().bg(theme.selection_bg))];
-        ui::render_lines(f, inner, &lines, scroll, &highlights);
+        let highlights = if self.selection >= scroll && self.selection < end {
+            vec![(
+                self.selection - scroll,
+                Style::default().bg(theme.selection_bg),
+            )]
+        } else {
+            Vec::new()
+        };
+        ui::render_lines(f, inner, &lines, 0, &highlights);
 
         // ---- right: details content ----
         if let Some(e) = self.selection_entry() {
@@ -881,6 +909,31 @@ mod tests {
     }
 
     #[test]
+    fn history_exhausted_stops_pagination_until_reload() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut c = LogComponent::new(&ctx);
+        let entries: Vec<LogEntry> = (2..=60)
+            .rev()
+            .map(|r| entry(r, "a", &format!("commit {r}")))
+            .collect();
+        c.update(entries.clone());
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+        // E195012 at the path's history start: no retry on later scrolls
+        c.mark_history_exhausted();
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(q.pop().is_none(), "exhausted history must not paginate");
+        // a full reload re-arms pagination
+        c.update(entries);
+        c.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+    }
+
+    #[test]
     fn only_movement_keys_trigger_pagination() {
         let q = crate::queue::Queue::new();
         let ctx = Context {
@@ -915,5 +968,49 @@ mod tests {
         c.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::LogLoadMore)));
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use crate::test_support as ts;
+    use crate::ui::style::Theme;
+    use std::time::{Duration, Instant};
+
+    /// Regression guard: drawing must only build the visible window of
+    /// list lines (the old code built a `Line` per loaded entry — author
+    /// clone included — on every frame).
+    #[test]
+    fn perf_draw_large_log_is_windowed() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q,
+            theme: Theme::default(),
+        };
+        let mut c = LogComponent::new(&ctx);
+        let entries: Vec<LogEntry> = (1..=50_000u64)
+            .rev()
+            .map(|r| LogEntry {
+                revision: r,
+                author: "alice".into(),
+                date: "2026-01-01".into(),
+                line_count: 1,
+                changed: vec![('M', "src/main.rs".into())],
+                message: format!("commit {r}"),
+            })
+            .collect();
+        c.update(entries);
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = ts::render(120, 40, |f| {
+                c.draw(f, Rect::new(0, 0, 120, 40)).unwrap();
+            });
+        }
+        let el = t.elapsed();
+        assert!(
+            el < Duration::from_secs(5),
+            "10 draws of a 50k-entry log took {el:?}; not windowed?"
+        );
     }
 }

@@ -56,24 +56,33 @@ Arguments:
 
 Options:
   -h, --help     Print help
-  -V, --version  Print version";
+  -V, --version  Print version
+  --             Treat all following arguments as paths";
 
 /// Parse argv (without the program name). A single optional positional
 /// argument doesn't justify pulling in clap and its derive macro tree.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<CliAction, String> {
     let mut path: Option<PathBuf> = None;
+    // after `--`, everything is a positional argument, so paths that
+    // start with `-` can be passed
+    let mut positional_only = false;
     for arg in args {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(CliAction::Help),
-            "-V" | "--version" => return Ok(CliAction::Version),
-            _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
-            _ => {
-                if path.is_some() {
-                    return Err(format!("unexpected extra argument: {arg}"));
+        if !positional_only {
+            match arg.as_str() {
+                "--" => {
+                    positional_only = true;
+                    continue;
                 }
-                path = Some(PathBuf::from(arg));
+                "-h" | "--help" => return Ok(CliAction::Help),
+                "-V" | "--version" => return Ok(CliAction::Version),
+                _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
+                _ => {}
             }
         }
+        if path.is_some() {
+            return Err(format!("unexpected extra argument: {arg}"));
+        }
+        path = Some(PathBuf::from(arg));
     }
     Ok(CliAction::Run(CliArgs {
         path: path.unwrap_or_else(|| PathBuf::from(".")),
@@ -85,6 +94,28 @@ enum QueueEvent {
     Input(Event),
     Async(svn::AsyncSvnNotification),
     Tick,
+}
+
+/// Enter the alternate screen and enable bracketed paste. On failure,
+/// best-effort undo whatever already reached the terminal (the first
+/// escape sequence may have succeeded while the second failed), so the
+/// shell is not left stuck in the alternate screen — mirrors the
+/// `Terminal::new` failure path in `main`.
+fn enter_terminal(stdout: &mut impl io::Write) -> Result<(), String> {
+    if let Err(e) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    ) {
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            crossterm::event::DisableBracketedPaste
+        );
+        disable_raw_mode().ok();
+        return Err(format!("failed to enter alternate screen: {e}"));
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), String> {
@@ -163,14 +194,7 @@ fn main() -> Result<(), String> {
     let mut stdout = io::stdout();
     // bracketed paste: pasted text arrives as one Event::Paste, so pasting
     // a (multi-line, CJK) commit message never triggers stray key actions
-    if let Err(e) = execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableBracketedPaste
-    ) {
-        disable_raw_mode().ok();
-        return Err(format!("failed to enter alternate screen: {e}"));
-    }
+    enter_terminal(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(t) => t,
@@ -328,6 +352,88 @@ mod tests {
     }
 
     #[test]
+    fn cli_args_double_dash() {
+        // a path starting with `-` is accepted after `--`
+        let Ok(CliAction::Run(args)) =
+            parse_args(["--".to_string(), "-weird".to_string()].into_iter())
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(args.path, PathBuf::from("-weird"));
+        // after `--`, even `--help` is a path
+        let Ok(CliAction::Run(args)) =
+            parse_args(["--".to_string(), "--help".to_string()].into_iter())
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(args.path, PathBuf::from("--help"));
+        // before `--`, options still work
+        assert!(matches!(
+            parse_args(["-V".to_string(), "--".to_string()].into_iter()),
+            Ok(CliAction::Version)
+        ));
+        // extra positional args after `--` are still errors
+        assert!(
+            parse_args(["--".to_string(), "a".to_string(), "b".to_string()].into_iter()).is_err()
+        );
+        // a lone trailing `--` is fine and keeps the default
+        let Ok(CliAction::Run(args)) = parse_args(["--".to_string()].into_iter()) else {
+            panic!("expected Run");
+        };
+        assert_eq!(args.path, PathBuf::from("."));
+    }
+
+    /// Writer that records all bytes and fails exactly once, on the
+    /// `fail_at`-th write call.
+    struct FailOnce {
+        fail_at: usize,
+        writes: usize,
+        buf: Vec<u8>,
+    }
+
+    impl io::Write for FailOnce {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == self.fail_at {
+                return Err(io::Error::other("boom"));
+            }
+            self.buf.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn enter_terminal_failure_restores_terminal() {
+        // EnterAlternateScreen (write #1) succeeds, EnableBracketedPaste
+        // (write #2) fails: cleanup must still leave the alternate screen
+        // and disable bracketed paste
+        let mut w = FailOnce {
+            fail_at: 2,
+            writes: 0,
+            buf: Vec::new(),
+        };
+        let err = enter_terminal(&mut w).unwrap_err();
+        assert!(err.contains("failed to enter alternate screen"), "{err}");
+        let out = String::from_utf8_lossy(&w.buf);
+        assert!(out.contains("\x1b[?1049h"), "{out:?}");
+        assert!(out.contains("\x1b[?1049l"), "{out:?}");
+        assert!(out.contains("\x1b[?2004l"), "{out:?}");
+        // success path writes both sequences and returns Ok
+        let mut w = FailOnce {
+            fail_at: 0,
+            writes: 0,
+            buf: Vec::new(),
+        };
+        enter_terminal(&mut w).unwrap();
+        let out = String::from_utf8_lossy(&w.buf);
+        assert!(out.contains("\x1b[?1049h"), "{out:?}");
+        assert!(out.contains("\x1b[?2004h"), "{out:?}");
+    }
+
+    #[test]
     fn select_event_multiplexes_channels() {
         let (ti, ri) = unbounded::<Event>();
         let (ta, ra) = unbounded::<svn::AsyncSvnNotification>();
@@ -338,11 +444,11 @@ mod tests {
         assert!(matches!(select_event(&ri, &ra, &rt), Ok(QueueEvent::Tick)));
 
         // async arrives
-        ta.send(svn::AsyncSvnNotification::Status(Ok(vec![])))
+        ta.send(svn::AsyncSvnNotification::Status(0, Ok(vec![])))
             .unwrap();
         assert!(matches!(
             select_event(&ri, &ra, &rt),
-            Ok(QueueEvent::Async(svn::AsyncSvnNotification::Status(_)))
+            Ok(QueueEvent::Async(svn::AsyncSvnNotification::Status(..)))
         ));
 
         // input arrives
@@ -378,14 +484,17 @@ mod tests {
         // status/log fetches whose responses race the injected fixtures
         // below (a clean wc's empty status would clobber the Cargo.toml
         // entry whenever the worker finishes before 'q' is processed).
-        app.handle_async(svn::AsyncSvnNotification::Status(Ok(vec![StatusEntry {
-            status: 'M',
-            props_status: ' ',
-            tree_conflict: ' ',
-            path: "Cargo.toml".to_string(),
-            is_dir: false,
-        }])));
-        app.handle_async(svn::AsyncSvnNotification::Log(Ok(vec![])));
+        app.handle_async(svn::AsyncSvnNotification::Status(
+            0,
+            Ok(vec![StatusEntry {
+                status: 'M',
+                props_status: ' ',
+                tree_conflict: ' ',
+                path: "Cargo.toml".to_string(),
+                is_dir: false,
+            }]),
+        ));
+        app.handle_async(svn::AsyncSvnNotification::Log(0, Ok(vec![])));
 
         let backend = TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

@@ -51,8 +51,10 @@ pub struct StatusEntry {
 }
 
 impl StatusEntry {
+    /// Text conflict (column 1), property conflict (column 2) or tree
+    /// conflict (column 7)
     pub fn is_conflicted(&self) -> bool {
-        self.status == 'C' || self.tree_conflict == 'C'
+        self.status == 'C' || self.props_status == 'C' || self.tree_conflict == 'C'
     }
 }
 
@@ -184,6 +186,20 @@ mod tests {
         assert!(e.is_conflicted());
         e.status = 'M';
         e.tree_conflict = 'C';
+        assert!(e.is_conflicted());
+    }
+
+    #[test]
+    fn props_conflict_is_conflicted() {
+        // " C      f.txt": a property-only conflict sets column 2 and
+        // leaves column 1 blank — it must still count as conflicted
+        let e = StatusEntry {
+            status: ' ',
+            props_status: 'C',
+            tree_conflict: ' ',
+            path: "f.txt".into(),
+            is_dir: false,
+        };
         assert!(e.is_conflicted());
     }
 

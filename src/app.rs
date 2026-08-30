@@ -39,6 +39,25 @@ enum PendingFullscreen {
     Range(u64, u64),
 }
 
+/// Cap for path lists in confirmation messages; beyond it a
+/// ", … and N more" tail is appended (same style as the commit
+/// confirmation's file list).
+const MAX_CONFIRM_LISTED: usize = 8;
+
+/// Join paths for a confirmation message, capped at
+/// [`MAX_CONFIRM_LISTED`] entries: reverting a huge directory would
+/// otherwise build an MB-scale popup string.
+fn join_paths_capped(paths: &[String]) -> String {
+    let mut out = paths[..paths.len().min(MAX_CONFIRM_LISTED)].join(", ");
+    if paths.len() > MAX_CONFIRM_LISTED {
+        out.push_str(&format!(
+            ", … and {} more",
+            paths.len() - MAX_CONFIRM_LISTED
+        ));
+    }
+    out
+}
+
 /// Display name of a patch file path.
 fn patch_name(path: &std::path::Path) -> String {
     path.file_name()
@@ -75,6 +94,16 @@ pub struct App {
     pending_fullscreen: Option<(u64, PendingFullscreen)>,
     /// Next token for a fullscreen diff request (see [`PendingFullscreen`])
     next_req_id: u64,
+    /// Highest applied `svn status` request id; older results arriving
+    /// out of order are dropped (a stale snapshot would overwrite newer
+    /// state and its staged-pruning would silently unstale fresh paths)
+    last_status_id: u64,
+    /// Highest applied `svn log` request id, as above
+    last_log_id: u64,
+    /// FIFO of `svn add` batches in flight (mutations run serialized, so
+    /// notifications arrive in issue order); a failed add un-stages its
+    /// paths so they cannot poison the next commit
+    pending_adds: std::collections::VecDeque<Vec<String>>,
 }
 
 impl App {
@@ -100,6 +129,9 @@ impl App {
             spinner_frame: Cell::new(0),
             pending_fullscreen: None,
             next_req_id: 1,
+            last_status_id: 0,
+            last_log_id: 0,
+            pending_adds: std::collections::VecDeque::new(),
         }
     }
 
@@ -298,11 +330,25 @@ impl App {
                 self.push_popup(Popup::log_search(&ctx, &current));
             }
             InternalEvent::LogSearchInput(text) => {
-                // while server-side search results are shown the live
-                // filter is ignored; drop search mode so typing in the
-                // popup filters what is on screen again
-                self.log.clear_search();
-                self.log.set_filter(text);
+                // Esc closing an unchanged pre-filled popup re-sends the
+                // current filter: a no-op that must NOT drop an active
+                // server-side search (entries that only matched via
+                // changed paths would vanish from the list)
+                if text != self.log.filter() {
+                    // while server-side search results are shown the live
+                    // filter is ignored; drop search mode so typing in the
+                    // popup filters what is on screen again
+                    let was_searching = self.log.search_pattern().is_some();
+                    self.log.clear_search();
+                    self.log.set_filter(text);
+                    if was_searching {
+                        // the entries are non-contiguous search results;
+                        // reload the plain log so pagination cannot append
+                        // pages onto a gapped, fake full history
+                        self.svn.log(50);
+                        self.pending += 1;
+                    }
+                }
             }
             InternalEvent::OpenStatusFilter => {
                 let ctx = self.ctx.clone();
@@ -345,7 +391,7 @@ impl App {
                         self.commit_confirm_message(message, paths)
                     }
                     ConfirmAction::Revert(paths) => {
-                        format!("{} ({})", MSG.revert_confirm, paths.join(", "))
+                        format!("{} ({})", MSG.revert_confirm, join_paths_capped(paths))
                     }
                     ConfirmAction::Update => format!(
                         "{}\nWorking copy: {}",
@@ -381,11 +427,20 @@ impl App {
             }
             InternalEvent::AddFiles(paths) => {
                 if !paths.is_empty() {
+                    // remembered so a failed add can un-stage its paths
+                    // (mutations run serialized: results arrive in order)
+                    self.pending_adds.push_back(paths.clone());
                     self.svn.add(&paths);
                     self.pending += 1;
                 }
             }
             InternalEvent::RequestFileDiff => {
+                // one fullscreen diff at a time: a second request while
+                // one is in flight would orphan the first (its result
+                // would be silently discarded), so ignore it entirely
+                if self.pending_fullscreen.is_some() {
+                    return;
+                }
                 if let (Some(path), true) = (
                     self.status.tree.selection_path(),
                     self.status.tree.selection_entry().is_some(),
@@ -411,6 +466,10 @@ impl App {
                 }
             }
             InternalEvent::RequestRevisionDiff(rev) => {
+                // single in-flight fullscreen slot (see RequestFileDiff)
+                if self.pending_fullscreen.is_some() {
+                    return;
+                }
                 let id = self.next_req_id;
                 self.next_req_id += 1;
                 self.pending_fullscreen = Some((id, PendingFullscreen::Revision(rev)));
@@ -418,6 +477,10 @@ impl App {
                 self.pending += 1;
             }
             InternalEvent::RequestRangeDiff(revs) => {
+                // single in-flight fullscreen slot (see RequestFileDiff)
+                if self.pending_fullscreen.is_some() {
+                    return;
+                }
                 if let (Some(&from), Some(&to)) = (revs.iter().min(), revs.iter().max()) {
                     let id = self.next_req_id;
                     self.next_req_id += 1;
@@ -481,7 +544,8 @@ impl App {
     fn open_file_history(&mut self, path: &str) {
         let ctx = self.ctx.clone();
         self.push_popup(Popup::file_log(&ctx, path));
-        self.svn.file_log(path, 50);
+        self.svn
+            .file_log(path, crate::components::file_log::FILE_LOG_LIMIT);
         self.pending += 1;
     }
 
@@ -535,7 +599,8 @@ impl App {
     fn perform_confirmed(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::Commit { message, mut paths } => {
-                if paths.is_empty() {
+                let from_staged = paths.is_empty();
+                if from_staged {
                     paths = self.status.tree.staged.iter().cloned().collect();
                 }
                 // last-line guard: never hand svn an empty target list,
@@ -544,7 +609,11 @@ impl App {
                     self.show_error(MSG.commit_nothing_staged.to_string());
                     return;
                 }
-                self.svn.commit(&message, &paths);
+                // a staged directory target must commit only its own
+                // changes: --depth empty keeps unstaged descendants out
+                // of the commit (file targets are unaffected by it)
+                let depth_empty = from_staged && self.status.tree.staged_contains_dir();
+                self.svn.commit(&message, &paths, depth_empty);
                 self.pending += 1;
             }
             ConfirmAction::Revert(paths) => {
@@ -641,13 +710,27 @@ impl App {
                     self.show_error(msg);
                 }
             },
-            AsyncSvnNotification::Status(result) => match result {
-                Ok(entries) => {
-                    self.status.update_status(entries);
-                    self.maybe_request_diff();
+            AsyncSvnNotification::Status(id, result) => {
+                // two concurrent `svn status` runs can finish out of
+                // order; an older snapshot must not overwrite newer state
+                // (its staged-pruning would silently drop paths that were
+                // staged against the newer data)
+                if id < self.last_status_id {
+                    return;
                 }
-                Err(e) => self.show_error(format!("svn status: {e}")),
-            },
+                self.last_status_id = id;
+                match result {
+                    Ok(entries) => {
+                        self.status.update_status(entries);
+                        self.maybe_request_diff();
+                    }
+                    Err(e) => {
+                        // leave the tree out of its Loading state
+                        self.status.tree.pending = false;
+                        self.show_error(format!("svn status: {e}"));
+                    }
+                }
+            }
             AsyncSvnNotification::RepoInfo(result) => match result {
                 Ok(pair) => {
                     let (local, head) = *pair;
@@ -680,24 +763,39 @@ impl App {
                 }
                 Err(e) => {
                     self.take_pending_fullscreen(req);
+                    // a failed status-pane preview (no token) must not
+                    // leave the diff panel on "Loading…" forever, and the
+                    // dedup key is cleared so re-selecting the file retries
+                    if req.is_none() {
+                        self.status.diff_failed(&path);
+                    }
                     self.show_error(format!("svn diff {path}: {e}"));
                 }
             },
-            AsyncSvnNotification::Log(result) => match result {
-                Ok(entries) => {
-                    // keep the commit input's Tab picker stocked with the
-                    // most recent commit messages
-                    let history: Vec<String> = entries
-                        .iter()
-                        .map(|e| e.summary())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    self.status.commit.set_history(history);
-                    self.log.clear_search();
-                    self.log.update(entries);
+            AsyncSvnNotification::Log(id, result) => {
+                // out-of-order completion (as on `Status`): an older plain
+                // `svn log` must not clear_search + overwrite the newer
+                // list — e.g. full-history search results on screen
+                if id < self.last_log_id {
+                    return;
                 }
-                Err(e) => self.show_error(format!("svn log: {e}")),
-            },
+                self.last_log_id = id;
+                match result {
+                    Ok(entries) => {
+                        // keep the commit input's Tab picker stocked with the
+                        // most recent commit messages
+                        let history: Vec<String> = entries
+                            .iter()
+                            .map(|e| e.summary())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        self.status.commit.set_history(history);
+                        self.log.clear_search();
+                        self.log.update(entries);
+                    }
+                    Err(e) => self.show_error(format!("svn log: {e}")),
+                }
+            }
             AsyncSvnNotification::LogSearch { pattern, result } => {
                 // one thread per op: results can arrive out of order, and
                 // a full-history search is usually slower than a plain
@@ -724,13 +822,26 @@ impl App {
                 // the list — they pass `visible_indices` unfiltered)
                 let tail = self.log.entries.last().map(|e| e.revision);
                 if self.log.search_pattern().is_some() || tail != Some(before_rev) {
+                    // dropping the result must still release the pagination
+                    // guard, otherwise `loading_more` stays true and paging
+                    // is wedged once the search is cleared
+                    self.log.append_failed();
                     return;
                 }
                 match result {
                     Ok(entries) => self.log.append(entries),
                     Err(e) => {
-                        self.log.append_failed();
-                        self.show_error(format!("svn log: {e}"));
+                        // E195012: the path did not exist before the oldest
+                        // loaded revision — the normal end of history when
+                        // the wc root is a repo subdirectory, not an error;
+                        // stop paginating instead of retrying on every
+                        // scroll to the bottom
+                        if e.contains("E195012") {
+                            self.log.mark_history_exhausted();
+                        } else {
+                            self.log.append_failed();
+                            self.show_error(format!("svn log: {e}"));
+                        }
                     }
                 }
             }
@@ -874,12 +985,17 @@ impl App {
             },
             AsyncSvnNotification::Add(result) => match result {
                 Ok(_) => {
+                    self.pending_adds.pop_front();
                     // no set_staged write-back: the tree's staged set is
                     // authoritative (the user may have unstaged meanwhile)
                     self.show_info(MSG.add_done.to_string());
                     self.refresh_after_op();
                 }
                 Err(e) => {
+                    // roll the failed paths out of the commit set: left
+                    // staged, they would poison the next commit
+                    let paths = self.pending_adds.pop_front().unwrap_or_default();
+                    self.status.unset_staged(&paths);
                     self.show_error(format!("svn add: {e}"));
                 }
             },
@@ -1112,20 +1228,20 @@ mod tests {
         let second = recv(&rx);
         assert!(matches!(
             first,
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
         assert!(matches!(
             second,
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
         assert!(matches!(
             (&first, &second),
             (
-                AsyncSvnNotification::Status(_),
-                AsyncSvnNotification::Log(_)
+                AsyncSvnNotification::Status(..),
+                AsyncSvnNotification::Log(..)
             ) | (
-                AsyncSvnNotification::Log(_),
-                AsyncSvnNotification::Status(_)
+                AsyncSvnNotification::Log(..),
+                AsyncSvnNotification::Status(..)
             )
         ));
         assert!(app.pending > 0);
@@ -1179,10 +1295,10 @@ mod tests {
     fn status_log_diff_updates_components() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
-            entry('M', "a.txt"),
-            entry('?', "b.txt"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt"), entry('?', "b.txt")]),
+        ));
         assert_eq!(app.status.tree.selection_path().as_deref(), Some("a.txt"));
         // diff gets requested (async) and applies when it arrives
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
@@ -1193,16 +1309,16 @@ mod tests {
         });
         assert!(!app.status.diff.pending);
 
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "three"),
-            log_entry(2, "two"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "three"), log_entry(2, "two")]),
+        ));
         assert_eq!(app.log.selection_revision(), Some(3));
 
         // error paths
-        app.handle_async(AsyncSvnNotification::Status(Err("boom".into())));
+        app.handle_async(AsyncSvnNotification::Status(0, Err("boom".into())));
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
-        app.handle_async(AsyncSvnNotification::Log(Err("boom".into())));
+        app.handle_async(AsyncSvnNotification::Log(0, Err("boom".into())));
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
             req: None,
@@ -1216,9 +1332,10 @@ mod tests {
         let (mut app, rx) = app_with(&repo);
         // load a status so the tree has a selected file (top-level so the
         // dir-collapsed tree selects it directly)
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
-            'M', "main.rs",
-        )])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "main.rs")]),
+        ));
         // that triggers a diff request for the selection; consume it
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { path, .. } if path == "main.rs"));
         // request revision diff through the queue
@@ -1275,10 +1392,10 @@ mod tests {
         ));
         // unversioned paths (status '?') are still rejected
         app.popups.clear();
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
-            '?',
-            "scratch.txt",
-        )])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('?', "scratch.txt")]),
+        ));
         // the status update triggers a diff request for the selection
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
         app.queue
@@ -1333,7 +1450,10 @@ mod tests {
     fn revision_diff_attaches_commit_header() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![log_entry(3, "three")])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "three")]),
+        ));
         app.queue.push(InternalEvent::RequestRevisionDiff(3));
         app.handle_queue_events();
         assert!(matches!(
@@ -1373,10 +1493,10 @@ mod tests {
     fn range_diff_attaches_commit_header() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "three"),
-            log_entry(1, "one"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "three"), log_entry(1, "one")]),
+        ));
         app.queue.push(InternalEvent::RequestRangeDiff(vec![1, 3]));
         app.handle_queue_events();
         assert!(matches!(
@@ -1402,7 +1522,10 @@ mod tests {
     fn file_diff_fullscreen_matches_selection() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry('M', "a.txt")])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt")]),
+        ));
         let _ = recv(&rx); // diff request for a.txt
         app.queue.push(InternalEvent::RequestFileDiff);
         app.handle_queue_events();
@@ -1427,7 +1550,7 @@ mod tests {
         assert!(matches!(app.popups.last(), Some(Popup::Output(_))));
         assert!(matches!(
             recv(&rx),
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
         app.handle_async(AsyncSvnNotification::Update(Err("network down".into())));
 
@@ -1442,11 +1565,11 @@ mod tests {
         let msgs = [recv(&rx), recv(&rx), recv(&rx)];
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, AsyncSvnNotification::Status(_)))
+                .any(|m| matches!(m, AsyncSvnNotification::Status(..)))
         );
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, AsyncSvnNotification::Log(_)))
+                .any(|m| matches!(m, AsyncSvnNotification::Log(..)))
         );
 
         // commit error → error popup, staged stays
@@ -1459,26 +1582,26 @@ mod tests {
         // no write-back); add err → error
         app.handle_async(AsyncSvnNotification::Add(Ok(vec!["b.txt".into()])));
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.handle_async(AsyncSvnNotification::Add(Err("E155010".into())));
 
         // revert ok → unstaged + refresh
         app.status.set_staged(&["b.txt".into()]);
         app.handle_async(AsyncSvnNotification::Revert(Ok(vec!["b.txt".into()])));
         assert!(!app.status.tree.staged.contains("b.txt"));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.handle_async(AsyncSvnNotification::Revert(Err("boom".into())));
 
         // resolve ok / err
         app.handle_async(AsyncSvnNotification::Resolve(Ok("c.txt".into())));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.handle_async(AsyncSvnNotification::Resolve(Err("boom".into())));
 
         // update to revision ok / err
         app.handle_async(AsyncSvnNotification::UpdateToRevision(Ok(
             "Updated to r1.".into()
         )));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.handle_async(AsyncSvnNotification::UpdateToRevision(Err("boom".into())));
     }
 
@@ -1582,20 +1705,20 @@ mod tests {
         let m2 = recv(&rx);
         assert!(matches!(
             m1,
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
         assert!(matches!(
             m2,
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
 
         app.queue.push(InternalEvent::Update(NeedsUpdate::LOG));
         app.handle_queue_events();
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Log(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Log(..)));
 
         app.queue.push(InternalEvent::RefreshStatus);
         app.handle_queue_events();
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
 
         app.queue
             .push(InternalEvent::AddFiles(vec!["x.txt".into()]));
@@ -1629,7 +1752,10 @@ mod tests {
     fn handle_input_routing() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry('M', "a.txt")])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt")]),
+        ));
 
         // q quits
         app.handle_input(&ts_key(KeyCode::Char('q'))).unwrap();
@@ -1728,7 +1854,10 @@ mod tests {
         app.maybe_request_diff();
         assert!(app.pending == 0);
         app.active_tab = Tab::Status;
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry('M', "a.txt")])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt")]),
+        ));
         let _ = recv(&rx); // diff request
     }
 
@@ -1736,8 +1865,14 @@ mod tests {
     fn draw_status_log_and_popups() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry('M', "a.txt")])));
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![log_entry(3, "three")])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt")]),
+        ));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "three")]),
+        ));
 
         // status tab
         let backend = TestBackend::new(120, 40);
@@ -1791,11 +1926,11 @@ mod tests {
         let m2 = recv(&rx);
         assert!(matches!(
             m1,
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
         assert!(matches!(
             m2,
-            AsyncSvnNotification::Status(_) | AsyncSvnNotification::Log(_)
+            AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
     }
 
@@ -1834,10 +1969,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         // the composed overview lands in a scrollable output popup
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
-            entry('M', "a.txt"),
-            entry('?', "b.txt"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt"), entry('?', "b.txt")]),
+        ));
         app.status.tree.set_staged(&["a.txt".into()]);
         let mut head = test_info();
         head.revision = 10;
@@ -1918,10 +2053,10 @@ mod tests {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
         app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
-            entry('M', "a.txt"),
-            entry('M', "src/b.rs"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt"), entry('M', "src/b.rs")]),
+        ));
         app.status.set_staged(&["src/b.rs".into()]);
         app.queue
             .push(InternalEvent::Confirm(ConfirmAction::Commit {
@@ -1945,10 +2080,10 @@ mod tests {
         let (mut app, _rx) = app_with(&repo);
         app.handle_async(AsyncSvnNotification::Info(Ok(test_info())));
         let names: Vec<String> = (0..10).map(|i| format!("f{i:02}.txt")).collect();
-        app.handle_async(AsyncSvnNotification::Status(Ok(names
-            .iter()
-            .map(|n| entry('M', n))
-            .collect())));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(names.iter().map(|n| entry('M', n)).collect()),
+        ));
         app.status.set_staged(&names);
         app.queue
             .push(InternalEvent::Confirm(ConfirmAction::Commit {
@@ -2039,10 +2174,10 @@ mod tests {
     fn log_search_popup_flow() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "third"),
-            log_entry(2, "second"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
 
         // OpenLogSearch opens the popup pre-filled with the current filter
         app.log.set_filter("thi".into());
@@ -2082,10 +2217,10 @@ mod tests {
     fn status_filter_popup_flow() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![
-            entry('M', "alpha.txt"),
-            entry('?', "beta.txt"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "alpha.txt"), entry('?', "beta.txt")]),
+        ));
 
         // OpenStatusFilter opens the popup pre-filled with the current filter
         app.status.tree.set_filter("al".into());
@@ -2116,10 +2251,10 @@ mod tests {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
         // pretend the list ends at r2 so older pages exist
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "third"),
-            log_entry(2, "second"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
 
         app.queue.push(InternalEvent::LogLoadMore);
         app.handle_queue_events();
@@ -2153,10 +2288,10 @@ mod tests {
     fn out_of_order_log_results_are_dropped() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "third"),
-            log_entry(2, "second"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
 
         // a search starts (full history, usually slower than the paged
         // log); while it is in flight the tail is still r2
@@ -2196,7 +2331,7 @@ mod tests {
         // Esc/refresh cleared the search: a late search result must not
         // overwrite the fresh list
         app.log.clear_search();
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![log_entry(5, "five")])));
+        app.handle_async(AsyncSvnNotification::Log(0, Ok(vec![log_entry(5, "five")])));
         app.handle_async(AsyncSvnNotification::LogSearch {
             pattern: "other".into(),
             result: Ok(vec![log_entry(9, "stale")]),
@@ -2221,10 +2356,10 @@ mod tests {
     fn typing_in_search_popup_clears_server_search() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "third"),
-            log_entry(2, "second"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
         // run a full-history search and apply its results
         app.queue.push(InternalEvent::SearchLog("second".into()));
         app.handle_queue_events();
@@ -2278,9 +2413,6 @@ mod tests {
     fn fullscreen_diff_result_requires_matching_token() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        // two fullscreen requests for the same revision back to back: the
-        // first is superseded, so its late result must not open a popup or
-        // clear the newer pending request
         app.queue.push(InternalEvent::RequestRevisionDiff(3));
         app.handle_queue_events();
         assert!(matches!(
@@ -2291,6 +2423,38 @@ mod tests {
                 ..
             }
         ));
+        // a second fullscreen request while one is in flight is ignored:
+        // no new svn call, the pending slot is untouched
+        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.handle_queue_events();
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert!(matches!(app.pending_fullscreen, Some((1, _))));
+        // a token-less status-pane preview never opens a popup either
+        app.handle_async(AsyncSvnNotification::Diff {
+            path: "a.txt".into(),
+            req: None,
+            result: Ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
+        assert!(app.pending_fullscreen.is_some());
+        // a result with a foreign token is dropped
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: Some(99),
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
+        assert!(app.pending_fullscreen.is_some());
+        // the current token opens the popup and clears the pending request
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: Some(1),
+            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
+        assert!(app.pending_fullscreen.is_none());
+        // with the slot free again, a new request goes through
+        app.popups.clear();
         app.queue.push(InternalEvent::RequestRevisionDiff(3));
         app.handle_queue_events();
         assert!(matches!(
@@ -2301,39 +2465,16 @@ mod tests {
                 ..
             }
         ));
-        // stale result for the superseded request: silently dropped
-        app.handle_async(AsyncSvnNotification::RevisionDiff {
-            revision: 3,
-            req: Some(1),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
-        });
-        assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
-        assert!(app.pending_fullscreen.is_some());
-        // a token-less status-pane preview never opens a popup either
-        app.handle_async(AsyncSvnNotification::Diff {
-            path: "a.txt".into(),
-            req: None,
-            result: Ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
-        });
-        assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
-        assert!(app.pending_fullscreen.is_some());
-        // the current token opens the popup and clears the pending request
-        app.handle_async(AsyncSvnNotification::RevisionDiff {
-            revision: 3,
-            req: Some(2),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
-        });
-        assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
-        assert!(app.pending_fullscreen.is_none());
     }
 
     #[test]
     fn file_history_flow() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
-            'M', "main.rs",
-        )])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "main.rs")]),
+        ));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
         // request history of the selected file
         app.queue.push(InternalEvent::RequestFileHistory);
@@ -2358,9 +2499,10 @@ mod tests {
 
         // unversioned file → error message, no popup
         app.popups.clear();
-        app.handle_async(AsyncSvnNotification::Status(Ok(vec![entry(
-            '?', "new.txt",
-        )])));
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('?', "new.txt")]),
+        ));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
         app.queue.push(InternalEvent::RequestFileHistory);
         app.handle_queue_events();
@@ -2419,10 +2561,10 @@ mod tests {
     fn log_load_stocks_commit_history_picker() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
-        app.handle_async(AsyncSvnNotification::Log(Ok(vec![
-            log_entry(3, "third"),
-            log_entry(2, "second"),
-        ])));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
         // focus the commit input and press Tab → the picker opens
         app.queue.push(InternalEvent::OpenCommit);
         app.handle_queue_events();
@@ -2516,7 +2658,7 @@ mod tests {
         );
         // success shows the svn output and refreshes the status
         assert!(matches!(app.popups.last(), Some(Popup::Output(_))));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.popups.clear();
 
         // delete the patch, again behind confirmation
@@ -2569,7 +2711,7 @@ mod tests {
             panic!("expected error popup");
         };
         assert!(m.is_error);
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(_)));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
     }
 
     #[test]
@@ -2728,6 +2870,312 @@ mod tests {
         assert!(!s.contains("a apply"), "{s}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_with_staged_directory_uses_depth_empty() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // schedule a new directory with a file inside
+        test_support::write_file(&repo.wc.join("newdir/file.txt"), "hi\n");
+        repo.svn(&["add", "newdir"]);
+        // the tree knows the staged target is a directory
+        let dir_entry = StatusEntry {
+            status: 'A',
+            props_status: ' ',
+            tree_conflict: ' ',
+            path: "newdir".into(),
+            is_dir: true,
+        };
+        app.handle_async(AsyncSvnNotification::Status(0, Ok(vec![dir_entry])));
+        app.status.set_staged(&["newdir".into()]);
+        app.perform_confirmed(ConfirmAction::Commit {
+            message: "add dir".into(),
+            paths: vec![],
+        });
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(_)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        // --depth empty committed the directory itself only: the child
+        // file is still scheduled for addition, not swept into the commit
+        let out = repo.svn(&["status"]);
+        assert!(out.contains("newdir/file.txt"), "{out}");
+        assert!(!out.lines().any(|l| l.ends_with("newdir")), "{out}");
+    }
+
+    #[test]
+    fn out_of_order_status_results_are_dropped() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // the newer snapshot arrives first; a path is staged from it
+        app.handle_async(AsyncSvnNotification::Status(
+            5,
+            Ok(vec![entry('M', "a.txt")]),
+        ));
+        let _ = recv(&rx); // preview diff request for a.txt
+        app.status.set_staged(&["a.txt".into()]);
+        // an older snapshot completes late: fully dropped — the tree is
+        // not overwritten and the staged path is not pruned
+        app.handle_async(AsyncSvnNotification::Status(4, Ok(vec![])));
+        assert_eq!(app.status.tree.staged_count(), 1);
+        assert_eq!(app.status.tree.selection_path().as_deref(), Some("a.txt"));
+        // an older error is dropped silently too (no error popup)
+        app.handle_async(AsyncSvnNotification::Status(4, Err("boom".into())));
+        assert!(app.popups.is_empty());
+        // an even newer snapshot still applies
+        app.handle_async(AsyncSvnNotification::Status(
+            6,
+            Ok(vec![entry('M', "b.txt")]),
+        ));
+        assert_eq!(app.status.tree.selection_path().as_deref(), Some("b.txt"));
+        let _ = recv(&rx);
+    }
+
+    #[test]
+    fn out_of_order_log_results_do_not_clobber_search() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            5,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        // a full-history search is showing its results
+        app.queue.push(InternalEvent::SearchLog("fix".into()));
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "fix".into(),
+            result: Ok(vec![log_entry(9, "fix something")]),
+        });
+        assert_eq!(app.log.entries.len(), 1);
+        // an older plain-log result completes late: dropped, the search
+        // results and the search mode survive
+        app.handle_async(AsyncSvnNotification::Log(
+            4,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        assert_eq!(app.log.entries.len(), 1);
+        assert_eq!(app.log.search_pattern(), Some("fix"));
+        // a newer plain log still applies (and clears the search)
+        app.handle_async(AsyncSvnNotification::Log(
+            6,
+            Ok(vec![log_entry(7, "seven")]),
+        ));
+        assert_eq!(app.log.entries[0].revision, 7);
+        assert!(app.log.search_pattern().is_none());
+    }
+
+    #[test]
+    fn failed_diff_preview_unsticks_panel_and_allows_retry() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('M', "a.txt")]),
+        ));
+        // selecting the file issued a preview diff; the panel is Loading
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
+        assert!(app.status.diff.pending);
+        assert_eq!(app.status.last_diff_requested.as_deref(), Some("a.txt"));
+        // the preview fails: the panel leaves Loading, the dedup key is
+        // cleared and the error is shown
+        app.handle_async(AsyncSvnNotification::Diff {
+            path: "a.txt".into(),
+            req: None,
+            result: Err("boom".into()),
+        });
+        assert!(!app.status.diff.pending);
+        assert!(app.status.diff.empty_reason.is_some());
+        assert!(app.status.last_diff_requested.is_none());
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        app.popups.clear();
+        // moving the selection away and back retries the request
+        assert_eq!(app.status.maybe_request_diff().as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn failed_status_unsticks_the_tree() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        assert!(app.status.tree.pending);
+        app.handle_async(AsyncSvnNotification::Status(0, Err("boom".into())));
+        assert!(!app.status.tree.pending);
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn stale_log_append_still_releases_pagination() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        // scrolling to the bottom starts a load-more request
+        app.log.event(&ts_key(KeyCode::End)).unwrap();
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::LogAppend { .. }));
+        // a search starts before the page arrives; the stale page is
+        // dropped but must still release the pagination guard
+        app.log.set_search_active("fix".into());
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 2,
+            result: Ok(vec![log_entry(1, "first")]),
+        });
+        assert_eq!(app.log.entries.len(), 2, "stale append dropped");
+        // after the search is cleared, pagination works again
+        app.log.clear_search();
+        app.log.event(&ts_key(KeyCode::End)).unwrap();
+        app.handle_queue_events();
+        assert!(
+            matches!(recv(&rx), AsyncSvnNotification::LogAppend { .. }),
+            "pagination must not stay wedged"
+        );
+    }
+
+    #[test]
+    fn e195012_marks_history_exhausted_without_error_popup() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        app.log.event(&ts_key(KeyCode::End)).unwrap();
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::LogAppend { .. }));
+        // the path's history starts at r2: the normal end of pagination,
+        // not an error to show
+        app.handle_async(AsyncSvnNotification::LogAppend {
+            before_rev: 2,
+            result: Err(
+                "svn: E195012: Unable to find repository location for '2' in revision 0".into(),
+            ),
+        });
+        assert!(app.popups.is_empty(), "E195012 must not pop an error");
+        // scrolling to the bottom issues no further requests
+        app.log.event(&ts_key(KeyCode::End)).unwrap();
+        app.handle_queue_events();
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        // a full reload re-arms pagination
+        app.handle_async(AsyncSvnNotification::Log(
+            1,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        app.log.event(&ts_key(KeyCode::End)).unwrap();
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::LogAppend { .. }));
+    }
+
+    #[test]
+    fn failed_add_unstages_the_failed_paths() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.status.set_staged(&["x.txt".into(), "y.txt".into()]);
+        app.queue.push(InternalEvent::AddFiles(vec![
+            "x.txt".into(),
+            "y.txt".into(),
+        ]));
+        app.handle_queue_events();
+        // the real svn add fails (the files do not exist)
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Err(_))));
+        app.handle_async(AsyncSvnNotification::Add(Err("svn: E155010".into())));
+        // the failed paths are rolled out of the commit set
+        assert_eq!(app.status.tree.staged_count(), 0);
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn revert_confirm_truncates_long_path_list() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let paths: Vec<String> = (0..10).map(|i| format!("dir/f{i:02}.txt")).collect();
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Revert(paths)));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p.message.contains("dir/f00.txt"), "{}", p.message);
+        assert!(p.message.contains("dir/f07.txt"), "{}", p.message);
+        assert!(!p.message.contains("dir/f08.txt"), "{}", p.message);
+        assert!(p.message.contains("… and 2 more"), "{}", p.message);
+        // a short list is shown in full
+        app.popups.clear();
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Revert(vec![
+                "a.txt".into(),
+            ])));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p2)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p2.message.contains("(a.txt)"), "{}", p2.message);
+        assert!(!p2.message.contains("more"), "{}", p2.message);
+    }
+
+    #[test]
+    fn unchanged_search_popup_text_keeps_server_search() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        // type "second", then Enter: full-history search results shown
+        app.queue
+            .push(InternalEvent::LogSearchInput("second".into()));
+        app.handle_queue_events();
+        app.queue.push(InternalEvent::SearchLog("second".into()));
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "second".into(),
+            result: Ok(vec![log_entry(2, "second")]),
+        });
+        assert_eq!(app.log.search_pattern(), Some("second"));
+        assert_eq!(app.log.entries.len(), 1);
+        // reopen the popup (pre-filled with the current text) and close
+        // it unchanged: Esc re-sends the initial text, which is a no-op —
+        // the search mode and its results survive, and no reload is issued
+        app.queue.push(InternalEvent::OpenLogSearch);
+        app.handle_queue_events();
+        app.queue
+            .push(InternalEvent::LogSearchInput("second".into()));
+        app.handle_queue_events();
+        assert_eq!(app.log.search_pattern(), Some("second"));
+        assert_eq!(app.log.entries.len(), 1);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn changed_search_popup_text_reloads_the_plain_log() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third"), log_entry(2, "second")]),
+        ));
+        app.queue
+            .push(InternalEvent::LogSearchInput("second".into()));
+        app.handle_queue_events();
+        app.queue.push(InternalEvent::SearchLog("second".into()));
+        app.handle_queue_events();
+        let _ = recv(&rx);
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "second".into(),
+            result: Ok(vec![log_entry(2, "second")]),
+        });
+        assert_eq!(app.log.search_pattern(), Some("second"));
+        // typing a *different* text drops the search mode AND reloads the
+        // plain paged log, so pagination cannot append pages onto the
+        // sparse search results
+        app.queue.push(InternalEvent::LogSearchInput("thi".into()));
+        app.handle_queue_events();
+        assert!(app.log.search_pattern().is_none());
+        assert_eq!(app.log.filter(), "thi");
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Log(..)));
     }
 
     fn ts_key(code: crossterm::event::KeyCode) -> crossterm::event::Event {

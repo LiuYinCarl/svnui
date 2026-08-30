@@ -108,8 +108,14 @@ impl TextView {
             self.search.start_input();
             return SearchOutcome::Consumed;
         }
-        let plain =
-            |c: char| k.code == KeyCode::Char(c) && !k.modifiers.contains(KeyModifiers::CONTROL);
+        // plain char, no ctrl/alt: macOS Option+n reports Char('n')+ALT
+        // and must not trigger search cycling (same hygiene as is_key)
+        let plain = |c: char| {
+            k.code == KeyCode::Char(c)
+                && !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        };
         let jump = if plain('n') {
             self.search.next_match()
         } else if plain('N') {
@@ -289,6 +295,38 @@ mod tests {
             KeyModifiers::CONTROL,
         ));
         assert_eq!(tv.search_event(&ctrl_n, &lines, 0), SearchOutcome::Ignored);
+    }
+
+    #[test]
+    fn alt_modified_chars_are_not_search_cycling() {
+        // macOS Option+n reports Char('n')+ALT; with a confirmed search
+        // active it must not jump to the next match
+        let mut tv = TextView::new();
+        let lines: Vec<&str> = LINES.to_vec();
+        tv.search.start_input();
+        for c in "foo".chars() {
+            tv.search_event(&ts::key(KeyCode::Char(c)), &lines, 0);
+        }
+        tv.search_event(&ts::key(KeyCode::Enter), &lines, 0);
+        assert_eq!(tv.search.match_count(), 3);
+        let alt_n = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::ALT,
+        ));
+        assert_eq!(tv.search_event(&alt_n, &lines, 0), SearchOutcome::Ignored);
+        let alt_big_n = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('N'),
+            KeyModifiers::ALT,
+        ));
+        assert_eq!(
+            tv.search_event(&alt_big_n, &lines, 0),
+            SearchOutcome::Ignored
+        );
+        // plain n still cycles
+        assert_eq!(
+            tv.search_event(&ts::key(KeyCode::Char('n')), &lines, 0),
+            SearchOutcome::Reveal(2)
+        );
     }
 
     #[test]

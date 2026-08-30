@@ -26,6 +26,17 @@ struct Node {
     children: Vec<Node>,
 }
 
+/// Cached per-directory rendering info: staged/total counts covering the
+/// directory's own status entry plus descendant files, and the directory's
+/// own status entry (for showing its status char on the dir line).
+#[derive(Clone, Copy, Default)]
+struct DirCounts {
+    staged: usize,
+    total: usize,
+    /// (status char, tree-conflicted) of the dir's own status entry
+    own_status: Option<(char, bool)>,
+}
+
 pub struct StatusTreeComponent {
     ctx: Context,
     entries: Vec<StatusEntry>,
@@ -38,9 +49,9 @@ pub struct StatusTreeComponent {
     filter: String,
     pub pending: bool,
     pub focused: bool,
-    /// Cache of per-directory (staged, total) file counts, recomputed only
-    /// when the staged set or the status entries change (not per draw).
-    counts_cache: std::cell::RefCell<std::collections::HashMap<String, (usize, usize)>>,
+    /// Cache of per-directory counts, recomputed only when the staged set
+    /// or the status entries change (not per draw).
+    counts_cache: std::cell::RefCell<std::collections::HashMap<String, DirCounts>>,
     counts_dirty: std::cell::Cell<bool>,
 }
 
@@ -196,6 +207,28 @@ impl StatusTreeComponent {
             self.counts_dirty.set(true);
         }
         self.staged.clear();
+    }
+
+    /// Whether the staged set contains any directory path. Staged paths
+    /// without a current status entry count as non-directories.
+    pub fn staged_contains_dir(&self) -> bool {
+        let by_path = self.entries_by_path();
+        self.staged
+            .iter()
+            .any(|p| by_path.get(p.as_str()).is_some_and(|e| e.is_dir))
+    }
+
+    /// Remove paths from the staged set; paths that are not staged are
+    /// silently skipped. The staged-counts cache is invalidated only when
+    /// something was actually removed.
+    pub fn unstage_paths(&mut self, paths: &[String]) {
+        let mut removed = false;
+        for p in paths {
+            removed |= self.staged.remove(p);
+        }
+        if removed {
+            self.counts_dirty.set(true);
+        }
     }
 
     pub fn staged_count(&self) -> usize {
@@ -493,6 +526,19 @@ fn stageable(e: &StatusEntry) -> bool {
     !matches!(e.status, '!' | '~') && !e.is_conflicted()
 }
 
+/// Status char shown for an entry: a tree conflict dominates, then the
+/// text status, falling back to the props status so property-only changes
+/// (and property conflicts) stay visible instead of rendering blank.
+fn display_status(e: &StatusEntry) -> char {
+    if e.tree_conflict == 'C' {
+        'C'
+    } else if e.status == ' ' {
+        e.props_status
+    } else {
+        e.status
+    }
+}
+
 impl DrawableComponent for StatusTreeComponent {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
@@ -571,7 +617,7 @@ impl StatusTreeComponent {
     fn item_line(
         &self,
         item: &TreeItem,
-        dir_counts: &std::collections::HashMap<String, (usize, usize)>,
+        dir_counts: &std::collections::HashMap<String, DirCounts>,
     ) -> (Line<'static>, bool) {
         let theme = &self.ctx.theme;
         let mut spans: Vec<Span> = Vec::new();
@@ -580,6 +626,18 @@ impl StatusTreeComponent {
 
         match &item.kind {
             TreeItemKind::Dir { expanded } => {
+                let info = dir_counts.get(&item.path).copied().unwrap_or_default();
+                // A dir with its own status entry (unversioned, props-changed
+                // or deleted) shows that entry's status char in the same
+                // column and colors as file lines; dirs without one keep
+                // the bare tree glyph.
+                if let Some((code, tree_conflict)) = info.own_status {
+                    spans.push(Span::styled(code.to_string(), theme.status_style(code)));
+                    spans.push(Span::raw(" "));
+                    if tree_conflict {
+                        spans.push(Span::styled("C ", theme.status_conflicted));
+                    }
+                }
                 let sym = if *expanded { "▼ " } else { "▶ " };
                 spans.push(Span::styled(
                     format!("{sym}{}/", item.name),
@@ -587,18 +645,13 @@ impl StatusTreeComponent {
                         .fg(theme.text.fg.unwrap_or(ratatui::style::Color::Gray))
                         .add_modifier(Modifier::BOLD),
                 ));
-                let (staged, total) = dir_counts.get(&item.path).copied().unwrap_or((0, 0));
-                let staged_all = total > 0 && staged == total;
+                let staged_all = info.total > 0 && info.staged == info.total;
                 (Line::from(spans), staged_all)
             }
             TreeItemKind::File { entry } => {
                 let e = self.entries.get(*entry);
                 if let Some(e) = e {
-                    let code = if e.tree_conflict == 'C' {
-                        'C'
-                    } else {
-                        e.status
-                    };
+                    let code = display_status(e);
                     spans.push(Span::styled(code.to_string(), theme.status_style(code)));
                     spans.push(Span::raw(" "));
                     if e.tree_conflict == 'C' {
@@ -622,11 +675,43 @@ impl StatusTreeComponent {
 
     fn dir_staged_counts(
         &self,
-    ) -> std::cell::Ref<'_, std::collections::HashMap<String, (usize, usize)>> {
+    ) -> std::cell::Ref<'_, std::collections::HashMap<String, DirCounts>> {
         if self.counts_dirty.replace(false) {
-            let mut counts: std::collections::HashMap<String, (usize, usize)> =
+            // Directory paths: every ancestor prefix of an entry path, plus
+            // entries svn reports as directories. A deleted dir is gone
+            // from disk (is_dir=false) but still owns its deleted children,
+            // so the prefix walk is what catches it.
+            let mut dir_paths: HashSet<String> = HashSet::new();
+            for e in &self.entries {
+                if e.is_dir {
+                    dir_paths.insert(e.path.clone());
+                }
+                let mut prefix = String::new();
+                for part in e.path.split('/') {
+                    if !prefix.is_empty() {
+                        prefix.push('/');
+                    }
+                    prefix.push_str(part);
+                    if prefix == e.path {
+                        break;
+                    }
+                    dir_paths.insert(prefix.clone());
+                }
+            }
+            let mut counts: std::collections::HashMap<String, DirCounts> =
                 std::collections::HashMap::new();
             for e in &self.entries {
+                if dir_paths.contains(e.path.as_str()) {
+                    // The dir's own status entry (unversioned dir, props
+                    // change, deletion): counts toward the dir itself so
+                    // staging e.g. `? newdir` shows the staged marker.
+                    let c = counts.entry(e.path.clone()).or_default();
+                    c.total += 1;
+                    if self.staged.contains(&e.path) {
+                        c.staged += 1;
+                    }
+                    c.own_status = Some((display_status(e), e.tree_conflict == 'C'));
+                }
                 if e.is_dir {
                     continue;
                 }
@@ -640,10 +725,10 @@ impl StatusTreeComponent {
                     if prefix == e.path {
                         break;
                     }
-                    let c = counts.entry(prefix.clone()).or_insert((0, 0));
-                    c.1 += 1;
+                    let c = counts.entry(prefix.clone()).or_default();
+                    c.total += 1;
                     if self.staged.contains(&e.path) {
-                        c.0 += 1;
+                        c.staged += 1;
                     }
                 }
             }
@@ -666,12 +751,15 @@ fn build_tree(entries: &[StatusEntry]) -> Vec<Node> {
     let mut nodes: HashMap<String, Node> = HashMap::new();
     for (idx, e) in entries.iter().enumerate() {
         let mut cur = String::new();
-        for (i, part) in e.path.split('/').enumerate() {
+        // split once per path; re-splitting inside the loop scanned the
+        // whole path per component (O(depth^2) per path)
+        let parts: Vec<&str> = e.path.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
             if i > 0 {
                 cur.push('/');
             }
             cur.push_str(part);
-            let is_last = i + 1 == e.path.split('/').count();
+            let is_last = i + 1 == parts.len();
             let entry = if is_last { Some(idx) } else { None };
             let is_dir = !is_last || e.is_dir;
             match nodes.entry(cur.clone()) {
@@ -1354,6 +1442,123 @@ mod interaction_tests {
         assert!(st.lines().any(|l| l.contains("newdir/f.txt")), "{st}");
         repo.svn(&["commit", "-m", "add newdir", "newdir"]);
         assert!(repo.svn(&["status"]).trim().is_empty());
+    }
+
+    /// First content column of the tree row at buffer row `y` (x=0 is the
+    /// block border).
+    fn row_line(t: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16) -> String {
+        let buf = t.backend().buffer();
+        let w = buf.area().width;
+        (1..w).map(|x| buf[(x, y)].symbol()).collect::<String>()
+    }
+
+    #[test]
+    fn dir_with_own_entry_shows_status_char() {
+        // props-changed dir (` M dir`): the dir line shows its own 'M' in
+        // the same column a file line would use
+        let (c, _q) = comp_with(vec![dir_entry('M', "dir"), entry('M', "dir/f.txt")]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let dir_row = row_line(&t, 1);
+        assert!(dir_row.starts_with("M ▶ dir/"), "{dir_row}");
+        // a dir without its own status entry keeps the bare tree glyph
+        let (c2, _q) = comp_with(vec![entry('M', "src/a.txt")]);
+        let t2 = ts::render(40, 8, |f| {
+            c2.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let src_row = row_line(&t2, 1);
+        assert!(src_row.starts_with("▶ src/"), "{src_row}");
+    }
+
+    #[test]
+    fn deleted_dir_shows_its_own_status_char() {
+        // `svn rm gone`: the dir entry is is_dir=false (gone from disk) but
+        // the tree node is a dir and must still show its 'D'
+        let (c, _q) = comp_with(vec![entry('D', "gone"), entry('D', "gone/a.txt")]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let row = row_line(&t, 1);
+        assert!(row.starts_with("D ▶ gone/"), "{row}");
+    }
+
+    #[test]
+    fn unversioned_dir_shows_status_and_staged_marker() {
+        let (mut c, _q) = comp_with(vec![dir_entry('?', "newdir"), entry('M', "a.txt")]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let row = row_line(&t, 1);
+        assert!(row.starts_with("? ▶ newdir/"), "{row}");
+        // staging the dir counts its own entry → staged marker (row bg)
+        c.set_staged(&["newdir".to_string()]);
+        c.event(&key(KeyCode::Char('j'))).unwrap(); // move selection off the dir row
+        assert_eq!(c.selection_path().as_deref(), Some("a.txt"));
+        let t2 = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let staged_bg = Theme::default().staged_bg;
+        let buf = t2.backend().buffer();
+        assert_eq!(buf[(1, 1)].bg, staged_bg, "staged dir row must be marked");
+        assert_eq!(buf[(10, 1)].bg, staged_bg, "staged dir row must be marked");
+    }
+
+    #[test]
+    fn props_only_file_shows_props_status_char() {
+        // ` MM file`-style entry: text status blank, props modified — the
+        // status column must not render blank
+        let mut e = entry(' ', "p.txt");
+        e.props_status = 'M';
+        let (c, _q) = comp_with(vec![e]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let row = row_line(&t, 1);
+        assert!(row.starts_with("M p.txt"), "{row}");
+        // a property conflict shows 'C'
+        let mut e2 = entry(' ', "c.txt");
+        e2.props_status = 'C';
+        let (c2, _q) = comp_with(vec![e2]);
+        let t2 = ts::render(40, 8, |f| {
+            c2.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let row2 = row_line(&t2, 1);
+        assert!(row2.starts_with("C c.txt"), "{row2}");
+    }
+
+    #[test]
+    fn staged_contains_dir_checks_current_entries() {
+        let (mut c, _q) = comp_with(vec![dir_entry('?', "newdir"), entry('M', "a.txt")]);
+        assert!(!c.staged_contains_dir());
+        // staging only a file: no dir in the commit set
+        c.set_staged(&["a.txt".to_string()]);
+        assert!(!c.staged_contains_dir());
+        // staging a path with no status entry counts as a non-directory
+        c.set_staged(&["ghost".to_string()]);
+        assert!(!c.staged_contains_dir());
+        // staging the dir itself is detected
+        c.set_staged(&["newdir".to_string()]);
+        assert!(c.staged_contains_dir());
+    }
+
+    #[test]
+    fn unstage_paths_removes_and_invalidates_counts() {
+        let (mut c, _q) = comp_with(vec![dir_entry('?', "newdir"), entry('M', "a.txt")]);
+        c.set_staged(&["newdir".to_string(), "a.txt".to_string()]);
+        c.counts_dirty.set(false);
+        // unknown paths are silently skipped and do not dirty the cache
+        c.unstage_paths(&["ghost".to_string()]);
+        assert!(!c.counts_dirty.get());
+        assert_eq!(c.staged_count(), 2);
+        // removing a staged path invalidates the cache
+        c.unstage_paths(&["a.txt".to_string(), "ghost".to_string()]);
+        assert!(c.counts_dirty.get());
+        assert!(!c.staged.contains("a.txt"));
+        assert!(c.staged.contains("newdir"));
+        // removing everything leaves an empty set
+        c.unstage_paths(&["newdir".to_string()]);
+        assert!(c.staged.is_empty());
     }
 }
 

@@ -105,6 +105,19 @@ impl StatusTab {
         }
     }
 
+    /// A status-pane diff preview failed to load: leave the panel in its
+    /// hint state (not a permanent "Loading…") and clear the dedup key so
+    /// moving the selection away and back retries the request.
+    pub fn diff_failed(&mut self, path: &str) {
+        if self.diff.pending && self.diff.title == path {
+            self.diff
+                .set_hint(path.to_string(), "Failed to load the diff".to_string());
+        }
+        if self.last_diff_requested.as_deref() == Some(path) {
+            self.last_diff_requested = None;
+        }
+    }
+
     /// Request a diff for the currently selected file if it changed.
     /// Returns the path when a request was issued (caller bumps the
     /// pending counter).
@@ -327,8 +340,8 @@ mod tests {
                 .unwrap()
                 .consumed
         );
-        // diff focused: scroll keys handled by diff, 'j' not consumed by diff
-        // but falls through to the tree
+        // diff focused: 'j' is consumed by the DiffView itself (it scrolls
+        // the diff); it does not fall through to the tree
         t.set_focus(PaneFocus::Diff);
         let _ = t
             .event(&ts::key(crossterm::event::KeyCode::Char('j')))
