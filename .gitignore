@@ -2,3 +2,7 @@
 # 演示 GIF 托管在 GitHub Release 附件中，不进仓库
 /svnui.gif
 .DS_Store
+
+# 本地安装的 agent skill，不进仓库
+/.agents/
+/skills-lock.json
