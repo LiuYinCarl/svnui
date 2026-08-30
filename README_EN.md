@@ -4,6 +4,14 @@
 
 An SVN (Subversion) terminal UI client inspired by [gitui](https://github.com/gitui-org/gitui), written in Rust with [ratatui](https://github.com/ratatui/ratatui).
 
+## Architecture map
+
+An interactive runtime architecture map generated from the source with [Archify](https://github.com/tt-a1i/archify) (dark/light themes, route tracing, guided views):
+
+[![svnui runtime architecture](docs/architecture/svnui-architecture.visual-check.1440x900.dark.png)](https://htmlpreview.github.io/?https://github.com/LiuYinCarl/svnui/blob/master/docs/architecture/svnui-architecture.html)
+
+Click the image to explore the interactive version online; the diagram spec lives at [docs/architecture/svnui.architecture.json](docs/architecture/svnui.architecture.json).
+
 ## Screenshots & recordings
 
 Demo data is the public [spdlog](https://github.com/gabime/spdlog) commit history (converted to SVN

@@ -1,0 +1,397 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "svnui 运行时架构",
+    "locale": "zh-CN",
+    "output": "svnui-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/LiuYinCarl/svnui",
+      "revision": "0c3265808ca11d7c279612ad133cb1a628d275ff"
+    },
+    "viewBox": [
+      1250,
+      720
+    ],
+    "views": [
+      {
+        "id": "input-to-draw",
+        "label": "输入到绘制主路径",
+        "focus": [
+          "terminal",
+          "inputThread",
+          "eventLoop",
+          "app",
+          "components"
+        ],
+        "note": "跟随一次按键从终端事件到 ratatui 绘制的完整路径。"
+      },
+      {
+        "id": "async-svn",
+        "label": "SVN 异步调用",
+        "focus": [
+          "app",
+          "svnWorkers",
+          "svnCli",
+          "eventLoop"
+        ],
+        "note": "只读操作各自起线程，变更操作经 FIFO 串行化，结果统一回流事件循环。"
+      },
+      {
+        "id": "internal-queue",
+        "label": "内部事件队列",
+        "focus": [
+          "components",
+          "queue",
+          "app"
+        ],
+        "note": "组件通过 Rc 共享的 Queue 反向通知 App，无需持有 App 引用。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "terminal",
+      "type": "external",
+      "label": "用户终端",
+      "sublabel": "crossterm raw mode",
+      "pos": [
+        40,
+        100
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "inputThread",
+      "type": "backend",
+      "label": "输入读取线程",
+      "sublabel": "event::read() 阻塞读取",
+      "pos": [
+        240,
+        100
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/main.rs",
+          "label": "input-reader"
+        }
+      ]
+    },
+    {
+      "id": "eventLoop",
+      "type": "backend",
+      "label": "主事件循环",
+      "sublabel": "crossbeam select! 多路复用",
+      "tag": "main.rs",
+      "pos": [
+        460,
+        100
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/main.rs",
+          "label": "run()"
+        }
+      ]
+    },
+    {
+      "id": "app",
+      "type": "backend",
+      "label": "App 状态中枢",
+      "sublabel": "Tab / Popup 栈 / pending",
+      "tag": "app.rs",
+      "pos": [
+        655,
+        100
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/app.rs",
+          "label": "App"
+        }
+      ]
+    },
+    {
+      "id": "queue",
+      "type": "messagebus",
+      "label": "内部事件队列",
+      "sublabel": "Rc<RefCell<VecDeque>>",
+      "tag": "queue.rs",
+      "pos": [
+        850,
+        102
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/queue.rs",
+          "label": "Queue"
+        }
+      ]
+    },
+    {
+      "id": "components",
+      "type": "frontend",
+      "label": "组件与弹窗",
+      "sublabel": "DrawableComponent · ratatui",
+      "tag": "components/ popups/ ui/",
+      "pos": [
+        1030,
+        100
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/components/status_tree.rs",
+          "label": "status tree"
+        },
+        {
+          "path": "src/popups/confirm.rs",
+          "label": "popups"
+        },
+        {
+          "path": "src/ui/mod.rs",
+          "label": "ui helpers"
+        }
+      ]
+    },
+    {
+      "id": "svnWorkers",
+      "type": "backend",
+      "label": "svn worker 线程",
+      "sublabel": "只读每操作一线程 · 变更 FIFO 串行",
+      "pos": [
+        500,
+        560
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/svn/mod.rs",
+          "line": 263,
+          "label": "read ops"
+        },
+        {
+          "path": "src/svn/mod.rs",
+          "label": "mutation queue"
+        }
+      ]
+    },
+    {
+      "id": "svnCli",
+      "type": "external",
+      "label": "svn CLI 子进程",
+      "sublabel": "Command::new(\"svn\")",
+      "pos": [
+        880,
+        560
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/svn/mod.rs",
+          "line": 675,
+          "label": "spawn svn"
+        },
+        {
+          "path": "src/svn/parser.rs",
+          "label": "output parser"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "keys",
+      "from": "terminal",
+      "to": "inputThread",
+      "label": "按键事件",
+      "variant": "emphasis"
+    },
+    {
+      "id": "input-rx",
+      "from": "inputThread",
+      "to": "eventLoop",
+      "label": "rx_input"
+    },
+    {
+      "id": "loop-to-app",
+      "from": "eventLoop",
+      "to": "app",
+      "label": "事件派发",
+      "variant": "emphasis",
+      "labelDy": -26
+    },
+    {
+      "id": "drain-event",
+      "from": "queue",
+      "to": "app",
+      "label": "drain",
+      "labelDy": 30
+    },
+    {
+      "id": "push-event",
+      "from": "components",
+      "to": "queue",
+      "label": "push InternalEvent",
+      "fromSide": "left",
+      "toSide": "right",
+      "labelAt": [
+        1015,
+        178
+      ]
+    },
+    {
+      "id": "app-to-components",
+      "from": "app",
+      "to": "components",
+      "label": "状态分发 + 事件",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          840,
+          132
+        ],
+        [
+          840,
+          60
+        ],
+        [
+          1115,
+          60
+        ]
+      ],
+      "labelAt": [
+        977,
+        44
+      ]
+    },
+    {
+      "id": "render-out",
+      "from": "components",
+      "to": "terminal",
+      "label": "帧绘制（alternate screen）",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          1240,
+          132
+        ],
+        [
+          1240,
+          30
+        ],
+        [
+          20,
+          30
+        ],
+        [
+          20,
+          132
+        ]
+      ],
+      "labelAt": [
+        660,
+        12
+      ]
+    },
+    {
+      "id": "dispatch",
+      "from": "app",
+      "to": "svnWorkers",
+      "label": "操作请求（只读 / 变更）",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          730,
+          340
+        ],
+        [
+          590,
+          340
+        ]
+      ],
+      "labelAt": [
+        660,
+        312
+      ]
+    },
+    {
+      "id": "notify",
+      "from": "svnWorkers",
+      "to": "eventLoop",
+      "label": "AsyncSvnNotification",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDx": -65
+    },
+    {
+      "id": "spawn",
+      "from": "svnWorkers",
+      "to": "svnCli",
+      "label": "shell out"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "线程模型",
+      "items": [
+        "主线程跑 select! 事件循环，另设输入读取与 spinner 线程",
+        "每个只读 svn 操作独占一个 worker 线程",
+        "所有变更操作经单个 FIFO worker 串行执行，保证顺序"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "UI 结构",
+      "items": [
+        "组件实现 DrawableComponent + ratatui 绘制，通过共享 Queue 反向通知 App",
+        "单调递增请求 id 丢弃过期异步结果，pending 计数驱动 spinner",
+        "keys.rs 集中维护按键映射表"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "SVN 交互",
+      "items": [
+        "不使用 libsvn 绑定，直接 shell out 到 svn CLI（>= 1.8）",
+        "parser.rs 将 status / log / diff 文本输出解析为结构化模型"
+      ]
+    }
+  ]
+}

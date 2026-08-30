@@ -4,6 +4,14 @@
 
 一个受 [gitui](https://github.com/gitui-org/gitui) 启发的 SVN (Subversion) 终端 UI 客户端，使用 Rust + [ratatui](https://github.com/ratatui/ratatui) 编写。
 
+## 架构图
+
+由 [Archify](https://github.com/tt-a1i/archify) 依据源码生成的交互式运行时架构图（暗色/亮色主题、路径追踪、引导视图）：
+
+[![svnui 运行时架构](docs/architecture/svnui-architecture.visual-check.1440x900.dark.png)](https://htmlpreview.github.io/?https://github.com/LiuYinCarl/svnui/blob/master/docs/architecture/svnui-architecture.html)
+
+点击图片可在线查看交互式版本；图的源规格为 [docs/architecture/svnui.architecture.json](docs/architecture/svnui.architecture.json)（校验规格变化可对比架构演进）。
+
 ## 功能预览（截图与操作录屏）
 
 演示数据为公开的 [spdlog](https://github.com/gabime/spdlog) 提交历史（经 git2svn 转换为 SVN 仓库），
