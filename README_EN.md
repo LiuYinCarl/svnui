@@ -29,6 +29,28 @@ Covers the most common daily SVN operations:
 | **Help** | `?` shows all key bindings |
 | **Async execution** | Every svn command runs on a background thread; the UI never blocks and shows a spinner |
 
+## Screenshots & recordings
+
+Demo data is the public [spdlog](https://github.com/gabime/spdlog) commit history (converted to SVN
+with git2svn). The recording pipeline is asciinema + agg; see `scripts/record_demos.sh`
+(regenerates all assets below).
+
+| Status tab: tree / staging commit set / path filter | Commit: commit set + message + confirm |
+| --- | --- |
+| ![status tab](docs/screenshots/status.gif) | ![commit flow](docs/screenshots/commit.gif) |
+
+| Log tab: revision diff / marked range diff / full-history search | File finder → file history → blame → in-popup search |
+| --- | --- |
+| ![log tab](docs/screenshots/log.gif) | ![blame](docs/screenshots/blame.gif) |
+
+| Patch management: save / preview / revert / apply | Help popup (`?`) |
+| --- | --- |
+| ![patches](docs/screenshots/patches.gif) | ![help](docs/screenshots/help.png) |
+
+| Repository overview (`i`) | |
+| --- | --- |
+| ![repo info](docs/screenshots/info.png) | |
+
 ## Install & run
 
 ```bash

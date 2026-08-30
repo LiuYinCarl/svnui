@@ -29,6 +29,27 @@
 | **帮助** | `?` 查看全部快捷键 |
 | **异步执行** | 所有 svn 命令在后台线程执行，UI 不卡顿，带 spinner 指示 |
 
+## 功能预览（截图与操作录屏）
+
+演示数据为公开的 [spdlog](https://github.com/gabime/spdlog) 提交历史（经 git2svn 转换为 SVN 仓库），
+录制管线为 asciinema + agg，脚本见 `scripts/record_demos.sh`（可重复生成下列全部素材）。
+
+| 状态页：目录树 / 暂存提交集 / 路径过滤 | 提交：提交集 + 信息输入 + 确认 |
+| --- | --- |
+| ![状态页](docs/screenshots/status.gif) | ![提交](docs/screenshots/commit.gif) |
+
+| 日志页：修订 diff / 标记区间 diff / 全历史搜索 | 文件查找 → 文件历史 → Blame → 弹窗内搜索 |
+| --- | --- |
+| ![日志页](docs/screenshots/log.gif) | ![Blame](docs/screenshots/blame.gif) |
+
+| 补丁管理：保存 / 预览 / 还原 / 应用 | 帮助弹窗（`?`） |
+| --- | --- |
+| ![补丁](docs/screenshots/patches.gif) | ![帮助](docs/screenshots/help.png) |
+
+| 仓库概览（`i`） | |
+| --- | --- |
+| ![仓库概览](docs/screenshots/info.png) | |
+
 ## 安装与运行
 
 ```bash

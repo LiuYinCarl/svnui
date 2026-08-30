@@ -1,3 +1,4 @@
 /target
 # 演示 GIF 托管在 GitHub Release 附件中，不进仓库
 /svnui.gif
+.DS_Store

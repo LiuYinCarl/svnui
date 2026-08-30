@@ -1,0 +1,28 @@
+# 提交流程：暂存 -> 输入信息 -> 确认 -> 完成
+wait 3.0
+type g
+type l
+wait 0.5
+type j
+wait 0.5
+key space
+wait 0.8
+type G
+wait 0.5
+key space
+wait 1.5
+key esc
+wait 0.5
+type c
+wait 0.8
+type example: tweak main loop, add release notes
+wait 1.0
+snap commit
+key enter
+wait 1.5
+snap commit-confirm
+type y
+wait 3.0
+key esc
+wait 0.5
+type q

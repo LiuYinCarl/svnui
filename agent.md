@@ -203,6 +203,34 @@ SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
   git filter-branch -f -- --all && git replace -d $b && rm -rf refs/original`），
   浅克隆（--depth）go-git 无法读取，不要用。
 
+## 演示素材录制（README 截图/GIF）
+
+一条命令全量重录：`scripts/record_demos.sh`（首次运行自动调 `scripts/setup_demo_env.sh`
+搭建演示环境）。产物进 `docs/screenshots/`（README 引用），中间产物在演示目录 `out/`。
+
+组成：
+- `scripts/record_demo.py` — pty 按键驱动。`.demo` 脚本 DSL：`wait <秒>` / `type <文本>` /
+  `key <enter|esc|tab|space|...>` / `ctrl <字母>` / `snap <名字>`（截图时间点，写 sidecar JSON）。
+  带 watchdog（SIGALRM 兜底 SIGKILL），不会挂死录制会话。
+- `scripts/demos/*.demo` — 各功能的演示脚本（已入库；改 UI 后同步更新）。
+- `scripts/setup_demo_env.sh` — 搭建 `$SVNUI_DEMO_DIR`（默认 `/tmp/svnui-demo`）：
+  hotcopy 源 SVN 仓库（`SVNUI_DEMO_SRC_REPO`，默认 `~/dev/spdlog-svn-repo`，spdlog 公开
+  历史的 git2svn 转换；commit 演示会真实提交进这个一次性副本）→ checkout trunk →
+  施加 4 处手工改动（`M example/example.cpp`、`D include/spdlog/fmt/fmt.h`、
+  `M include/spdlog/spdlog.h`、`? notes.txt`）→ `wc-base` 快照（每次录制前 rsync 重置 wc）。
+- `scripts/record_demos.sh` — 依赖检查（asciinema/agg/Pillow/release 二进制）→
+  逐 demo：`asciinema rec --headless` 出 `.cast` → agg 渲染 GIF → 每个 `snap` 点用
+  `agg --select <t>s` 渲染确定性 PNG（注意 snap 用 `--idle-time-limit 1000000` 保持
+  原始时间轴，主 GIF 则压缩空闲时间）。可调：`SVNUI_DEMO_SIZE`（默认 110x32）、
+  `AGG_THEME`、`AGG_SPEED`。
+
+注意事项：
+- 驱动会剔除 `NO_COLOR` 并设 `TERM=xterm-256color`（crossterm 尊重 NO_COLOR，否则录制无色）；
+- 异步操作后的消息弹窗（"Added to version control"、"Reverted" 等）"press any key to close"
+  会吞掉下一个按键——`.demo` 脚本在这类操作后要先 `key esc`；
+- 提交信息输入框聚焦时 `q` 是文本输入而非退出，退出前先 `key esc` 切回焦点；
+- 换演示源仓库（非 spdlog）时要同步改 `.demo` 脚本里的文件名/搜索词。
+
 ## CI/CD
 
 - **ci.yml**：fmt → clippy(-D warnings) → test(Linux/macOS) → coverage(≥80%) → 三平台 release 构建。

@@ -1,0 +1,8 @@
+# 仓库信息弹窗
+wait 3.0
+type i
+wait 2.5
+snap info
+key esc
+wait 0.5
+type q

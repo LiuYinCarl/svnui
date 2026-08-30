@@ -1,0 +1,11 @@
+# 帮助弹窗
+wait 3.0
+type ?
+wait 2.5
+snap help
+type j
+type j
+wait 0.8
+key esc
+wait 0.5
+type q
