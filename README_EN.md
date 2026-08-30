@@ -6,9 +6,9 @@ An SVN (Subversion) terminal UI client inspired by [gitui](https://github.com/gi
 
 ## Architecture map
 
-An interactive runtime architecture map generated from the source with [Archify](https://github.com/tt-a1i/archify) (dark/light themes, route tracing, guided views):
+An interactive runtime architecture map generated from the source with [Archify](https://github.com/tt-a1i/archify) (light editorial theme, switchable to dark; route tracing and guided views):
 
-[![svnui runtime architecture](docs/architecture/svnui-architecture.visual-check.1440x900.dark.png)](https://htmlpreview.github.io/?https://github.com/LiuYinCarl/svnui/blob/master/docs/architecture/svnui-architecture.html)
+[![svnui runtime architecture](docs/architecture/svnui-architecture.png)](https://htmlpreview.github.io/?https://github.com/LiuYinCarl/svnui/blob/master/docs/architecture/svnui-architecture.html)
 
 Click the image to explore the interactive version online; the diagram spec lives at [docs/architecture/svnui.architecture.json](docs/architecture/svnui.architecture.json).
 
@@ -120,10 +120,6 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 [![CI](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml)
 [![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml)
 
-> Note: day-to-day releasing is carried by bump.yml (it bumps the version, then calls release.yml
-> to build and publish). GitHub attributes reusable-workflow runs to the caller, so release.yml's
-> own badge was stuck on early failed manual tag pushes — the badge above shows bump.yml instead.
-
 `.github/workflows/` contains three pipelines:
 
 - **ci.yml** — runs on push / PR: fmt, clippy (zero-warning gate), full tests on Linux/macOS, coverage gate (≥ 80%), release builds on three platforms, and headless stress tests: a parallel matrix of 13 popular open-source repos across languages — redis / tmux (C), clap (Rust), slugify (JS), ts-node (TS), requests (Python), gin (Go), nlohmann/json (C++), gson (Java), jekyll (Ruby), composer (PHP), elixir (Elixir), ohmyzsh (Shell) — each shallow-cloned at depth 500, converted to SVN with git2svn, and driven through 60 randomized rounds (15-minute cap per leg); the source commit is logged so failures can be reproduced.
@@ -134,7 +130,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 
 Day to day, just push to master/main: bump.yml bumps the patch version and releases automatically — no manual steps.
 
-For a minor/major release, set `version` in `Cargo.toml` to the target before pushing (bump only increments the patch part on top of it). The manual tag flow still works too (the tag `vX.Y.Z` must match the `Cargo.toml` version):
+For a minor/major release, set `version` in `Cargo.toml` to the target before pushing (bump only increments the patch part on top of it). You can also tag manually (the tag `vX.Y.Z` must match the `Cargo.toml` version):
 
 ```bash
 git tag v0.2.0

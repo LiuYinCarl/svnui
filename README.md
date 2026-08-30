@@ -6,9 +6,9 @@
 
 ## 架构图
 
-由 [Archify](https://github.com/tt-a1i/archify) 依据源码生成的交互式运行时架构图（暗色/亮色主题、路径追踪、引导视图）：
+由 [Archify](https://github.com/tt-a1i/archify) 依据源码生成的交互式运行时架构图（编辑风格浅色主题，可切换暗色、路径追踪、引导视图）：
 
-[![svnui 运行时架构](docs/architecture/svnui-architecture.visual-check.1440x900.dark.png)](https://htmlpreview.github.io/?https://github.com/LiuYinCarl/svnui/blob/master/docs/architecture/svnui-architecture.html)
+[![svnui 运行时架构](docs/architecture/svnui-architecture.png)](https://htmlpreview.github.io/?https://github.com/LiuYinCarl/svnui/blob/master/docs/architecture/svnui-architecture.html)
 
 点击图片可在线查看交互式版本；图的源规格为 [docs/architecture/svnui.architecture.json](docs/architecture/svnui.architecture.json)（校验规格变化可对比架构演进）。
 
@@ -115,10 +115,6 @@ svnui /path/to/working-copy
 [![CI](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/ci.yml)
 [![Release](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml/badge.svg)](https://github.com/LiuYinCarl/svnui/actions/workflows/bump.yml)
 
-> 注：日常发布由 bump.yml 承载（bump 版本号后调用 release.yml 构建发版）；可复用工作流的运行
-> 记录在 GitHub 上归属于调用方，因此 release.yml 自身的徽章永远停在早期手动打标签的失败
-> 记录上，这里改为展示 bump.yml 的状态。
-
 `.github/workflows/` 包含三条流水线：
 
 - **ci.yml** — push / PR 时运行：fmt、clippy（零警告门禁）、Linux/macOS 全量测试、覆盖率门禁（≥ 80%）、三平台 release 构建、压测（matrix 并行跑 13 个不同语言的流行开源仓库——redis / tmux(C)、clap(Rust)、slugify(JS)、ts-node(TS)、requests(Python)、gin(Go)、nlohmann/json(C++)、gson(Java)、jekyll(Ruby)、composer(PHP)、elixir(Elixir)、ohmyzsh(Shell)——各浅克隆 500 个提交后用 git2svn 转成 SVN，无头驱动 App 跑 60 轮随机操作，单 job 限时 15 分钟；日志记录源仓库 commit 以便复现）。
@@ -129,7 +125,7 @@ svnui /path/to/working-copy
 
 日常向 master/main push 即可：bump.yml 会自动 bump 补丁版本并发布，无需手动操作。
 
-想发 minor / major 版本：push 前自己把 `Cargo.toml` 的 `version` 改成目标版本即可（bump 只会在其基础上再 +1 补丁位）。也可以沿用手动标签流程（标签 `vX.Y.Z` 必须与 `Cargo.toml` 版本一致）：
+想发 minor / major 版本：push 前自己把 `Cargo.toml` 的 `version` 改成目标版本即可（bump 只会在其基础上再 +1 补丁位）。也可以手动打标签（标签 `vX.Y.Z` 必须与 `Cargo.toml` 版本一致）：
 
 ```bash
 git tag v0.2.0

@@ -12,7 +12,7 @@
     },
     "viewBox": [
       1250,
-      720
+      700
     ],
     "views": [
       {
@@ -48,7 +48,8 @@
         ],
         "note": "组件通过 Rc 共享的 Queue 反向通知 App，无需持有 App 引用。"
       }
-    ]
+    ],
+    "visual_preset": "editorial"
   },
   "components": [
     {

@@ -194,9 +194,8 @@ SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
 指向合法工作副本时才真正执行，否则直接跳过（pass）。
 
 注意事项：
-- 曾发现 go-git 并发读 packfile 竞争导致转换偶发 "object not found"，
-  已在 git2svn 侧修复（f7011b6，每个 worker 独立的 Repository 句柄）；
-  若用旧版 git2svn，可加 `GOMAXPROCS=1` 规避。
+- git2svn 需包含 f7011b6 或更新（每个 worker 独立 Repository 句柄）；更旧版本并发
+  转换会偶发 "object not found"，可加 `GOMAXPROCS=1` 规避。
 - 想要"恰好约 1000 提交"的仓库，可从本地大仓库截断历史（示例：
   `git clone --no-local file://<repo> dst && cd dst && b=$(git rev-list
   --first-parent HEAD | sed -n 1000p) && git replace --graft $b &&
@@ -243,5 +242,5 @@ SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
   再构建 Linux/macOS/Windows 二进制并创建 Release。发版流程见 README「发布新版本」。
   注意：`cargo build --locked` 要求 Cargo.lock 与 Cargo.toml 版本同步（bump.yml 用
   `cargo check` 重写 lock；手动改版本号发 tag 前必须同步提交 Cargo.lock）。
-  README 的 Release 徽章指向 bump.yml——可复用工作流的运行记录归属调用方，
-  release.yml 自身徽章会停在早期手动 tag 的失败记录上。
+  README 的 Release 徽章指向 bump.yml（可复用工作流的运行记录归属调用方，
+  release.yml 徽章不反映实际发布状态）。
