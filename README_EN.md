@@ -100,6 +100,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `n` / `N` | Diff / blame popup search: next / previous match (wraps) |
 | `Enter` | Blame popup: diff of the cursor line's revision |
 | `h` / `l` | Diff / blame views: scroll long lines left / right (narrow terminals) |
+| `[` / `]` | Diff view: jump to the previous / next file section (multi-file diffs) |
 | `i` | Repository overview (local info + remote HEAD comparison + change summary) |
 | `F5` / `R` | Refresh status / log / patch list |
 | `P` | Save working-copy changes as a patch file (snapshot, no revert) |

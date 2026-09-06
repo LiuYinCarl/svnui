@@ -433,8 +433,17 @@ impl StatusTreeComponent {
             }
         } else if key_match(k, KeyAction::RevertFiles) {
             let by_path = self.entries_by_path();
-            let paths: Vec<String> = self
-                .paths_at_selection()
+            // With a non-empty commit set the revert covers every staged
+            // path (the multi-selection); without one it targets only the
+            // item under the cursor.
+            let candidates = if self.staged.is_empty() {
+                self.paths_at_selection()
+            } else {
+                let mut all: Vec<String> = self.staged.iter().cloned().collect();
+                all.sort();
+                all
+            };
+            let paths: Vec<String> = candidates
                 .into_iter()
                 .filter(|p| by_path.get(p.as_str()).is_some_and(|e| e.status != '?'))
                 .collect();
@@ -972,6 +981,33 @@ mod interaction_tests {
             code,
             crossterm::event::KeyModifiers::NONE,
         ))
+    }
+
+    #[test]
+    fn revert_targets_all_staged_files() {
+        let (mut c, q) = comp_with(vec![
+            entry('M', "a.txt"),
+            entry('M', "b.txt"),
+            entry('?', "c.txt"),
+        ]);
+        // nothing staged: only the file under the cursor is reverted
+        c.event(&key(KeyCode::Char('r'))).unwrap();
+        match q.pop() {
+            Some(InternalEvent::Confirm(ConfirmAction::Revert(paths))) => {
+                assert_eq!(paths, vec!["a.txt".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // with a commit set the revert covers all staged paths (sorted);
+        // unversioned staged paths cannot be reverted and drop out
+        c.set_staged(&["b.txt".into(), "a.txt".into(), "c.txt".into()]);
+        c.event(&key(KeyCode::Char('r'))).unwrap();
+        match q.pop() {
+            Some(InternalEvent::Confirm(ConfirmAction::Revert(paths))) => {
+                assert_eq!(paths, vec!["a.txt".to_string(), "b.txt".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

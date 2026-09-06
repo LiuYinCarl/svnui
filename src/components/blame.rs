@@ -127,10 +127,14 @@ impl BlamePopup {
             self.tv.hscroll.set(self.tv.hscroll.get().saturating_add(8));
             return Ok(EventState::consumed());
         } else if key_match(k, KeyAction::Enter) {
-            // jump to the diff of the revision that last touched this line
+            // jump to the diff of the revision that last touched this line,
+            // limited to the blamed file (not the whole commit)
             if let Some(bl) = self.lines.get(selected) {
                 match bl.revision {
-                    Some(rev) => self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev)),
+                    Some(rev) => self.ctx.queue.push(InternalEvent::RequestFileRevisionDiff(
+                        rev,
+                        self.path.clone(),
+                    )),
                     None => self.ctx.queue.push(InternalEvent::ShowInfoMsg(
                         "line is not committed yet (no revision)".to_string(),
                     )),
@@ -318,18 +322,19 @@ mod tests {
     #[test]
     fn enter_opens_revision_diff_of_cursor_line() {
         let (mut b, q) = blame_with_lines();
-        // cursor starts on line 0, whose revision is 1
+        // cursor starts on line 0, whose revision is 1; the diff is
+        // limited to the blamed file
         b.event(&ts::key(KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(1))
+            Some(InternalEvent::RequestFileRevisionDiff(1, path)) if path == "src/main.rs"
         ));
         // move the cursor down, Enter follows it
         b.event(&ts::key(KeyCode::Char('j'))).unwrap();
         b.event(&ts::key(KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(2))
+            Some(InternalEvent::RequestFileRevisionDiff(2, path)) if path == "src/main.rs"
         ));
         // uncommitted lines have no revision to jump to
         let (mut b2, q2) = {

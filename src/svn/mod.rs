@@ -442,11 +442,21 @@ impl Svn {
         );
     }
 
-    pub fn revision_diff(&self, revision: u64, req: Option<u64>) {
+    /// Diff of a single revision (`svn diff -c rev`). With `path` the diff
+    /// is limited to that one file (file history popup). NB: no peg suffix
+    /// on the path — svn diff rejects pegged wc targets (E155010) and
+    /// treats a trailing "@xxx" as plain path text.
+    pub fn revision_diff(&self, revision: u64, path: Option<&str>, req: Option<u64>) {
         let cwd = self.cwd.clone();
+        let path = path.map(str::to_string);
         self.spawn(
             move || {
-                let result = Self::run_in(&cwd, &["diff", "-c", &revision.to_string()]);
+                let rev = revision.to_string();
+                let args: Vec<&str> = match &path {
+                    Some(p) => vec!["diff", "-c", &rev, "--", p],
+                    None => vec!["diff", "-c", &rev],
+                };
+                let result = Self::run_in(&cwd, &args);
                 AsyncSvnNotification::RevisionDiff {
                     revision,
                     req,
@@ -830,7 +840,7 @@ mod tests {
         repo.svn(&["commit", "-m", "bump"]);
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
-        c.revision_diff(2, Some(9));
+        c.revision_diff(2, None, Some(9));
         match recv(&rx) {
             AsyncSvnNotification::RevisionDiff {
                 revision,
@@ -1102,10 +1112,30 @@ mod tests {
     }
 
     #[test]
+    fn revision_diff_can_be_limited_to_one_file() {
+        let Some(repo) = TestRepo::new() else { return };
+        // one commit touching two files
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+        test_support::write_file(&repo.wc.join("src/main.rs"), "fn main() {}\n");
+        repo.svn(&["commit", "-m", "bump both"]);
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        // path-limited: only that file's section comes back
+        c.revision_diff(2, Some("Cargo.toml"), None);
+        match recv(&rx) {
+            AsyncSvnNotification::RevisionDiff { result: Ok(d), .. } => {
+                assert!(d.contains("Index: Cargo.toml"), "{d}");
+                assert!(!d.contains("src/main.rs"), "{d}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn revision_diff_error_reports_stderr() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
-        Svn::new(repo.wc.clone(), tx).revision_diff(999_999, None);
+        Svn::new(repo.wc.clone(), tx).revision_diff(999_999, None, None);
         match recv(&rx) {
             AsyncSvnNotification::RevisionDiff { result: Err(e), .. } => {
                 assert!(!e.is_empty(), "expected an error message");

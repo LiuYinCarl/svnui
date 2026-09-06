@@ -72,6 +72,9 @@ pub enum InternalEvent {
     OpenFileFinder,
     /// Request a diff of the selected revision (log tab)
     RequestRevisionDiff(u64),
+    /// Request a diff of one revision limited to a single file (file
+    /// history popup): revision + path relative to the working copy root
+    RequestFileRevisionDiff(u64, String),
     /// Request a combined diff of several marked revisions (log tab)
     RequestRangeDiff(Vec<u64>),
     /// Search the full commit history (Enter in the log search popup)

@@ -35,6 +35,8 @@ use std::time::SystemTime;
 enum PendingFullscreen {
     File(String),
     Revision(u64),
+    /// A revision diff limited to one file (file history popup)
+    FileRevision(u64, String),
     /// Combined diff of revisions `from..=to`
     Range(u64, u64),
 }
@@ -473,7 +475,19 @@ impl App {
                 let id = self.next_req_id;
                 self.next_req_id += 1;
                 self.pending_fullscreen = Some((id, PendingFullscreen::Revision(rev)));
-                self.svn.revision_diff(rev, Some(id));
+                self.svn.revision_diff(rev, None, Some(id));
+                self.pending += 1;
+            }
+            InternalEvent::RequestFileRevisionDiff(rev, path) => {
+                // single in-flight fullscreen slot (see RequestFileDiff)
+                if self.pending_fullscreen.is_some() {
+                    return;
+                }
+                let id = self.next_req_id;
+                self.next_req_id += 1;
+                self.pending_fullscreen =
+                    Some((id, PendingFullscreen::FileRevision(rev, path.clone())));
+                self.svn.revision_diff(rev, Some(&path), Some(id));
                 self.pending += 1;
             }
             InternalEvent::RequestRangeDiff(revs) => {
@@ -911,9 +925,8 @@ impl App {
                 req,
                 result,
             } => match result {
-                Ok(content) => {
-                    if let Some(PendingFullscreen::Revision(r)) = self.take_pending_fullscreen(req)
-                    {
+                Ok(content) => match self.take_pending_fullscreen(req) {
+                    Some(PendingFullscreen::Revision(r)) => {
                         // attach the commit info when the revision is in
                         // the loaded log (log-tab-triggered diff)
                         let header = self
@@ -925,10 +938,31 @@ impl App {
                             .unwrap_or_default();
                         self.show_diff_popup(format!("Diff r{r}"), &content, header);
                     }
-                }
+                    Some(PendingFullscreen::FileRevision(r, path)) => {
+                        // commit info from the open file-history popup (or
+                        // the loaded log when it happens to list the rev)
+                        let entry = self
+                            .popups
+                            .iter()
+                            .find_map(|p| match p {
+                                Popup::FileLog(fl) if fl.path == path => {
+                                    fl.entries.iter().find(|e| e.revision == r)
+                                }
+                                _ => None,
+                            })
+                            .or_else(|| self.log.entries.iter().find(|e| e.revision == r));
+                        let header = entry.map(diff_view::revision_header).unwrap_or_default();
+                        self.show_diff_popup(format!("Diff r{r}: {path}"), &content, header);
+                    }
+                    _ => {}
+                },
                 Err(e) => {
-                    self.take_pending_fullscreen(req);
-                    self.show_error(format!("svn diff -c {revision}: {e}"));
+                    // name the file for file-scoped diffs (file history)
+                    let target = match self.take_pending_fullscreen(req) {
+                        Some(PendingFullscreen::FileRevision(_, p)) => format!(" -- {p}"),
+                        _ => String::new(),
+                    };
+                    self.show_error(format!("svn diff -c {revision}{target}: {e}"));
                 }
             },
             AsyncSvnNotification::Blame { path, result } => match result {
@@ -1487,6 +1521,62 @@ mod tests {
             panic!("expected diff popup");
         };
         assert!(d2.view.header().is_empty());
+    }
+
+    #[test]
+    fn file_revision_diff_is_limited_to_the_file() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // the file history popup is open with one loaded entry
+        app.push_popup(Popup::file_log(&app.ctx.clone(), "main.rs"));
+        if let Some(Popup::FileLog(fl)) = app.popups.last_mut() {
+            fl.update(vec![log_entry(2, "two")]);
+        }
+        app.queue
+            .push(InternalEvent::RequestFileRevisionDiff(2, "main.rs".into()));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RevisionDiff {
+                revision: 2,
+                req: Some(1),
+                ..
+            }
+        ));
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 2,
+            req: Some(1),
+            result: Ok("Index: main.rs\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+        });
+        let Some(Popup::Diff(d)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        assert_eq!(d.view.title, "Diff r2: main.rs");
+        // commit info comes from the file-history popup's entries
+        assert_eq!(d.view.header(), &["r2 | alice | 2026-01-01", "two"]);
+    }
+
+    #[test]
+    fn file_revision_diff_error_names_the_file() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.queue
+            .push(InternalEvent::RequestFileRevisionDiff(2, "main.rs".into()));
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RevisionDiff { revision: 2, .. }
+        ));
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 2,
+            req: Some(1),
+            result: Err("E160013: path not found".into()),
+        });
+        assert!(app.pending_fullscreen.is_none());
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.message.contains("main.rs"), "{}", m.message);
     }
 
     #[test]

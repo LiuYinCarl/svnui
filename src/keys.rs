@@ -81,6 +81,10 @@ pub enum KeyAction {
     DetailScrollDown,
     /// File history popup: scroll the commit message up (Ctrl+u)
     DetailScrollUp,
+    /// Diff view: jump to the next file's section (`]`)
+    NextDiffFile,
+    /// Diff view: jump to the previous file's section (`[`)
+    PrevDiffFile,
 }
 
 /// Central keybindings: every `KeyAction` maps to one or more keys.
@@ -160,6 +164,8 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::DetailScrollUp => {
             ev.code == KeyCode::Char('u') && ev.modifiers.contains(KeyModifiers::CONTROL)
         }
+        KeyAction::NextDiffFile => is_key(ev, KeyCode::Char(']')),
+        KeyAction::PrevDiffFile => is_key(ev, KeyCode::Char('[')),
     }
 }
 
@@ -249,6 +255,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "h / l",
                     "Diff / blame popup: scroll long lines left / right",
                 ),
+                KeyBinding::new(
+                    "[ / ]",
+                    "Diff view: previous / next file in a multi-file diff",
+                ),
                 KeyBinding::new("Enter", "Blame popup: diff of the cursor line's revision"),
                 KeyBinding::new("Ctrl+b", "File finder: blame highlighted file"),
                 KeyBinding::new("b", "File history popup: blame the file"),
@@ -315,6 +325,8 @@ mod tests {
         assert!(key_match(&key(KeyCode::Char('d')), KeyAction::DiffFull));
         assert!(key_match(&key(KeyCode::Char('b')), KeyAction::Blame));
         assert!(key_match(&key(KeyCode::Char('/')), KeyAction::Filter));
+        assert!(key_match(&key(KeyCode::Char(']')), KeyAction::NextDiffFile));
+        assert!(key_match(&key(KeyCode::Char('[')), KeyAction::PrevDiffFile));
         assert!(key_match(&key(KeyCode::F(5)), KeyAction::Refresh));
         assert!(key_match(&key(KeyCode::Char('R')), KeyAction::Refresh));
         assert!(key_match(

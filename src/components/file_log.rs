@@ -184,7 +184,11 @@ impl DrawableComponent for FileLogPopup {
             self.scroll_detail(-10);
         } else if key_match(k, KeyAction::OpenRevisionDiff) {
             if let Some(rev) = self.selection_revision() {
-                self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev));
+                // the diff is limited to this file, not the whole commit
+                self.ctx.queue.push(InternalEvent::RequestFileRevisionDiff(
+                    rev,
+                    self.path.clone(),
+                ));
             }
         } else if key_match(k, KeyAction::Blame) {
             self.ctx
@@ -255,18 +259,18 @@ mod tests {
         p.event(&ts::key(crossterm::event::KeyCode::PageUp))
             .unwrap();
         assert_eq!(p.selection_revision(), Some(5));
-        // Enter requests the revision diff
+        // Enter requests the revision diff, limited to this file
         p.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(5))
+            Some(InternalEvent::RequestFileRevisionDiff(5, path)) if path == "src/main.rs"
         ));
         // 'd' also requests it
         p.event(&ts::key(crossterm::event::KeyCode::Char('d')))
             .unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(5))
+            Some(InternalEvent::RequestFileRevisionDiff(5, path)) if path == "src/main.rs"
         ));
         // 'b' requests blame for the file (regardless of selection)
         p.event(&ts::key(crossterm::event::KeyCode::Char('b')))

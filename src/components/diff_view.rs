@@ -4,6 +4,7 @@
 use super::EventState;
 use super::text_search::highlight_spans;
 use super::text_view::{SearchOutcome, TextView};
+use crate::keys::{KeyAction, key_match};
 use crate::svn::models::{DiffLine, DiffLineKind, LogEntry, ParsedDiff};
 use crate::svn::parser::{parse_diff, parse_new_file_content};
 use crate::ui::{self, style::Theme};
@@ -17,6 +18,30 @@ use ratatui::widgets::{Block, Borders};
 /// Max lines the fixed commit-info header above a diff may occupy, so
 /// huge (merge) commit messages cannot eat the whole screen.
 pub const DIFF_HEADER_MAX: usize = 5;
+
+/// Tab stop used when expanding tabs for display. ratatui's buffer drops
+/// control characters outright, so a literal '\t' in diff content would
+/// vanish (and with it the line's indentation).
+const TAB_STOP: usize = 4;
+
+/// Expand tabs to spaces at `TAB_STOP`-wide stops, counting display
+/// columns so CJK characters advance the column by two.
+fn expand_tabs(s: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let n = TAB_STOP - (col % TAB_STOP);
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        } else {
+            out.push(ch);
+            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    out
+}
 
 /// Header lines for a single-revision diff: `r<N> | author | date` plus
 /// message lines, capped at `DIFF_HEADER_MAX`. When the message is
@@ -173,6 +198,13 @@ impl DiffView {
             self.parsed = parse_new_file_content(content);
             self.empty_reason = None;
         }
+        // tabs would be dropped by the terminal buffer (control chars);
+        // expand them so indented lines keep their shape
+        for dl in &mut self.parsed.lines {
+            if dl.content.contains('\t') {
+                dl.content = expand_tabs(&dl.content);
+            }
+        }
         self.num_w = line_number_width(&self.parsed);
         self.tv.max_width.set(self.compute_max_width());
     }
@@ -200,7 +232,32 @@ impl DiffView {
     }
 
     pub fn event(&mut self, ev: &Event) -> EventState {
+        if let Event::Key(k) = ev {
+            if key_match(k, KeyAction::NextDiffFile) {
+                self.jump_file(true);
+                return EventState::consumed();
+            }
+            if key_match(k, KeyAction::PrevDiffFile) {
+                self.jump_file(false);
+                return EventState::consumed();
+            }
+        }
         self.tv.scroll_event(ev, self.parsed.lines.len())
+    }
+
+    /// Jump the scroll position to the next/previous file section header
+    /// (multi-file diffs: revision/range diffs and patch previews).
+    pub fn jump_file(&mut self, forward: bool) {
+        let cur = self.tv.scroll.get();
+        let is_boundary = |i: usize| self.parsed.lines.get(i).is_some_and(is_file_boundary);
+        let target = if forward {
+            (cur + 1..self.parsed.lines.len()).find(|&i| is_boundary(i))
+        } else {
+            (0..cur).rev().find(|&i| is_boundary(i))
+        };
+        if let Some(i) = target {
+            self.tv.scroll.set(i);
+        }
     }
 
     /// Handle search-related input (`/`, live typing, `n`/`N`).
@@ -229,6 +286,20 @@ impl DiffView {
             }
         }
     }
+}
+
+/// A new section starts at an "Index: " header (svn), a "diff --git "
+/// header (git-format patches), or a "Property changes on:" section
+/// (property-only diff without an Index header). Added/Removed lines are
+/// excluded: diffing a .patch file yields content lines that themselves
+/// start with these prefixes, and those are not section starts.
+fn is_file_boundary(dl: &DiffLine) -> bool {
+    if matches!(dl.kind, DiffLineKind::Added | DiffLineKind::Removed) {
+        return false;
+    }
+    dl.content.starts_with("Index: ")
+        || dl.content.starts_with("diff --git ")
+        || dl.content.starts_with("Property changes on:")
 }
 
 /// Build a single styled diff line with line numbers.
@@ -508,6 +579,75 @@ Index: Cargo.toml
         v.set_content("t".into(), &content);
         assert_eq!(v.tv.hscroll.get(), 0);
         assert_eq!(v.tv.scroll.get(), 0);
+    }
+
+    #[test]
+    fn tabs_are_expanded_not_dropped() {
+        // the terminal buffer drops control characters: a literal tab in
+        // the diff content would vanish, so set_content expands it
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: f\n@@ -1 +1,2 @@\n fn main() {\n+\tlet x = 1;\n",
+        );
+        let added = v
+            .parsed
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Added)
+            .unwrap();
+        assert!(!added.content.contains('\t'));
+        // one tab at column 0 expands to a full tab stop
+        assert_eq!(added.content, format!("{}let x = 1;", " ".repeat(4)));
+        // width math sees the expanded content
+        let t = ts::render(40, 6, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 40, 6), &v, &Theme::default());
+        });
+        let buf = t.backend().buffer();
+        // row 4 = the added line: 9-column gutter, then 4 spaces, then 'l'
+        assert_eq!(buf[(10, 4)].symbol(), " ");
+        assert_eq!(buf[(14, 4)].symbol(), "l");
+    }
+
+    #[test]
+    fn jump_file_moves_between_file_sections() {
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: a\n@@ -1 +1 @@\n-a\n+b\nIndex: b\n@@ -1 +1 @@\n-c\n+d\nIndex: c\n@@ -1 +1 @@\n-e\n+f\n",
+        );
+        assert_eq!(v.tv.scroll.get(), 0);
+        // ] jumps to the next file's "Index: " header
+        v.event(&ts::key(KeyCode::Char(']')));
+        assert_eq!(v.tv.scroll.get(), 4);
+        v.event(&ts::key(KeyCode::Char(']')));
+        assert_eq!(v.tv.scroll.get(), 8);
+        // no further file: stays put, key still consumed
+        assert!(v.event(&ts::key(KeyCode::Char(']'))).consumed);
+        assert_eq!(v.tv.scroll.get(), 8);
+        // scrolled into the middle of a section: [ goes to its header first
+        v.tv.scroll.set(10);
+        v.event(&ts::key(KeyCode::Char('[')));
+        assert_eq!(v.tv.scroll.get(), 8);
+        v.event(&ts::key(KeyCode::Char('[')));
+        assert_eq!(v.tv.scroll.get(), 4);
+        v.event(&ts::key(KeyCode::Char('[')));
+        assert_eq!(v.tv.scroll.get(), 0);
+        assert!(v.event(&ts::key(KeyCode::Char('['))).consumed);
+        assert_eq!(v.tv.scroll.get(), 0);
+    }
+
+    #[test]
+    fn added_lines_that_look_like_headers_are_not_boundaries() {
+        // diffing a .patch file: its "+diff --git ..." / "+Index: ..."
+        // content lines must not become jump targets
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: p.patch\n@@ -0,0 +1,2 @@\n+diff --git a/x b/y\n+Index: z\n",
+        );
+        assert!(v.event(&ts::key(KeyCode::Char(']'))).consumed);
+        assert_eq!(v.tv.scroll.get(), 0, "no real second file section");
     }
 
     #[test]
