@@ -187,13 +187,22 @@ maybe_request_diff；异步通知 → handle_async → …），确定性 PRNG�
 错误弹窗、无残留弹窗；失败信息带 seed 可复现。harness 挑选修改目标时跳过符号链接
 （append 会穿透到目标文件，破坏逐文件追踪）。
 
+**tree parity 校验**（checkout 之后、压测之前，`STRESS_TREE_CHECK` 控制）：
+git 仓库只是素材来源，转换若静默丢文件/截断内容，App 层断言发现不了——所以先比对
+git 分支与 svn wc 的一致性再开跑。文件清单：`git ls-tree -r <branch>`（排除
+gitlink/submodule，git2svn 不转换）vs `svn list -R .@HEAD`（滤掉目录）；文件内容：
+逐文件 `git cat-file blob` vs wc 文件（基准是分支 blob 而非可能脏的 worktree；
+symlink 比对 target 文本；可执行位与空目录不比对）。不一致默认直接失败
+（`STRESS_TREE_CHECK=warn` 降级为警告、`=off` 跳过）。
+
 ```bash
 scripts/stress_test.sh                    # 完整跑（默认 200 轮）
 SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
 ```
 
 环境变量：`STRESS_GIT_REPO` / `STRESS_GIT_BRANCH`（转换哪个 git 仓库/分支）、
-`SVNUI_STRESS_ROUNDS`、`SVNUI_STRESS_SEED`、`GIT2SVN_DIR`。
+`SVNUI_STRESS_ROUNDS`、`SVNUI_STRESS_SEED`、`STRESS_TREE_CHECK`（fail/warn/off）、
+`GIT2SVN_DIR`。
 **CI 不会运行它**：`tests/stress.rs` 仅在 `SVNUI_STRESS=1` 且 `SVNUI_STRESS_WC`
 指向合法工作副本时才真正执行，否则直接跳过（pass）。
 

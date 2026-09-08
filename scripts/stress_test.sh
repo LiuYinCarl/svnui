@@ -17,6 +17,8 @@
 #                       falling back to main/master when detached)
 #   SVNUI_STRESS_ROUNDS stress rounds         (default 200)
 #   SVNUI_STRESS_SEED   PRNG seed             (default fixed)
+#   STRESS_TREE_CHECK   git<->svn tree parity check after conversion:
+#                       fail (default) | warn | off
 #   GIT2SVN_DIR         git2svn checkout      (default ~/dev/github/git2svn)
 set -euo pipefail
 
@@ -95,6 +97,89 @@ echo ">> converting to $SVN_REPO (this takes a minute or two)"
 # 4. check out the working copy
 echo ">> checking out $WC"
 svn checkout -q "file://$SVN_REPO/trunk" "$WC"
+
+# 4.5 tree parity: the converted svn repo must mirror the git branch.
+# Silent conversion loss (dropped/truncated files, symlink mishandling)
+# would otherwise go unnoticed — the app-level rounds only see the svn
+# side. Compared: the file *listing* (git ls-tree of the converted
+# branch vs `svn list -R`, gitlinks/submodules excluded — git2svn does
+# not convert them) and per-file *content* against the branch's blobs
+# (NOT the possibly-dirty worktree; symlinks by target text).
+# Executable bits (svn:executable) and empty dirs are not compared.
+STRESS_TREE_CHECK="${STRESS_TREE_CHECK:-fail}"
+if [[ "$STRESS_TREE_CHECK" != "off" ]]; then
+    echo ">> verifying tree parity (git branch vs svn wc, mode: $STRESS_TREE_CHECK)"
+    GIT_TREE="$STRESS_DIR/tree-git-ls-tree.txt"
+    GIT_LIST="$STRESS_DIR/tree-git.txt"
+    SVN_LIST="$STRESS_DIR/tree-svn.txt"
+    # core.quotepath=false keeps non-ASCII paths raw, matching svn output
+    git -C "$STRESS_GIT_REPO" -c core.quotepath=false \
+        ls-tree -r "$STRESS_GIT_BRANCH" > "$GIT_TREE"
+    grep -v '^160000 ' "$GIT_TREE" | sed $'s/^[^\t]*\t//' | sort > "$GIT_LIST"
+    (cd "$WC" && svn list -R .@HEAD) | grep -v '/$' | sort > "$SVN_LIST"
+
+    parity_fail=0
+    only_git="$(comm -23 "$GIT_LIST" "$SVN_LIST")"
+    only_svn="$(comm -13 "$GIT_LIST" "$SVN_LIST")"
+    if [[ -n "$only_git" ]]; then
+        n=$(echo "$only_git" | wc -l | tr -d ' ')
+        echo "   $n file(s) missing from svn (first 20):"
+        echo "$only_git" | head -20 | sed 's/^/     /'
+        parity_fail=1
+    fi
+    if [[ -n "$only_svn" ]]; then
+        n=$(echo "$only_svn" | wc -l | tr -d ' ')
+        echo "   $n file(s) unexpected in svn (first 20):"
+        echo "$only_svn" | head -20 | sed 's/^/     /'
+        parity_fail=1
+    fi
+
+    # content of every converted file, git blob vs wc file (one cat-file
+    # per file: a few seconds even for ~10k-file repos). Files missing
+    # from the wc were already reported by the listing comparison.
+    differ=0
+    while IFS= read -r entry; do
+        meta="${entry%%$'\t'*}"
+        f="${entry#*$'\t'}"
+        read -r mode _type sha <<< "$meta"
+        s="$WC/$f"
+        if [[ "$mode" == "120000" ]]; then
+            [[ -L "$s" ]] || continue
+            target="$(git -C "$STRESS_GIT_REPO" cat-file blob "$sha")"
+            if [[ "$(readlink "$s")" != "$target" ]]; then
+                if (( differ < 20 )); then
+                    echo "     symlink differs: $f"
+                fi
+                differ=$((differ + 1))
+            fi
+        else
+            [[ -e "$s" ]] || continue
+            if ! git -C "$STRESS_GIT_REPO" cat-file blob "$sha" | cmp -s - "$s"; then
+                if (( differ < 20 )); then
+                    echo "     content differs: $f"
+                fi
+                differ=$((differ + 1))
+            fi
+        fi
+    done < <(grep -v '^160000 ' "$GIT_TREE")
+    if (( differ > 0 )); then
+        echo "   $differ file(s) differ in content (first 20 shown)"
+        parity_fail=1
+    fi
+
+    if (( parity_fail > 0 )); then
+        if [[ "$STRESS_TREE_CHECK" == "warn" ]]; then
+            echo "   WARNING: tree parity check failed (continuing anyway)"
+        else
+            echo "error: tree parity check failed — the conversion is not faithful;" >&2
+            echo "       stressing a distorted repo would mask app bugs." >&2
+            echo "       STRESS_TREE_CHECK=warn downgrades to a warning, =off skips." >&2
+            exit 1
+        fi
+    else
+        echo "   tree parity OK ($(wc -l < "$GIT_LIST" | tr -d ' ') files)"
+    fi
+fi
 
 # 5. run the headless stress test
 echo ">> running stress test"
