@@ -49,6 +49,14 @@ impl BlamePopup {
         // is recomputed below
         self.tv.reset();
         self.selected.set(0);
+        let mut lines = lines;
+        // the terminal buffer drops control characters: expand tabs before
+        // measuring widths so tab-indented code keeps its shape
+        for l in &mut lines {
+            if l.content.contains('\t') {
+                l.content = ui::expand_tabs(&l.content);
+            }
+        }
         // the author column is padded to the widest author in the file so
         // the content stays left-aligned
         let author_w = lines
@@ -131,9 +139,9 @@ impl BlamePopup {
             // limited to the blamed file (not the whole commit)
             if let Some(bl) = self.lines.get(selected) {
                 match bl.revision {
-                    Some(rev) => self.ctx.queue.push(InternalEvent::RequestFileRevisionDiff(
+                    Some(rev) => self.ctx.queue.push(InternalEvent::RequestRevisionDiff(
                         rev,
-                        self.path.clone(),
+                        Some(self.path.clone()),
                     )),
                     None => self.ctx.queue.push(InternalEvent::ShowInfoMsg(
                         "line is not committed yet (no revision)".to_string(),
@@ -327,14 +335,14 @@ mod tests {
         b.event(&ts::key(KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestFileRevisionDiff(1, path)) if path == "src/main.rs"
+            Some(InternalEvent::RequestRevisionDiff(1, Some(path))) if path == "src/main.rs"
         ));
         // move the cursor down, Enter follows it
         b.event(&ts::key(KeyCode::Char('j'))).unwrap();
         b.event(&ts::key(KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestFileRevisionDiff(2, path)) if path == "src/main.rs"
+            Some(InternalEvent::RequestRevisionDiff(2, Some(path))) if path == "src/main.rs"
         ));
         // uncommitted lines have no revision to jump to
         let (mut b2, q2) = {
@@ -390,6 +398,30 @@ mod tests {
         // content column: 1 (border) + 7 (rev) + 1 + 11 (author) + 2 = 22
         assert_eq!(buf[(22, 1)].symbol(), "s", "short content");
         assert_eq!(buf[(22, 2)].symbol(), "x", "long-author content");
+    }
+
+    #[test]
+    fn tabs_in_content_are_expanded_not_dropped() {
+        // the terminal buffer drops control characters; without expansion
+        // tab-indented code would lose its indentation (see DiffView)
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut b = BlamePopup::new(&ctx, "f");
+        b.update(vec![line(Some(1), "al", "\tlet x = 1;")]);
+        assert!(!b.lines[0].content.contains('\t'));
+        assert_eq!(b.lines[0].content, "    let x = 1;");
+        // max_width sees the expanded content (10 + author 2 + 14)
+        assert_eq!(b.tv.max_width.get(), 26);
+        let t = ts::render(60, 4, |f| {
+            b.draw(f, Rect::new(0, 0, 60, 4)).unwrap();
+        });
+        let buf = t.backend().buffer();
+        // content column 13: 1 (border) + 7 (rev) + 1 + 2 (author) + 2
+        assert_eq!(buf[(13, 1)].symbol(), " ");
+        assert_eq!(buf[(17, 1)].symbol(), "l");
     }
 
     fn blame_with_lines() -> (BlamePopup, crate::queue::Queue) {

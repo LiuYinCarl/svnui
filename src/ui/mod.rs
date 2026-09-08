@@ -174,6 +174,30 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Tab stop used when expanding tabs for display. ratatui's buffer drops
+/// control characters outright, so a literal '\t' in displayed content
+/// would vanish (and with it the line's indentation).
+const TAB_STOP: usize = 4;
+
+/// Expand tabs to spaces at `TAB_STOP`-wide stops, counting display
+/// columns so CJK characters advance the column by two.
+pub fn expand_tabs(s: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let n = TAB_STOP - (col % TAB_STOP);
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        } else {
+            out.push(ch);
+            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +264,16 @@ mod tests {
             seen.insert(spinner_frame(i));
         }
         assert_eq!(seen.len(), 10);
+    }
+
+    #[test]
+    fn expand_tabs_uses_display_columns() {
+        // tab at column 0 expands to a full stop; a mid-line tab pads to
+        // the next stop; CJK chars count as two columns
+        assert_eq!(expand_tabs("\tlet"), "    let");
+        assert_eq!(expand_tabs("ab\tc"), "ab  c");
+        assert_eq!(expand_tabs("中\tc"), "中  c");
+        assert_eq!(expand_tabs("no tabs"), "no tabs");
     }
 
     #[test]

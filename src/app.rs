@@ -34,9 +34,9 @@ use std::time::SystemTime;
 #[derive(Clone, Debug)]
 enum PendingFullscreen {
     File(String),
-    Revision(u64),
-    /// A revision diff limited to one file (file history popup)
-    FileRevision(u64, String),
+    /// A revision diff, optionally limited to one file (file history /
+    /// blame popup)
+    Revision(u64, Option<String>),
     /// Combined diff of revisions `from..=to`
     Range(u64, u64),
 }
@@ -467,18 +467,7 @@ impl App {
                     self.pending += 1;
                 }
             }
-            InternalEvent::RequestRevisionDiff(rev) => {
-                // single in-flight fullscreen slot (see RequestFileDiff)
-                if self.pending_fullscreen.is_some() {
-                    return;
-                }
-                let id = self.next_req_id;
-                self.next_req_id += 1;
-                self.pending_fullscreen = Some((id, PendingFullscreen::Revision(rev)));
-                self.svn.revision_diff(rev, None, Some(id));
-                self.pending += 1;
-            }
-            InternalEvent::RequestFileRevisionDiff(rev, path) => {
+            InternalEvent::RequestRevisionDiff(rev, path) => {
                 // single in-flight fullscreen slot (see RequestFileDiff)
                 if self.pending_fullscreen.is_some() {
                     return;
@@ -486,8 +475,8 @@ impl App {
                 let id = self.next_req_id;
                 self.next_req_id += 1;
                 self.pending_fullscreen =
-                    Some((id, PendingFullscreen::FileRevision(rev, path.clone())));
-                self.svn.revision_diff(rev, Some(&path), Some(id));
+                    Some((id, PendingFullscreen::Revision(rev, path.clone())));
+                self.svn.revision_diff(rev, path.as_deref(), Some(id));
                 self.pending += 1;
             }
             InternalEvent::RequestRangeDiff(revs) => {
@@ -925,41 +914,36 @@ impl App {
                 req,
                 result,
             } => match result {
-                Ok(content) => match self.take_pending_fullscreen(req) {
-                    Some(PendingFullscreen::Revision(r)) => {
-                        // attach the commit info when the revision is in
-                        // the loaded log (log-tab-triggered diff)
-                        let header = self
-                            .log
-                            .entries
-                            .iter()
-                            .find(|e| e.revision == r)
-                            .map(diff_view::revision_header)
-                            .unwrap_or_default();
-                        self.show_diff_popup(format!("Diff r{r}"), &content, header);
-                    }
-                    Some(PendingFullscreen::FileRevision(r, path)) => {
-                        // commit info from the open file-history popup (or
-                        // the loaded log when it happens to list the rev)
-                        let entry = self
-                            .popups
-                            .iter()
-                            .find_map(|p| match p {
-                                Popup::FileLog(fl) if fl.path == path => {
-                                    fl.entries.iter().find(|e| e.revision == r)
-                                }
-                                _ => None,
+                Ok(content) => {
+                    if let Some(PendingFullscreen::Revision(r, path)) =
+                        self.take_pending_fullscreen(req)
+                    {
+                        // commit info: for file-scoped diffs prefer the open
+                        // file-history popup; else the loaded log when it
+                        // happens to list the revision
+                        let entry = path
+                            .as_deref()
+                            .and_then(|p| {
+                                self.popups.iter().find_map(|pp| match pp {
+                                    Popup::FileLog(fl) if fl.path == p => {
+                                        fl.entries.iter().find(|e| e.revision == r)
+                                    }
+                                    _ => None,
+                                })
                             })
                             .or_else(|| self.log.entries.iter().find(|e| e.revision == r));
                         let header = entry.map(diff_view::revision_header).unwrap_or_default();
-                        self.show_diff_popup(format!("Diff r{r}: {path}"), &content, header);
+                        let title = match &path {
+                            Some(p) => format!("Diff r{r}: {p}"),
+                            None => format!("Diff r{r}"),
+                        };
+                        self.show_diff_popup(title, &content, header);
                     }
-                    _ => {}
-                },
+                }
                 Err(e) => {
                     // name the file for file-scoped diffs (file history)
                     let target = match self.take_pending_fullscreen(req) {
-                        Some(PendingFullscreen::FileRevision(_, p)) => format!(" -- {p}"),
+                        Some(PendingFullscreen::Revision(_, Some(p))) => format!(" -- {p}"),
                         _ => String::new(),
                     };
                     self.show_error(format!("svn diff -c {revision}{target}: {e}"));
@@ -1373,7 +1357,7 @@ mod tests {
         // that triggers a diff request for the selection; consume it
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { path, .. } if path == "main.rs"));
         // request revision diff through the queue
-        app.queue.push(InternalEvent::RequestRevisionDiff(1));
+        app.queue.push(InternalEvent::RequestRevisionDiff(1, None));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),
@@ -1488,7 +1472,7 @@ mod tests {
             0,
             Ok(vec![log_entry(3, "three")]),
         ));
-        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3, None));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),
@@ -1506,7 +1490,7 @@ mod tests {
 
         // a revision not in the loaded log → no header
         app.popups.clear();
-        app.queue.push(InternalEvent::RequestRevisionDiff(99));
+        app.queue.push(InternalEvent::RequestRevisionDiff(99, None));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),
@@ -1532,8 +1516,10 @@ mod tests {
         if let Some(Popup::FileLog(fl)) = app.popups.last_mut() {
             fl.update(vec![log_entry(2, "two")]);
         }
-        app.queue
-            .push(InternalEvent::RequestFileRevisionDiff(2, "main.rs".into()));
+        app.queue.push(InternalEvent::RequestRevisionDiff(
+            2,
+            Some("main.rs".into()),
+        ));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),
@@ -1560,8 +1546,10 @@ mod tests {
     fn file_revision_diff_error_names_the_file() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.queue
-            .push(InternalEvent::RequestFileRevisionDiff(2, "main.rs".into()));
+        app.queue.push(InternalEvent::RequestRevisionDiff(
+            2,
+            Some("main.rs".into()),
+        ));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),
@@ -1916,7 +1904,7 @@ mod tests {
             result: Err("boom".into()),
         });
         assert!(app.pending_fullscreen.is_none());
-        app.pending_fullscreen = Some((1, PendingFullscreen::Revision(3)));
+        app.pending_fullscreen = Some((1, PendingFullscreen::Revision(3, None)));
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
             req: Some(1),
@@ -2503,7 +2491,7 @@ mod tests {
     fn fullscreen_diff_result_requires_matching_token() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
-        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3, None));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),
@@ -2515,7 +2503,7 @@ mod tests {
         ));
         // a second fullscreen request while one is in flight is ignored:
         // no new svn call, the pending slot is untouched
-        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3, None));
         app.handle_queue_events();
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
         assert!(matches!(app.pending_fullscreen, Some((1, _))));
@@ -2545,7 +2533,7 @@ mod tests {
         assert!(app.pending_fullscreen.is_none());
         // with the slot free again, a new request goes through
         app.popups.clear();
-        app.queue.push(InternalEvent::RequestRevisionDiff(3));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3, None));
         app.handle_queue_events();
         assert!(matches!(
             recv(&rx),

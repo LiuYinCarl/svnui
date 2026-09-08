@@ -19,30 +19,6 @@ use ratatui::widgets::{Block, Borders};
 /// huge (merge) commit messages cannot eat the whole screen.
 pub const DIFF_HEADER_MAX: usize = 5;
 
-/// Tab stop used when expanding tabs for display. ratatui's buffer drops
-/// control characters outright, so a literal '\t' in diff content would
-/// vanish (and with it the line's indentation).
-const TAB_STOP: usize = 4;
-
-/// Expand tabs to spaces at `TAB_STOP`-wide stops, counting display
-/// columns so CJK characters advance the column by two.
-fn expand_tabs(s: &str) -> String {
-    use unicode_width::UnicodeWidthChar;
-    let mut out = String::with_capacity(s.len());
-    let mut col = 0usize;
-    for ch in s.chars() {
-        if ch == '\t' {
-            let n = TAB_STOP - (col % TAB_STOP);
-            out.extend(std::iter::repeat_n(' ', n));
-            col += n;
-        } else {
-            out.push(ch);
-            col += UnicodeWidthChar::width(ch).unwrap_or(0);
-        }
-    }
-    out
-}
-
 /// Header lines for a single-revision diff: `r<N> | author | date` plus
 /// message lines, capped at `DIFF_HEADER_MAX`. When the message is
 /// longer, the last shown line ends with `…`.
@@ -202,7 +178,7 @@ impl DiffView {
         // expand them so indented lines keep their shape
         for dl in &mut self.parsed.lines {
             if dl.content.contains('\t') {
-                dl.content = expand_tabs(&dl.content);
+                dl.content = ui::expand_tabs(&dl.content);
             }
         }
         self.num_w = line_number_width(&self.parsed);
@@ -290,16 +266,16 @@ impl DiffView {
 
 /// A new section starts at an "Index: " header (svn), a "diff --git "
 /// header (git-format patches), or a "Property changes on:" section
-/// (property-only diff without an Index header). Added/Removed lines are
-/// excluded: diffing a .patch file yields content lines that themselves
-/// start with these prefixes, and those are not section starts.
+/// (property-only diff without an Index header). Only `Header`-kind lines
+/// qualify: the parser classifies those prefixes at the raw-line level,
+/// where content lines always carry a +/-/space marker — so a diff *of* a
+/// .patch file (whose content lines themselves start with these prefixes)
+/// yields no phantom section starts.
 fn is_file_boundary(dl: &DiffLine) -> bool {
-    if matches!(dl.kind, DiffLineKind::Added | DiffLineKind::Removed) {
-        return false;
-    }
-    dl.content.starts_with("Index: ")
-        || dl.content.starts_with("diff --git ")
-        || dl.content.starts_with("Property changes on:")
+    dl.kind == DiffLineKind::Header
+        && (dl.content.starts_with("Index: ")
+            || dl.content.starts_with("diff --git ")
+            || dl.content.starts_with("Property changes on:"))
 }
 
 /// Build a single styled diff line with line numbers.
@@ -648,6 +624,38 @@ Index: Cargo.toml
         );
         assert!(v.event(&ts::key(KeyCode::Char(']'))).consumed);
         assert_eq!(v.tv.scroll.get(), 0, "no real second file section");
+    }
+
+    #[test]
+    fn context_lines_that_look_like_headers_are_not_boundaries() {
+        // diffing a *modified* .patch file: the embedded patch's unchanged
+        // header lines appear as context lines and must not be jump targets
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: p.patch\n@@ -1,3 +1,3 @@\n diff --git a/x b/y\n Index: z\n-old\n+new\n",
+        );
+        assert!(v.event(&ts::key(KeyCode::Char(']'))).consumed);
+        assert_eq!(
+            v.tv.scroll.get(),
+            0,
+            "context header lookalikes are no sections"
+        );
+    }
+
+    #[test]
+    fn git_patch_headers_are_boundaries() {
+        // a git-format patch preview: "diff --git " raw lines classify as
+        // headers, so ] walks the patch's files
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "diff --git a/x b/y\n@@ -1 +1 @@\n-a\n+b\ndiff --git c/z d/z\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        v.event(&ts::key(KeyCode::Char(']')));
+        assert_eq!(v.tv.scroll.get(), 4);
+        v.event(&ts::key(KeyCode::Char('[')));
+        assert_eq!(v.tv.scroll.get(), 0);
     }
 
     #[test]

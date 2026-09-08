@@ -404,7 +404,11 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
 
     for raw in output.lines() {
         let line = raw.trim_end_matches('\r');
-        if line.starts_with("Index:") || line.starts_with("===") {
+        // Raw-line headers. Content lines always carry a +/-/space
+        // marker, so these prefixes cannot be content; "diff --git " is
+        // a git-format patch header (patch previews reuse this parser).
+        if line.starts_with("Index:") || line.starts_with("===") || line.starts_with("diff --git ")
+        {
             old_line = None;
             new_line = None;
             lines.push(DiffLine {

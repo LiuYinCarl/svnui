@@ -164,7 +164,9 @@ impl LogComponent {
             let revs: Vec<u64> = self.marks.iter().copied().collect();
             self.ctx.queue.push(InternalEvent::RequestRangeDiff(revs));
         } else if let Some(rev) = self.selection_revision() {
-            self.ctx.queue.push(InternalEvent::RequestRevisionDiff(rev));
+            self.ctx
+                .queue
+                .push(InternalEvent::RequestRevisionDiff(rev, None));
         }
     }
 
@@ -566,13 +568,13 @@ mod tests {
         c.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(3))
+            Some(InternalEvent::RequestRevisionDiff(3, None))
         ));
         c.event(&ts::key(crossterm::event::KeyCode::Char('d')))
             .unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(3))
+            Some(InternalEvent::RequestRevisionDiff(3, None))
         ));
         c.event(&ts::key(crossterm::event::KeyCode::Char('o')))
             .unwrap();
@@ -634,7 +636,7 @@ mod tests {
         c.event(&ts::key(crossterm::event::KeyCode::Enter)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::RequestRevisionDiff(3))
+            Some(InternalEvent::RequestRevisionDiff(3, None))
         ));
     }
 
