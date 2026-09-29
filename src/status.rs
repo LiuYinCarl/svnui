@@ -88,14 +88,37 @@ impl StatusTab {
 
     // ----- data updates -----
 
-    pub fn update_status(&mut self, entries: Vec<StatusEntry>) {
+    pub fn update_status(
+        &mut self,
+        entries: Vec<StatusEntry>,
+        ignore: Option<&crate::ignore_filter::IgnoreFilter>,
+    ) {
+        // a `.svnignore` filter only affects display: hidden entries are
+        // dropped before they reach the tree, so they can neither be
+        // staged nor committed from the TUI while hidden
+        let (entries, hidden) = match ignore {
+            Some(f) => {
+                let (visible, hidden) = f.partition(entries, |e| e.path.as_str(), |e| e.is_dir);
+                (visible, Some(hidden.len()))
+            }
+            None => (entries, None),
+        };
+        self.tree.set_svnignore_hidden(hidden);
         self.tree.update(entries);
         // force the diff to reload after status changes
         self.last_diff_requested = None;
         self.update_commit_hint();
         if self.tree.is_empty() && self.tree.selection_entry().is_none() {
-            self.diff
-                .set_hint("Diff".to_string(), "Working copy is clean".to_string());
+            let reason = match hidden {
+                Some(n) if n > 0 => {
+                    format!(
+                        "Working copy is clean ({n} {})",
+                        crate::strings::MSG.svnignore_hidden
+                    )
+                }
+                _ => "Working copy is clean".to_string(),
+            };
+            self.diff.set_hint("Diff".to_string(), reason);
         }
     }
 
@@ -269,7 +292,7 @@ mod tests {
     #[test]
     fn update_status_sets_hints() {
         let (mut t, _q) = tab();
-        t.update_status(vec![entry('M', "a.txt"), entry('?', "b.txt")]);
+        t.update_status(vec![entry('M', "a.txt"), entry('?', "b.txt")], None);
         assert_eq!(t.tree.staged_count(), 0);
         assert!(t.commit.hint.contains("nothing staged"));
         // staged hint
@@ -277,7 +300,37 @@ mod tests {
         t.update_commit_hint();
         assert!(t.commit.hint.contains("1 file(s) staged"));
         // clean working copy hint
-        t.update_status(vec![]);
+        t.update_status(vec![], None);
+        assert_eq!(
+            t.diff.empty_reason.as_deref(),
+            Some("Working copy is clean")
+        );
+    }
+
+    #[test]
+    fn update_status_applies_svnignore_filter() {
+        let (mut t, _q) = tab();
+        let filter = crate::ignore_filter::IgnoreFilter::from_lines("*.log\nbuild/\n").unwrap();
+        t.update_status(
+            vec![
+                entry('M', "a.txt"),
+                entry('?', "error.log"),
+                entry('?', "build/output.bin"),
+            ],
+            Some(&filter),
+        );
+        // only the non-ignored file reaches the tree
+        assert_eq!(t.tree.visible_len(), 1);
+        assert_eq!(t.tree.selection_path().as_deref(), Some("a.txt"));
+        // everything hidden: the diff hint says so instead of "clean"
+        t.update_status(vec![entry('?', "error.log")], Some(&filter));
+        assert!(t.tree.is_empty());
+        assert_eq!(
+            t.diff.empty_reason.as_deref(),
+            Some("Working copy is clean (1 hidden by .svnignore)")
+        );
+        // no filter: back to the plain hint
+        t.update_status(vec![], None);
         assert_eq!(
             t.diff.empty_reason.as_deref(),
             Some("Working copy is clean")
@@ -287,13 +340,13 @@ mod tests {
     #[test]
     fn maybe_request_diff_flow() {
         let (mut t, _q) = tab();
-        t.update_status(vec![entry('M', "a.txt"), entry('M', "b.txt")]);
+        t.update_status(vec![entry('M', "a.txt"), entry('M', "b.txt")], None);
         // first selection (a.txt) requests a diff
         assert_eq!(t.maybe_request_diff().as_deref(), Some("a.txt"));
         // same file → no duplicate request
         assert_eq!(t.maybe_request_diff(), None);
         // new status: selection stays on a.txt (a file) → new request
-        t.update_status(vec![entry('M', "src/main.rs"), entry('M', "a.txt")]);
+        t.update_status(vec![entry('M', "src/main.rs"), entry('M', "a.txt")], None);
         assert_eq!(t.maybe_request_diff().as_deref(), Some("a.txt"));
         // moving to the src dir → hint, no request
         t.tree
@@ -307,14 +360,14 @@ mod tests {
             Some("src is a directory — select a file")
         );
         // status change forces a new request
-        t.update_status(vec![entry('M', "a.txt")]);
+        t.update_status(vec![entry('M', "a.txt")], None);
         assert_eq!(t.maybe_request_diff().as_deref(), Some("a.txt"));
     }
 
     #[test]
     fn apply_diff_only_for_current_selection() {
         let (mut t, _q) = tab();
-        t.update_status(vec![entry('M', "a.txt")]);
+        t.update_status(vec![entry('M', "a.txt")], None);
         // stale diff for a different path is ignored (hint stays)
         t.apply_diff("b.txt", "Index: b\n");
         assert!(t.diff.empty_reason.is_some());
@@ -326,7 +379,7 @@ mod tests {
     #[test]
     fn event_routes_to_focused_pane() {
         let (mut t, q) = tab();
-        t.update_status(vec![entry('M', "a.txt")]);
+        t.update_status(vec![entry('M', "a.txt")], None);
         // tree focused: 'j' consumed
         assert!(
             t.event(&ts::key(crossterm::event::KeyCode::Char('j')))
@@ -387,7 +440,7 @@ mod tests {
     #[test]
     fn draw_layout() {
         let (mut t, _q) = tab();
-        t.update_status(vec![entry('M', "a.txt")]);
+        t.update_status(vec![entry('M', "a.txt")], None);
         t.tree
             .event(&crossterm::event::Event::Key(
                 crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')),

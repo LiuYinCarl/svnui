@@ -69,6 +69,10 @@ pub enum KeyAction {
     ViewCommitInfo,
     BlameFileFinder,
     SwitchTabPatches,
+    /// Switch to the `.svnignore` editor tab (`4`)
+    SwitchTabIgnore,
+    /// Ignore tab: save the file (Ctrl+s)
+    IgnoreSave,
     /// Save the working-copy changes as a patch file (`P`, app-level)
     SavePatch,
     /// Patches tab: preview the selected patch (`p`, Enter is separate)
@@ -116,6 +120,10 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::SwitchTabStatus => is_key(ev, KeyCode::Char('1')),
         KeyAction::SwitchTabLog => is_key(ev, KeyCode::Char('2')),
         KeyAction::SwitchTabPatches => is_key(ev, KeyCode::Char('3')),
+        KeyAction::SwitchTabIgnore => is_key(ev, KeyCode::Char('4')),
+        KeyAction::IgnoreSave => {
+            ev.code == KeyCode::Char('s') && ev.modifiers.contains(KeyModifiers::CONTROL)
+        }
         KeyAction::Help => is_key(ev, KeyCode::Char('?')),
         KeyAction::RepoInfo => is_key(ev, KeyCode::Char('i')),
         KeyAction::Confirm => is_key(ev, KeyCode::Char('y')) || is_key(ev, KeyCode::Char('Y')),
@@ -192,7 +200,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
         KeyGroup {
             title: "Global",
             bindings: vec![
-                KeyBinding::new("1 / 2 / 3", "Switch tab: status / log / patches"),
+                KeyBinding::new(
+                    "1 / 2 / 3 / 4",
+                    "Switch tab: status / log / patches / .svnignore",
+                ),
                 KeyBinding::new(
                     "Tab / Shift+Tab",
                     "Cycle pane focus (status: tree/diff/commit, log: list/details)",
@@ -244,6 +255,14 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("Enter / p", "Preview patch (diff view)"),
                 KeyBinding::new("a", "Apply patch (svn patch, confirmed)"),
                 KeyBinding::new("d", "Delete patch file (confirmed)"),
+            ],
+        },
+        KeyGroup {
+            title: "Ignore tab (.svnignore editor)",
+            bindings: vec![
+                KeyBinding::new("Ctrl+s", "Save .svnignore (refreshes the status filter)"),
+                KeyBinding::new("F5", "Reload from disk (only with no unsaved edits)"),
+                KeyBinding::new("Esc", "Back to the status tab"),
             ],
         },
         KeyGroup {

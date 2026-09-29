@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod components;
+pub mod ignore_filter;
 pub mod keys;
 pub mod popups;
 pub mod queue;

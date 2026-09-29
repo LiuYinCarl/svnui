@@ -6,6 +6,7 @@ pub mod diff_view;
 pub mod file_finder;
 pub mod file_log;
 pub mod help;
+pub mod ignore_editor;
 pub mod log;
 pub mod log_search;
 pub mod patches;

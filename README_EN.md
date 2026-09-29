@@ -52,7 +52,7 @@ Covers the most common daily SVN operations:
 | **Update** | `svn update` and update-to-revision (`svn update -r N`), both confirmed; the confirmation shows the working-copy path being updated |
 | **Conflict resolution** | `svn resolve --accept=working` (with confirmation) |
 | **Patch management** | `P` saves working-copy changes as a timestamped patch file (an `svn diff` snapshot; the working copy is not reverted); `3` opens the patches tab (newest first) where `Enter`/`p` previews (reusing the diff popup), `a` applies (`svn patch`, confirmed) and `d` deletes (confirmed). Patches live in the platform data dir; override with `SVNUI_PATCH_DIR` |
-| **Filtering** | `/` filters files by path (status tab, popup input, live filtering; Esc clears an active filter) / searches commits (log tab) |
+| **Filtering** | `/` filters files by path (status tab, popup input, live filtering; Esc clears an active filter) / searches commits (log tab). A `.svnignore` file at the working-copy root (.gitignore syntax) additionally hides matching files/dirs from the status tree; while active the status title shows a `[N hidden by .svnignore]` hint. `4` opens a built-in editor with live syntax checking (`Ctrl+s` saves and applies immediately) |
 | **Repo info** | `i` opens a repository overview popup: working-copy info (path/URL/branch/revision/last change), remote HEAD comparison (how many revisions behind, last commit), and a change summary (per-status counts + commit-set size), all color-coded |
 | **Help** | `?` shows all key bindings |
 | **Async execution** | Every svn command runs on a background thread; the UI never blocks and shows a spinner |
@@ -105,7 +105,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `F5` / `R` | Refresh status / log / patch list |
 | `P` | Save working-copy changes as a patch file (snapshot, no revert) |
 | `Tab` / `Shift+Tab` | Cycle pane focus within the tab (status: tree/diff/commit, log: list/details); use `1`/`2`/`3` to switch tabs |
-| `1` / `2` / `3` | Status / log / patches tabs |
+| `1` / `2` / `3` / `4` | Status / log / patches / `.svnignore` editor tabs |
 | `Enter` / `d` | Log tab: diff of the selected (or marked) revisions |
 | `space` | Log tab: mark / unmark revision |
 | `o` | Log tab: update working copy to the selected revision |

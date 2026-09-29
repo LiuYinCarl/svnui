@@ -52,6 +52,8 @@ pub struct Msg {
     pub patch_deleted: &'static str,
     pub apply_patch_confirm: &'static str,
     pub delete_patch_confirm: &'static str,
+    /// Status-tree title suffix while a `.svnignore` filter is active
+    pub svnignore_hidden: &'static str,
 }
 
 pub const MSG: Msg = Msg {
@@ -76,4 +78,5 @@ pub const MSG: Msg = Msg {
     patch_deleted: "Deleted patch",
     apply_patch_confirm: "Apply this patch to the working copy? (svn patch)",
     delete_patch_confirm: "Delete this patch file?",
+    svnignore_hidden: "hidden by .svnignore",
 };

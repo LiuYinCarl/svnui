@@ -3,6 +3,7 @@
 
 use crate::components::{
     Context, DrawableComponent, diff_view,
+    ignore_editor::{self, IgnoreEditor},
     log::{self, LogComponent},
     patches::{self, PatchesComponent},
     repo_info,
@@ -79,6 +80,8 @@ pub struct App {
     pub status: StatusTab,
     pub log: LogComponent,
     pub patches: PatchesComponent,
+    /// `.svnignore` editor tab
+    pub ignore: IgnoreEditor,
     pub active_tab: Tab,
     pub popups: Vec<Popup>,
     /// Working copy info (URL / branch / revision), loaded at startup
@@ -113,12 +116,14 @@ impl App {
         let status = StatusTab::new(&ctx);
         let log = LogComponent::new(&ctx);
         let patches = PatchesComponent::new(&ctx);
+        let ignore = IgnoreEditor::new(&ctx, cwd.clone());
         Self {
             svn,
             queue: ctx.queue.clone(),
             status,
             log,
             patches,
+            ignore,
             ctx,
             active_tab: Tab::Status,
             popups: Vec::new(),
@@ -232,6 +237,7 @@ impl App {
             Tab::Status => self.status.event(ev)?.consumed || self.status.handle_global_key(ev),
             Tab::Log => self.log.event(ev)?.consumed,
             Tab::Patches => self.patches.event(ev)?.consumed,
+            Tab::Ignore => self.ignore.event(ev)?.consumed,
         };
         if consumed {
             return Ok(());
@@ -262,6 +268,8 @@ impl App {
             self.activate_tab(Tab::Log);
         } else if key_match(k, KeyAction::SwitchTabPatches) {
             self.activate_tab(Tab::Patches);
+        } else if key_match(k, KeyAction::SwitchTabIgnore) {
+            self.activate_tab(Tab::Ignore);
         }
         // Tab / Shift+Tab are pane-focus keys, handled per tab (status:
         // handle_global_key; log: its own event); they never switch tabs
@@ -270,11 +278,16 @@ impl App {
     }
 
     /// Switch the active tab; entering the patches tab reloads the list
-    /// (a cheap local dir read) so it never shows stale entries.
+    /// (a cheap local dir read) so it never shows stale entries. Entering
+    /// the ignore tab likewise reloads the file from disk (refused while
+    /// it holds unsaved edits).
     fn activate_tab(&mut self, tab: Tab) {
         self.active_tab = tab;
         if tab == Tab::Patches {
             self.patches.refresh();
+        }
+        if tab == Tab::Ignore {
+            self.ignore.reload();
         }
     }
 
@@ -735,7 +748,10 @@ impl App {
                 self.last_status_id = id;
                 match result {
                     Ok(entries) => {
-                        self.status.update_status(entries);
+                        // reloaded on every refresh, so edits to the file
+                        // take effect without restarting the TUI
+                        let ignore = crate::ignore_filter::IgnoreFilter::load(&self.cwd);
+                        self.status.update_status(entries, ignore.as_ref());
                         self.maybe_request_diff();
                     }
                     Err(e) => {
@@ -1096,6 +1112,7 @@ impl App {
             Tab::Status => self.status.draw(f, main)?,
             Tab::Log => self.log.draw(f, main)?,
             Tab::Patches => self.patches.draw(f, main)?,
+            Tab::Ignore => self.ignore.draw(f, main)?,
         }
 
         // status bar
@@ -1144,9 +1161,10 @@ impl App {
             Tab::Status => crate::status::HINTS,
             Tab::Log => crate::components::log::HINTS,
             Tab::Patches => patches::HINTS,
+            Tab::Ignore => ignore_editor::HINTS,
         };
         spans.push(Span::styled(
-            format!("{hints}  ? help  i info  q quit  [1]status [2]log [3]patches"),
+            format!("{hints}  ? help  i info  q quit  [1]status [2]log [3]patches [4]ignore"),
             theme.dim,
         ));
         let line = Line::from(spans);
@@ -1877,6 +1895,41 @@ mod tests {
         app.handle_queue_events();
         assert_eq!(app.active_tab, Tab::Log);
         app.handle_input(&ts_key(KeyCode::Char('1'))).unwrap();
+        app.handle_queue_events();
+        assert_eq!(app.active_tab, Tab::Status);
+    }
+
+    #[test]
+    fn ignore_tab_edit_save_flow() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // '4' opens the .svnignore editor
+        app.handle_input(&ts_key(KeyCode::Char('4'))).unwrap();
+        app.handle_queue_events();
+        assert_eq!(app.active_tab, Tab::Ignore);
+        // typing goes into the editor (digits are text, not tab switches)
+        for ch in "*.log".chars() {
+            app.handle_input(&ts_key(KeyCode::Char(ch))).unwrap();
+        }
+        assert_eq!(app.ignore.content(), "*.log");
+        assert!(app.ignore.is_dirty());
+        // Ctrl+s writes the file and triggers a status refresh
+        app.handle_input(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ))
+        .unwrap();
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
+        assert_eq!(
+            std::fs::read_to_string(repo.wc.join(".svnignore")).unwrap(),
+            "*.log\n"
+        );
+        assert!(!app.ignore.is_dirty());
+        // Esc returns to the status tab
+        app.handle_input(&ts_key(KeyCode::Esc)).unwrap();
         app.handle_queue_events();
         assert_eq!(app.active_tab, Tab::Status);
     }
@@ -3049,6 +3102,45 @@ mod tests {
         // the added ancestors were committed along, nothing is left behind
         let out = repo.svn(&["status"]);
         assert!(out.trim().is_empty(), "{out}");
+    }
+
+    /// A `.svnignore` at the working-copy root filters status entries out
+    /// of the tree, and the tree title advertises the filter so users do
+    /// not mistake the hidden entries for a bug.
+    #[test]
+    fn svnignore_filters_status_and_shows_hint() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        test_support::write_file(&repo.wc.join(".svnignore"), "*.log\nbuild/\n");
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![
+                entry('M', "Cargo.toml"),
+                entry('?', "error.log"),
+                entry('?', "build/output.bin"),
+            ]),
+        ));
+        assert_eq!(app.status.tree.visible_len(), 1);
+        assert_eq!(
+            app.status.tree.selection_path().as_deref(),
+            Some("Cargo.toml")
+        );
+        let t = test_support::render(80, 10, |f| {
+            app.status.tree.draw(f, Rect::new(0, 0, 80, 10)).unwrap();
+        });
+        let s = test_support::dump(&t);
+        assert!(s.contains("2 hidden by .svnignore"), "{s}");
+        // deleting the file disables the filter on the next refresh
+        std::fs::remove_file(repo.wc.join(".svnignore")).unwrap();
+        app.handle_async(AsyncSvnNotification::Status(
+            1,
+            Ok(vec![entry('?', "error.log")]),
+        ));
+        assert_eq!(app.status.tree.visible_len(), 1);
+        let t = test_support::render(80, 10, |f| {
+            app.status.tree.draw(f, Rect::new(0, 0, 80, 10)).unwrap();
+        });
+        assert!(!test_support::dump(&t).contains(".svnignore"));
     }
 
     #[test]

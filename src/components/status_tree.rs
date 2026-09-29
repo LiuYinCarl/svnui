@@ -46,6 +46,10 @@ pub struct StatusTreeComponent {
     scroll: std::cell::Cell<usize>,
     /// Paths included in the commit set (staged)
     pub staged: HashSet<String>,
+    /// `Some(n)` while a `.svnignore` filter is active and hid `n` status
+    /// entries (shown in the title so the filter is not mistaken for a
+    /// bug); `None` when no `.svnignore` is in effect
+    svnignore_hidden: Option<usize>,
     filter: String,
     pub pending: bool,
     pub focused: bool,
@@ -65,6 +69,7 @@ impl StatusTreeComponent {
             selection: 0,
             scroll: std::cell::Cell::new(0),
             staged: HashSet::new(),
+            svnignore_hidden: None,
             filter: String::new(),
             pending: true,
             focused: true,
@@ -207,6 +212,13 @@ impl StatusTreeComponent {
             self.counts_dirty.set(true);
         }
         self.staged.clear();
+    }
+
+    /// Record how many status entries a `.svnignore` filter hid (`None` =
+    /// no filter in effect). Shown in the title so users do not mistake
+    /// the missing entries for a bug.
+    pub fn set_svnignore_hidden(&mut self, hidden: Option<usize>) {
+        self.svnignore_hidden = hidden;
     }
 
     /// Whether the staged set contains any directory path. Staged paths
@@ -610,6 +622,9 @@ impl DrawableComponent for StatusTreeComponent {
         } else if !self.filter.is_empty() {
             title.push_str(&format!("  filter: \"{}\"", self.filter));
         }
+        if let Some(hidden) = self.svnignore_hidden {
+            title.push_str(&format!("  [{hidden} {}]", strings::MSG.svnignore_hidden));
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border))
@@ -980,6 +995,7 @@ mod tests {
             selection: 0,
             scroll: std::cell::Cell::new(0),
             staged: HashSet::new(),
+            svnignore_hidden: None,
             filter: String::new(),
             pending: false,
             focused: true,

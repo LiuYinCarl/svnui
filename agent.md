@@ -14,8 +14,14 @@
 - SVN **没有暂存区**。"暂存"被实现为**提交集**（`StatusTreeComponent::staged: HashSet<String>`）：
   只有加入提交集的路径才会随下一次 `svn commit` 提交；未版本化（`?`）文件暂存时自动
   `svn add`；提交集为空时拒绝提交（确认弹窗前与 `perform_confirmed` 双重拦截）。
-  提交集含目录路径时 commit 自动带 `--depth empty`（`staged_contains_dir()`），目录 target
-  只提交自身改动、不递归卷入未暂存子孙；`svn add` 失败的路径会从提交集回滚（`unstage_paths()`）。
+  提交集含目录路径时 commit 自动带 `--depth empty`（按扩展后的提交目标判定），目录 target
+  只提交自身改动、不递归卷入未列出的子孙；提交前 `expand_commit_paths()` 会扩展目标：
+  拉入新增（A）祖先目录（否则 svn 报 E200009），并把"新增目录 target"展开为其新增子孙
+  （否则 --depth empty 会提交空目录、把子文件留在工作副本）；`svn add` 失败的路径会从
+  提交集回滚（`unstage_paths()`）。
+- 状态树支持 `.svnignore`（工作副本根目录，.gitignore 语法，见 `src/ignore_filter.rs`）：
+  命中的条目不展示也不可操作，标题栏显示 `[N hidden by .svnignore]` 提示；`4` 键打开
+  内置编辑器标签页（`ignore_editor.rs`），带实时语法检查。
 - 禁止使用 `unsafe`。新代码必须通过 `cargo clippy --all-targets -- -D warnings`（CI 门禁）。
 
 ## 目录结构
@@ -30,6 +36,7 @@ src/
 ├── status.rs         Status 标签页聚合（文件树 + Diff 面板 + 提交输入栏 + 焦点切换）
 ├── keys.rs           快捷键集中定义（key_match(ev, KeyAction) -> bool）
 ├── strings.rs        用户可见字符串（集中管理）
+├── ignore_filter.rs  .svnignore 支持（gitignore 语法，匹配用 ignore crate）
 ├── svn/
 │   ├── mod.rs        Svn 客户端：所有命令在后台线程执行，经 channel 回传 AsyncSvnNotification
 │   ├── parser.rs     svn status/log/blame/diff 纯文本解析器（纯函数、无 IO）
@@ -49,6 +56,9 @@ src/
 │   │                 diff + h/l 横滚）
 │   ├── patches.rs    补丁标签页（列出 patch 目录、预览/应用/删除补丁；patch_dir() 解析存储目录，
 │   │                 SVNUI_PATCH_DIR 可覆盖）
+│   ├── ignore_editor.rs  第 4 标签页：.svnignore 编辑器（tui-textarea 多行编辑；每次编辑用
+│   │                 ignore crate 的 GitignoreBuilder 逐行语法校验，错误显示在底部面板；
+│   │                 Ctrl+s 保存并触发状态刷新；dirty 时 F5 拒绝重载；Esc 返回状态页）
 │   ├── text_search.rs 可复用的增量搜索状态（diff/blame 弹窗共用）
 │   ├── text_view.rs  可滚动文本视图基座（滚动/横滚/搜索/footer 布局;diff/blame 共用）
 │   └── help.rs       帮助弹窗
@@ -107,8 +117,10 @@ cargo fmt --all --check     # 格式门禁
 - 组件实现 `DrawableComponent`（`draw(&self, ...)` + `event(&mut self, ...)`）；
   `draw` 是 `&self`——需要可变状态（滚动偏移等）用 `Cell`。
 - 文本输入用 `tui-textarea-2`，不要手写字符宽度计算。
-- 终端 buffer 会丢弃控制字符：凡展示文件/命令原始内容（diff、blame……），先经
-  `ui::expand_tabs` 展开 tab（4 列停点、按显示列计宽），否则缩进整个丢失。
+- 终端 buffer 会丢弃控制字符：凡展示文件/命令原始内容，必须先处理 tab——diff 视图用
+  `ui::visualize_whitespace`（tab → `→`、行尾空格 → `·`，纯空白修改才不会显示成两行
+  无差异），blame 等其余视图用 `ui::expand_tabs` 展开（4 列停点、按显示列计宽），
+  否则缩进整个丢失。
 - 组件不应直接持有 `Svn`；通过 `Context.queue` push `InternalEvent`，由 App 执行命令。
 - 新增快捷键：在 `keys.rs` 加 `KeyAction` 变体 + `key_match` 分支，并更新 `all_binding_groups()`（帮助页，按上下文分组）。
 - 新增用户可见文本：加到 `strings.rs`。

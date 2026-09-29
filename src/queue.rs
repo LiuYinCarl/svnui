@@ -119,6 +119,8 @@ pub enum Tab {
     Status,
     Log,
     Patches,
+    /// `.svnignore` editor
+    Ignore,
 }
 
 /// Simple FIFO queue shared via Rc, so components can push events without
