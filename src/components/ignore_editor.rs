@@ -202,10 +202,13 @@ impl DrawableComponent for IgnoreEditor {
             Layout::vertical([Constraint::Min(3), Constraint::Length(footer_h)]).split(area);
 
         let dirty_mark = if self.dirty { " ●" } else { "" };
+        // NB: title is the bare file name, not the full path — a deep
+        // working-copy path would fill the title and push the dirty
+        // marker off the edge
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_focused))
-            .title(format!("{}{dirty_mark}", self.path.display()));
+            .title(format!("{IGNORE_FILE} (working copy root){dirty_mark}"));
         f.render_widget(&self.textarea, block.inner(chunks[0]));
         f.render_widget(block, chunks[0]);
 
