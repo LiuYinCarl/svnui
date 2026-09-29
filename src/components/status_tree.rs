@@ -255,9 +255,7 @@ impl StatusTreeComponent {
             if self.entry_for_path(p).is_some_and(is_added_dir) {
                 let prefix = format!("{p}/");
                 for e in &self.entries {
-                    if e.status == 'A'
-                        && e.path.starts_with(&prefix)
-                        && seen.insert(e.path.clone())
+                    if e.status == 'A' && e.path.starts_with(&prefix) && seen.insert(e.path.clone())
                     {
                         out.push(e.path.clone());
                     }
@@ -1676,8 +1674,7 @@ mod interaction_tests {
         let expanded = c.expand_commit_paths(&["props".to_string()]);
         assert_eq!(expanded, vec!["props".to_string()]);
         // no duplicates when the file was already a target
-        let expanded =
-            c.expand_commit_paths(&["newdir".to_string(), "newdir/a.txt".to_string()]);
+        let expanded = c.expand_commit_paths(&["newdir".to_string(), "newdir/a.txt".to_string()]);
         assert_eq!(
             expanded,
             vec![

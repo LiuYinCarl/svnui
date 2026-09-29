@@ -599,10 +599,7 @@ Index: Cargo.toml
         // a change that only adds trailing blanks / swaps spaces for a tab
         // must not render as two identical lines
         let mut v = DiffView::new("t");
-        v.set_content(
-            "t".into(),
-            "Index: f\n@@ -1 +1 @@\n-foo  \n+foo\t\n",
-        );
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-foo  \n+foo\t\n");
         let removed = v
             .parsed
             .lines
