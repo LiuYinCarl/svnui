@@ -574,15 +574,20 @@ impl App {
             .unwrap_or_else(|| "(unknown branch)".to_string());
         // what will actually be committed mirrors `perform_confirmed`:
         // explicit paths > staged set (an empty staged set is refused
-        // before this popup is ever shown)
-        let targets: Vec<(char, String)> = if !paths.is_empty() {
-            paths
-                .iter()
-                .map(|p| (self.status.tree.status_char(p), p.clone()))
-                .collect()
+        // before this popup is ever shown), expanded with the scheduled-add
+        // ancestors/descendants the commit will include
+        let base: Vec<String> = if !paths.is_empty() {
+            paths.to_vec()
         } else {
-            self.status.commit_targets()
+            self.status.tree.staged.iter().cloned().collect()
         };
+        let targets: Vec<(char, String)> = self
+            .status
+            .tree
+            .expand_commit_paths(&base)
+            .iter()
+            .map(|p| (self.status.tree.status_char(p), p.clone()))
+            .collect();
         let what = format!("{} ({} files)", MSG.commit_staged, targets.len());
         const MAX_LISTED: usize = 8;
         let mut out = format!("{what}\nTarget branch: {branch}\n");
@@ -612,10 +617,16 @@ impl App {
                     self.show_error(MSG.commit_nothing_staged.to_string());
                     return;
                 }
-                // a staged directory target must commit only its own
-                // changes: --depth empty keeps unstaged descendants out
-                // of the commit (file targets are unaffected by it)
-                let depth_empty = from_staged && self.status.tree.staged_contains_dir();
+                // pull in scheduled-add ancestors (svn rejects the commit
+                // with E200009 when a file under a newly added directory is
+                // committed without the directory) and the descendants of
+                // staged added directories (they would be stranded by the
+                // --depth empty below)
+                paths = self.status.tree.expand_commit_paths(&paths);
+                // a directory target must commit only its own changes:
+                // --depth empty keeps unlisted descendants out of the
+                // commit (file targets are unaffected by it)
+                let depth_empty = from_staged && self.status.tree.any_dir(&paths);
                 self.svn.commit(&message, &paths, depth_empty);
                 self.pending += 1;
             }
@@ -2951,13 +2962,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_with_staged_directory_uses_depth_empty() {
+    fn commit_with_staged_added_directory_commits_its_children() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
         // schedule a new directory with a file inside
         test_support::write_file(&repo.wc.join("newdir/file.txt"), "hi\n");
         repo.svn(&["add", "newdir"]);
-        // the tree knows the staged target is a directory
         let dir_entry = StatusEntry {
             status: 'A',
             props_status: ' ',
@@ -2965,7 +2975,17 @@ mod tests {
             path: "newdir".into(),
             is_dir: true,
         };
-        app.handle_async(AsyncSvnNotification::Status(0, Ok(vec![dir_entry])));
+        let file_entry = StatusEntry {
+            status: 'A',
+            props_status: ' ',
+            tree_conflict: ' ',
+            path: "newdir/file.txt".into(),
+            is_dir: false,
+        };
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![dir_entry, file_entry]),
+        ));
         app.status.set_staged(&["newdir".into()]);
         app.perform_confirmed(ConfirmAction::Commit {
             message: "add dir".into(),
@@ -2975,11 +2995,60 @@ mod tests {
             AsyncSvnNotification::Commit(Ok(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
-        // --depth empty committed the directory itself only: the child
-        // file is still scheduled for addition, not swept into the commit
+        // a staged *added* directory commits its added descendants too:
+        // with --depth empty alone the directory would be committed empty
+        // and the child stranded in the working copy
         let out = repo.svn(&["status"]);
-        assert!(out.contains("newdir/file.txt"), "{out}");
-        assert!(!out.lines().any(|l| l.ends_with("newdir")), "{out}");
+        assert!(out.trim().is_empty(), "{out}");
+    }
+
+    /// Regression test for svn E200009: a staged file inside a newly added
+    /// directory failed to commit because the directory itself was not a
+    /// commit target ("not part of the commit, yet its child ... is").
+    #[test]
+    fn commit_file_inside_added_directory_includes_the_directory() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        test_support::write_file(&repo.wc.join("newdir/sub/file.txt"), "hi\n");
+        repo.svn(&["add", "newdir"]);
+        // staging happens file-by-file (e.g. "stage all" skips dirs), so
+        // the commit set holds the file only
+        let entries = vec![
+            StatusEntry {
+                status: 'A',
+                props_status: ' ',
+                tree_conflict: ' ',
+                path: "newdir".into(),
+                is_dir: true,
+            },
+            StatusEntry {
+                status: 'A',
+                props_status: ' ',
+                tree_conflict: ' ',
+                path: "newdir/sub".into(),
+                is_dir: true,
+            },
+            StatusEntry {
+                status: 'A',
+                props_status: ' ',
+                tree_conflict: ' ',
+                path: "newdir/sub/file.txt".into(),
+                is_dir: false,
+            },
+        ];
+        app.handle_async(AsyncSvnNotification::Status(0, Ok(entries)));
+        app.status.set_staged(&["newdir/sub/file.txt".into()]);
+        app.perform_confirmed(ConfirmAction::Commit {
+            message: "add nested file".into(),
+            paths: vec![],
+        });
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(_)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        // the added ancestors were committed along, nothing is left behind
+        let out = repo.svn(&["status"]);
+        assert!(out.trim().is_empty(), "{out}");
     }
 
     #[test]

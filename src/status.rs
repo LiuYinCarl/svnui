@@ -154,13 +154,6 @@ impl StatusTab {
         };
     }
 
-    /// Files the next commit would include: the staged set. Committing with
-    /// an empty commit set is refused by the app layer, so there is no
-    /// "commit everything" fallback here.
-    pub fn commit_targets(&self) -> Vec<(char, String)> {
-        self.tree.staged_files()
-    }
-
     pub fn set_staged(&mut self, paths: &[String]) {
         self.tree.set_staged(paths);
         self.update_commit_hint();

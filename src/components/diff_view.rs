@@ -174,11 +174,18 @@ impl DiffView {
             self.parsed = parse_new_file_content(content);
             self.empty_reason = None;
         }
-        // tabs would be dropped by the terminal buffer (control chars);
-        // expand them so indented lines keep their shape
+        // tabs would be dropped by the terminal buffer (control chars)
+        // and trailing blanks are invisible, so content lines get visible
+        // markers for both — a whitespace-only change must not render as
+        // two identical-looking +/- lines. Headers keep their raw text
+        // (file headers legitimately contain '\t' before "(revision N)").
         for dl in &mut self.parsed.lines {
-            if dl.content.contains('\t') {
-                dl.content = ui::expand_tabs(&dl.content);
+            let is_content = matches!(
+                dl.kind,
+                DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
+            );
+            if is_content && (dl.content.contains('\t') || dl.content.ends_with(' ')) {
+                dl.content = ui::visualize_whitespace(&dl.content);
             }
         }
         self.num_w = line_number_width(&self.parsed);
@@ -558,9 +565,10 @@ Index: Cargo.toml
     }
 
     #[test]
-    fn tabs_are_expanded_not_dropped() {
+    fn tabs_are_expanded_with_visible_marker() {
         // the terminal buffer drops control characters: a literal tab in
-        // the diff content would vanish, so set_content expands it
+        // the diff content would vanish, so set_content expands it — with
+        // a visible '→' marker, so tab-vs-space changes stay visible
         let mut v = DiffView::new("t");
         v.set_content(
             "t".into(),
@@ -573,16 +581,52 @@ Index: Cargo.toml
             .find(|l| l.kind == DiffLineKind::Added)
             .unwrap();
         assert!(!added.content.contains('\t'));
-        // one tab at column 0 expands to a full tab stop
-        assert_eq!(added.content, format!("{}let x = 1;", " ".repeat(4)));
-        // width math sees the expanded content
+        // one tab at column 0 expands to a full tab stop, marker first
+        assert_eq!(added.content, "→   let x = 1;");
+        // width math sees the expanded content (marker is one column)
         let t = ts::render(40, 6, |f| {
             draw_diff_block(f, Rect::new(0, 0, 40, 6), &v, &Theme::default());
         });
         let buf = t.backend().buffer();
-        // row 4 = the added line: 9-column gutter, then 4 spaces, then 'l'
-        assert_eq!(buf[(10, 4)].symbol(), " ");
+        // row 4 = the added line: 9-column gutter, then the marker, then
+        // padding spaces, then 'l' — same columns as a plain 4-space indent
+        assert_eq!(buf[(10, 4)].symbol(), "→");
         assert_eq!(buf[(14, 4)].symbol(), "l");
+    }
+
+    #[test]
+    fn whitespace_only_changes_stay_visible() {
+        // a change that only adds trailing blanks / swaps spaces for a tab
+        // must not render as two identical lines
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: f\n@@ -1 +1 @@\n-foo  \n+foo\t\n",
+        );
+        let removed = v
+            .parsed
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Removed)
+            .unwrap();
+        let added = v
+            .parsed
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Added)
+            .unwrap();
+        assert_eq!(removed.content, "foo··");
+        assert_eq!(added.content, "foo→");
+        // header lines keep their raw text (file headers contain '\t')
+        let mut v2 = DiffView::new("t");
+        v2.set_content("t".into(), DIFF);
+        let file_header = v2
+            .parsed
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::FileHeader)
+            .unwrap();
+        assert!(file_header.content.contains('\t'));
     }
 
     #[test]

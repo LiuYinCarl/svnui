@@ -218,6 +218,56 @@ impl StatusTreeComponent {
             .any(|p| by_path.get(p.as_str()).is_some_and(|e| e.is_dir))
     }
 
+    /// Whether any of the given paths is a directory with a status entry.
+    pub fn any_dir(&self, paths: &[String]) -> bool {
+        paths
+            .iter()
+            .any(|p| self.entry_for_path(p).is_some_and(|e| e.is_dir))
+    }
+
+    /// Expand commit target paths so svn accepts and completes the commit:
+    ///
+    /// - every scheduled-add ('A') ancestor directory of a target becomes a
+    ///   target itself — svn refuses the commit otherwise (E200009: the
+    ///   parent "is not part of the commit, yet its child ... is");
+    /// - a target that is itself a scheduled-add directory is expanded to
+    ///   its scheduled-add descendants: directory targets are committed
+    ///   with `--depth empty` (which keeps unstaged descendants of
+    ///   *versioned* dirs out), and that would strand a new directory's
+    ///   children in the working copy as an empty-dir commit.
+    ///
+    /// The result is deduplicated and sorted (parents sort before their
+    /// children).
+    pub fn expand_commit_paths(&self, paths: &[String]) -> Vec<String> {
+        let is_added_dir = |e: &StatusEntry| e.is_dir && e.status == 'A';
+        let mut out: Vec<String> = paths.to_vec();
+        let mut seen: HashSet<String> = paths.iter().cloned().collect();
+        for p in paths {
+            let mut ancestor = p.as_str();
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                if self.entry_for_path(parent).is_some_and(is_added_dir)
+                    && seen.insert(parent.to_string())
+                {
+                    out.push(parent.to_string());
+                }
+                ancestor = parent;
+            }
+            if self.entry_for_path(p).is_some_and(is_added_dir) {
+                let prefix = format!("{p}/");
+                for e in &self.entries {
+                    if e.status == 'A'
+                        && e.path.starts_with(&prefix)
+                        && seen.insert(e.path.clone())
+                    {
+                        out.push(e.path.clone());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Remove paths from the staged set; paths that are not staged are
     /// silently skipped. The staged-counts cache is invalidated only when
     /// something was actually removed.
@@ -1576,6 +1626,66 @@ mod interaction_tests {
         // staging the dir itself is detected
         c.set_staged(&["newdir".to_string()]);
         assert!(c.staged_contains_dir());
+    }
+
+    #[test]
+    fn expand_commit_paths_pulls_in_added_ancestors() {
+        // svn E200009: committing a file whose newly added parent dirs are
+        // not commit targets is rejected, so they must be pulled in
+        let (c, _q) = comp_with(vec![
+            dir_entry('A', "newdir"),
+            dir_entry('A', "newdir/sub"),
+            entry('A', "newdir/sub/file.txt"),
+            entry('M', "versioned/existing.txt"),
+        ]);
+        let expanded = c.expand_commit_paths(&["newdir/sub/file.txt".to_string()]);
+        assert_eq!(
+            expanded,
+            vec![
+                "newdir".to_string(),
+                "newdir/sub".to_string(),
+                "newdir/sub/file.txt".to_string()
+            ]
+        );
+        // versioned ancestors are not touched
+        let expanded = c.expand_commit_paths(&["versioned/existing.txt".to_string()]);
+        assert_eq!(expanded, vec!["versioned/existing.txt".to_string()]);
+    }
+
+    #[test]
+    fn expand_commit_paths_expands_added_dir_targets() {
+        // a staged *added* directory commits with --depth empty; without
+        // expanding to its added descendants the children would be stranded
+        let (c, _q) = comp_with(vec![
+            dir_entry('A', "newdir"),
+            entry('A', "newdir/a.txt"),
+            entry('A', "newdir/b.txt"),
+            dir_entry('M', "props"),
+        ]);
+        let expanded = c.expand_commit_paths(&["newdir".to_string()]);
+        assert_eq!(
+            expanded,
+            vec![
+                "newdir".to_string(),
+                "newdir/a.txt".to_string(),
+                "newdir/b.txt".to_string()
+            ]
+        );
+        // a *versioned* dir target is NOT expanded: --depth empty keeps its
+        // unstaged descendants out on purpose
+        let expanded = c.expand_commit_paths(&["props".to_string()]);
+        assert_eq!(expanded, vec!["props".to_string()]);
+        // no duplicates when the file was already a target
+        let expanded =
+            c.expand_commit_paths(&["newdir".to_string(), "newdir/a.txt".to_string()]);
+        assert_eq!(
+            expanded,
+            vec![
+                "newdir".to_string(),
+                "newdir/a.txt".to_string(),
+                "newdir/b.txt".to_string()
+            ]
+        );
     }
 
     #[test]

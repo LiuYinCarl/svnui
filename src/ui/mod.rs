@@ -198,6 +198,34 @@ pub fn expand_tabs(s: &str) -> String {
     out
 }
 
+/// Make otherwise-invisible characters visible in diff content: a tab
+/// renders as '→' padded with spaces to the next tab stop (alignment is
+/// preserved), and trailing spaces render as '·'. Without this a
+/// whitespace-only change (space vs tab, added/removed trailing blanks)
+/// shows as two identical-looking +/- lines.
+pub fn visualize_whitespace(s: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let n = TAB_STOP - (col % TAB_STOP);
+            out.push('→');
+            out.extend(std::iter::repeat_n(' ', n - 1));
+            col += n;
+        } else {
+            out.push(ch);
+            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    let trailing = out.len() - out.trim_end_matches(' ').len();
+    if trailing > 0 {
+        out.truncate(out.len() - trailing);
+        out.extend(std::iter::repeat_n('·', trailing));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +302,19 @@ mod tests {
         assert_eq!(expand_tabs("ab\tc"), "ab  c");
         assert_eq!(expand_tabs("中\tc"), "中  c");
         assert_eq!(expand_tabs("no tabs"), "no tabs");
+    }
+
+    #[test]
+    fn visualize_whitespace_marks_tabs_and_trailing_spaces() {
+        // a tab keeps its width but becomes visible; trailing blanks too
+        assert_eq!(visualize_whitespace("\tlet"), "→   let");
+        assert_eq!(visualize_whitespace("ab\tc"), "ab→ c");
+        assert_eq!(visualize_whitespace("中\tc"), "中→ c");
+        assert_eq!(visualize_whitespace("foo  "), "foo··");
+        assert_eq!(visualize_whitespace("\t"), "→···");
+        // interior and no whitespace untouched
+        assert_eq!(visualize_whitespace("a b"), "a b");
+        assert_eq!(visualize_whitespace("no tabs"), "no tabs");
     }
 
     #[test]
