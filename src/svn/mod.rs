@@ -8,7 +8,8 @@ pub mod models;
 pub mod parser;
 
 use crossbeam_channel::Sender;
-use models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
+use models::{BlameLine, LogEntry, PreparedDiff, StatusEntry, SvnInfo};
+use parser::parse_diff_content;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,7 +42,8 @@ pub enum AsyncSvnNotification {
         /// Fullscreen-request token: `Some(id)` when the request came from
         /// a fullscreen diff action, `None` for status-pane previews
         req: Option<u64>,
-        result: Result<String, String>,
+        /// Parsed on the worker thread: the UI never re-parses big diffs
+        result: Result<PreparedDiff, String>,
     },
     /// `svn log` result; the id is a request sequence number, as on `Status`
     Log(u64, Result<Vec<LogEntry>, String>),
@@ -56,7 +58,8 @@ pub enum AsyncSvnNotification {
         revision: u64,
         /// Fullscreen-request token (as on `Diff`)
         req: Option<u64>,
-        result: Result<String, String>,
+        /// Parsed on the worker thread (as on `Diff`)
+        result: Result<PreparedDiff, String>,
     },
     /// Combined diff of a revision range (`svn diff -r from-1:to`)
     RangeDiff {
@@ -64,7 +67,8 @@ pub enum AsyncSvnNotification {
         to: u64,
         /// Fullscreen-request token (as on `Diff`)
         req: Option<u64>,
-        result: Result<String, String>,
+        /// Parsed on the worker thread (as on `Diff`)
+        result: Result<PreparedDiff, String>,
     },
     Blame {
         path: String,
@@ -288,9 +292,17 @@ impl Svn {
                 // NB: no peg suffix here — svn diff 1.14 rejects pegged
                 // working-copy targets outright (E155010), while it treats
                 // an unpegged `foo@bar` path literally just fine.
+                // Parse on the worker: the UI thread only installs the
+                // already-parsed result, so a huge modified file cannot
+                // freeze redraws (one owned String per diff line).
                 let result = match Self::run_in(&cwd, &["diff", "--", &path]) {
-                    Ok(out) => Ok(out),
-                    Err(e) if e.contains("E155010") => Self::read_content_fallback(&cwd, &path),
+                    Ok(out) => Ok(parse_diff_content(&out)),
+                    Err(e) if e.contains("E155010") => {
+                        match Self::read_content_fallback(&cwd, &path) {
+                            Ok(text) => Ok(parse_diff_content(&text)),
+                            Err(e2) => Err(e2),
+                        }
+                    }
                     Err(e) => Err(e),
                 };
                 AsyncSvnNotification::Diff { path, req, result }
@@ -456,7 +468,7 @@ impl Svn {
                     Some(p) => vec!["diff", "-c", &rev, "--", p],
                     None => vec!["diff", "-c", &rev],
                 };
-                let result = Self::run_in(&cwd, &args);
+                let result = Self::run_in(&cwd, &args).map(|t| parse_diff_content(&t));
                 AsyncSvnNotification::RevisionDiff {
                     revision,
                     req,
@@ -477,7 +489,8 @@ impl Svn {
         self.spawn(
             move || {
                 let range = format!("{}:{to}", from.saturating_sub(1));
-                let result = Self::run_in(&cwd, &["diff", "-r", &range]);
+                let result =
+                    Self::run_in(&cwd, &["diff", "-r", &range]).map(|t| parse_diff_content(&t));
                 AsyncSvnNotification::RangeDiff {
                     from,
                     to,
@@ -649,8 +662,13 @@ impl Svn {
                 // interprets -m in the "native" encoding, which is ASCII under
                 // the LC_ALL=C forced by run_in, and non-ASCII messages are
                 // rejected with E000022 ("Can't convert string ... to 'UTF-8'").
+                // `--force-log` keeps short path-like messages ("docs",
+                // "src/main.rs") from being rejected as E205005 — the same
+                // edge case agent.md documents; it only drops that client-side
+                // safety gate, so it is safe for every message.
                 args.push("--encoding".into());
                 args.push("UTF-8".into());
+                args.push("--force-log".into());
                 args.push("-m".into());
                 args.push(message);
                 args.push("--".into());
@@ -717,6 +735,23 @@ mod tests {
     fn recv<T>(rx: &crossbeam_channel::Receiver<T>) -> T {
         rx.recv_timeout(Duration::from_secs(15))
             .expect("timed out waiting for async svn result")
+    }
+
+    /// Render a parsed diff back to text for assertions on the raw
+    /// content: content lines regain their +/-/space marker (the parser
+    /// stores the marker as `kind`, not in `content`), so tests can still
+    /// assert on diff direction, not just on bare text.
+    fn diff_text(p: &PreparedDiff) -> String {
+        p.parsed
+            .lines
+            .iter()
+            .map(|l| match l.kind {
+                crate::svn::models::DiffLineKind::Added => format!("+{}", l.content),
+                crate::svn::models::DiffLineKind::Removed => format!("-{}", l.content),
+                crate::svn::models::DiffLineKind::Context => format!(" {}", l.content),
+                _ => l.content.clone(),
+            })
+            .collect()
     }
 
     #[test]
@@ -797,7 +832,7 @@ mod tests {
                 assert_eq!(path, "Cargo.toml");
                 // the fullscreen-request token is echoed back
                 assert_eq!(req, Some(7));
-                let content = result.unwrap();
+                let content = diff_text(&result.unwrap());
                 assert!(content.contains("Index: Cargo.toml"));
                 assert!(content.contains("version = 3"));
             }
@@ -808,8 +843,8 @@ mod tests {
             AsyncSvnNotification::Diff { path, req, result } => {
                 assert_eq!(path, "untracked.txt");
                 assert_eq!(req, None);
-                // fallback reads file content
-                assert_eq!(result.unwrap().trim(), "raw content");
+                // fallback reads file content (rendered as all-added lines)
+                assert_eq!(diff_text(&result.unwrap()).trim(), "+raw content");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -849,7 +884,7 @@ mod tests {
             } => {
                 assert_eq!(revision, 2);
                 assert_eq!(req, Some(9));
-                let content = result.unwrap();
+                let content = diff_text(&result.unwrap());
                 assert!(content.contains("Index: Cargo.toml"));
             }
             other => panic!("unexpected: {other:?}"),
@@ -972,6 +1007,54 @@ mod tests {
         }
     }
 
+    /// A short path-like message ("docs") is rejected by svn as E205005
+    /// unless `--force-log` is passed (agent.md documents the failure and
+    /// the remedy); the commit path always passes it now.
+    /// Status paths are relative to the launch directory, not the wc root
+    /// — R1-H's `.svnignore` prefixing depends on this.
+    #[test]
+    fn status_paths_are_relative_to_the_launch_dir() {
+        let Some(repo) = TestRepo::new() else { return };
+        std::fs::create_dir_all(repo.wc.join("src")).unwrap();
+        test_support::write_file(&repo.wc.join("src").join("a.txt"), "x\n");
+        // add the file; svn schedules the unversioned parent directory too
+        repo.svn(&["add", "src/a.txt"]);
+        repo.svn(&["commit", "-m", "seed"]);
+        // a local modification makes the status snapshot non-trivial
+        test_support::write_file(&repo.wc.join("src").join("a.txt"), "y\n");
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.join("src"), tx).status();
+        match recv(&rx) {
+            AsyncSvnNotification::Status(_, Ok(entries)) => {
+                assert!(
+                    entries.iter().any(|e| e.path == "a.txt"),
+                    "expected cwd-relative path, got {entries:?}"
+                );
+                assert!(
+                    !entries.iter().any(|e| e.path == "src/a.txt"),
+                    "paths must not be wc-root-relative: {entries:?}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_short_path_like_message_needs_force_log() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+        c.commit("docs", &["Cargo.toml".to_string()], false);
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(out)) => {
+                assert!(out.contains("Committed revision 2"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[test]
     fn log_more_pages() {
         let Some(repo) = TestRepo::new() else { return };
@@ -1030,7 +1113,7 @@ mod tests {
                 result: Ok(content),
                 ..
             } => {
-                assert!(content.is_empty());
+                assert!(diff_text(&content).is_empty());
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1101,7 +1184,7 @@ mod tests {
             } => {
                 assert_eq!((from, to), (2, 3));
                 assert_eq!(req, None);
-                let content = result.unwrap();
+                let content = diff_text(&result.unwrap());
                 assert!(content.contains("Index: Cargo.toml"), "{content}");
                 // combined diff goes straight from r1 content to r3 content
                 assert!(content.contains("-version = 1"), "{content}");
@@ -1124,6 +1207,7 @@ mod tests {
         c.revision_diff(2, Some("Cargo.toml"), None);
         match recv(&rx) {
             AsyncSvnNotification::RevisionDiff { result: Ok(d), .. } => {
+                let d = diff_text(&d);
                 assert!(d.contains("Index: Cargo.toml"), "{d}");
                 assert!(!d.contains("src/main.rs"), "{d}");
             }
@@ -1314,7 +1398,7 @@ mod tests {
         c.diff(name, None);
         match recv(&rx) {
             AsyncSvnNotification::Diff { result, .. } => {
-                assert!(result.unwrap().contains("+Description=t2"));
+                assert!(diff_text(&result.unwrap()).contains("+Description=t2"));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1429,6 +1513,7 @@ mod tests {
                 result: Ok(content),
                 ..
             } => {
+                let content = diff_text(&content);
                 assert!(content.is_empty(), "{content}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1450,6 +1535,7 @@ mod tests {
                 result: Ok(content),
                 ..
             } => {
+                let content = diff_text(&content);
                 assert!(content.contains("file too large to display"), "{content}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1470,6 +1556,7 @@ mod tests {
                 result: Ok(content),
                 ..
             } => {
+                let content = diff_text(&content);
                 assert!(content.contains("binary or unreadable"), "{content}");
             }
             other => panic!("unexpected: {other:?}"),

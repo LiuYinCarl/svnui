@@ -6,7 +6,7 @@ use super::components::{
 };
 use crate::keys::{KeyAction, key_match};
 
-use crate::svn::models::StatusEntry;
+use crate::svn::models::{PreparedDiff, StatusEntry};
 use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -122,22 +122,28 @@ impl StatusTab {
         }
     }
 
-    pub fn apply_diff(&mut self, path: &str, content: &str) {
+    /// Install a parsed diff (moved, no clone) when it still matches the
+    /// selection; the caller clones first only if a fullscreen popup also
+    /// needs a copy — the common status-pane preview stays copy-free.
+    pub fn apply_diff(&mut self, path: &str, prepared: PreparedDiff) {
         if self.tree.selection_path().as_deref() == Some(path) {
-            self.diff.set_content(path.to_string(), content);
+            self.diff.set_prepared(path.to_string(), prepared);
         }
     }
 
     /// A status-pane diff preview failed to load: leave the panel in its
-    /// hint state (not a permanent "Loading…") and clear the dedup key so
-    /// moving the selection away and back retries the request.
+    /// hint state (not a permanent "Loading…").
+    ///
+    /// `last_diff_requested` is deliberately KEPT: clearing it would make
+    /// the event loop's next `maybe_request_diff()` re-issue the same
+    /// failing request in the same turn — an endless svn-spawn + error-
+    /// popup storm while the selection sits on an undiffable file. Moving
+    /// the selection away and back retries (the dedup key changes), and a
+    /// refresh re-arms it via `update_status`.
     pub fn diff_failed(&mut self, path: &str) {
         if self.diff.pending && self.diff.title == path {
             self.diff
                 .set_hint(path.to_string(), "Failed to load the diff".to_string());
-        }
-        if self.last_diff_requested.as_deref() == Some(path) {
-            self.last_diff_requested = None;
         }
     }
 
@@ -244,6 +250,7 @@ impl StatusTab {
 mod tests {
     use super::*;
     use crate::svn::models::StatusEntry;
+    use crate::svn::parser::parse_diff_content;
     use crate::test_support as ts;
     use crate::ui::style::Theme;
 
@@ -369,9 +376,12 @@ mod tests {
         let (mut t, _q) = tab();
         t.update_status(vec![entry('M', "a.txt")], None);
         // stale diff for a different path is ignored (hint stays)
-        t.apply_diff("b.txt", "Index: b\n");
+        t.apply_diff("b.txt", parse_diff_content("Index: b\n"));
         assert!(t.diff.empty_reason.is_some());
-        t.apply_diff("a.txt", "Index: a.txt\n@@ -1 +1 @@\n-old\n+new\n");
+        t.apply_diff(
+            "a.txt",
+            parse_diff_content("Index: a.txt\n@@ -1 +1 @@\n-old\n+new\n"),
+        );
         assert!(t.diff.empty_reason.is_none());
         assert_eq!(t.diff.parsed.lines.len(), 4);
     }
@@ -446,7 +456,10 @@ mod tests {
                 crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')),
             ))
             .unwrap();
-        t.apply_diff("a.txt", "Index: a.txt\n===\n@@ -1 +1 @@\n-old\n+new\n");
+        t.apply_diff(
+            "a.txt",
+            parse_diff_content("Index: a.txt\n===\n@@ -1 +1 @@\n-old\n+new\n"),
+        );
         let terminal = ts::render(120, 30, |f| {
             t.draw(f, Rect::new(0, 0, 120, 30)).unwrap();
         });

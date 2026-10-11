@@ -100,6 +100,20 @@ pub struct ParsedDiff {
     pub lines: Vec<DiffLine>,
 }
 
+/// A `svn diff` result parsed on the worker thread, ready to render.
+///
+/// Carrying the parsed form (instead of the raw text) stops big diffs from
+/// being re-parsed on the UI thread (each line clones an owned `String`),
+/// which used to freeze the app on large modified files.
+#[derive(Clone, Debug)]
+pub struct PreparedDiff {
+    /// The parsed diff (empty when `empty_reason` is set).
+    pub parsed: ParsedDiff,
+    /// Shown instead of the diff when there is nothing to render (e.g.
+    /// "No textual diff" for empty output).
+    pub empty_reason: Option<String>,
+}
+
 /// A rendered diff line.
 #[derive(Clone, Debug)]
 pub struct DiffLine {

@@ -41,6 +41,10 @@ pub struct IgnoreEditor {
     ctx: Context,
     /// `<working copy root>/.svnignore`
     path: PathBuf,
+    /// A re-point deferred because the buffer had unsaved edits; applied
+    /// on the next save/reload so the editor never silently writes the
+    /// old file's content over the new path.
+    pending_root: Option<PathBuf>,
     pub textarea: TextArea<'static>,
     /// Content differs from what is on disk
     dirty: bool,
@@ -62,6 +66,7 @@ impl IgnoreEditor {
         let mut editor = Self {
             ctx: ctx.clone(),
             path: root.join(IGNORE_FILE),
+            pending_root: None,
             textarea,
             dirty: false,
             issues: Vec::new(),
@@ -74,6 +79,39 @@ impl IgnoreEditor {
     /// The file being edited.
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Re-point the editor at the working-copy root once `svn info` has
+    /// reported it (the app may have been launched from a subdirectory,
+    /// so the editor could otherwise be editing the wrong `.svnignore`).
+    ///
+    /// Deferred while there are unsaved edits: the re-point happens on the
+    /// next save/reload, so Ctrl+s never writes the buffer (loaded from
+    /// the old path) over the new file without warning, and the editor and
+    /// the status filter never silently point at different files.
+    pub fn set_root(&mut self, root: &std::path::Path) {
+        let path = root.join(IGNORE_FILE);
+        if path == self.path {
+            return;
+        }
+        if self.dirty {
+            self.pending_root = Some(path);
+            return;
+        }
+        self.path = path;
+        self.reload();
+    }
+
+    /// Apply a deferred re-point (requested while the buffer was dirty)
+    /// now that the buffer is clean; re-paths and reloads from disk.
+    fn apply_pending_root(&mut self) {
+        let Some(path) = self.pending_root.take() else {
+            return;
+        };
+        if path != self.path {
+            self.path = path;
+            self.reload();
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -107,6 +145,7 @@ impl IgnoreEditor {
         self.textarea.set_cursor_render_mode(CursorRenderMode::Cell);
         self.notice = None;
         self.validate();
+        self.apply_pending_root();
     }
 
     /// Re-validate every line with the gitignore parser.
@@ -135,6 +174,7 @@ impl IgnoreEditor {
         match result {
             Ok(()) => {
                 self.dirty = false;
+                self.apply_pending_root();
                 self.ctx.queue.push(InternalEvent::RefreshStatus);
                 self.notice = Some(if self.issues.is_empty() {
                     "saved · status filter refreshed".to_string()

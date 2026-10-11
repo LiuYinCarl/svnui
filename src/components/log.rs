@@ -78,6 +78,14 @@ impl LogComponent {
         self.selection = self.selection.min(len.saturating_sub(1));
     }
 
+    /// Leave the Loading state without content (a failed first load).
+    /// Without this the tab would render "Loading…" forever after a
+    /// plain `svn log` failure (the error arm only showed the popup).
+    pub fn fail_load(&mut self) {
+        self.pending = false;
+        self.loading_more = false;
+    }
+
     /// Append older revisions (pagination result).
     pub fn append(&mut self, entries: Vec<LogEntry>) {
         self.loading_more = false;

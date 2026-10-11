@@ -13,7 +13,7 @@ use crate::popups::{DiffPopup, OutputPopup, Popup};
 use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Queue, Tab};
 use crate::status::StatusTab;
 use crate::strings::MSG;
-use crate::svn::models::{BlameLine, LogEntry, SvnInfo};
+use crate::svn::models::{BlameLine, LogEntry, PreparedDiff, SvnInfo};
 use crate::svn::{AsyncSvnNotification, Svn};
 use crate::ui;
 use crossterm::event::Event;
@@ -186,6 +186,20 @@ impl App {
     fn show_diff_popup(&mut self, title: String, content: &str, header: Vec<String>) {
         let ctx = self.ctx.clone();
         let mut popup = DiffPopup::new(&ctx, title, content);
+        popup.view.set_header(header);
+        self.push_popup(Popup::Diff(popup));
+    }
+
+    /// Open a fullscreen diff popup for a diff already parsed on the svn
+    /// worker thread (repository diffs only).
+    fn show_diff_popup_prepared(
+        &mut self,
+        title: String,
+        prepared: PreparedDiff,
+        header: Vec<String>,
+    ) {
+        let ctx = self.ctx.clone();
+        let mut popup = DiffPopup::new_prepared(&ctx, title, prepared);
         popup.view.set_header(header);
         self.push_popup(Popup::Diff(popup));
     }
@@ -565,9 +579,21 @@ impl App {
         self.pending += 1;
     }
 
-    /// The working copy root shown in update confirmations: the path from
-    /// `svn info` when loaded, otherwise the directory the app was started
-    /// on.
+    /// Directory whose `.svnignore` applies: the working-copy root once
+    /// `svn info` has reported it, else the launch directory (the status
+    /// paths are launch-relative, so a subdir launch must still filter
+    /// against the root's rules with the right prefix).
+    fn ignore_root(&self) -> PathBuf {
+        self.svn_info
+            .as_ref()
+            .map(|i| PathBuf::from(i.wc_root.as_str()))
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// The working-copy label shown in the status bar / update
+    /// confirmations: the path from `svn info` when loaded, otherwise the
+    /// directory the app was started in.
     fn working_copy_label(&self) -> String {
         self.svn_info
             .as_ref()
@@ -594,13 +620,7 @@ impl App {
         } else {
             self.status.tree.staged.iter().cloned().collect()
         };
-        let targets: Vec<(char, String)> = self
-            .status
-            .tree
-            .expand_commit_paths(&base)
-            .iter()
-            .map(|p| (self.status.tree.status_char(p), p.clone()))
-            .collect();
+        let targets: Vec<(char, String)> = self.status.tree.expanded_commit_targets(&base);
         let what = format!("{} ({} files)", MSG.commit_staged, targets.len());
         const MAX_LISTED: usize = 8;
         let mut out = format!("{what}\nTarget branch: {branch}\n");
@@ -727,6 +747,10 @@ impl App {
             AsyncSvnNotification::Info(result) => match result {
                 Ok(info) => {
                     self.svn_info = Some(info);
+                    // the working-copy root is only known here; re-point
+                    // the ignore editor (launched from a subdir, it may
+                    // have been editing the wrong .svnignore)
+                    self.ignore.set_root(&self.ignore_root());
                     self.svn.status();
                     self.svn.log(50);
                     self.pending += 2;
@@ -749,8 +773,10 @@ impl App {
                 match result {
                     Ok(entries) => {
                         // reloaded on every refresh, so edits to the file
-                        // take effect without restarting the TUI
-                        let ignore = crate::ignore_filter::IgnoreFilter::load(&self.cwd);
+                        // take effect without restarting the TUI; patterns
+                        // are relative to the wc root, entries to the cwd
+                        let root = self.ignore_root();
+                        let ignore = crate::ignore_filter::IgnoreFilter::load_for(&root, &self.cwd);
                         self.status.update_status(entries, ignore.as_ref());
                         self.maybe_request_diff();
                     }
@@ -782,24 +808,36 @@ impl App {
                 Err(e) => self.show_error(format!("svn info: {e}")),
             },
             AsyncSvnNotification::Diff { path, req, result } => match result {
-                Ok(content) => {
-                    self.status.apply_diff(&path, &content);
+                Ok(prepared) => {
                     // the token guarantees the pending request is this one,
-                    // so its payload carries the title
-                    if let Some(PendingFullscreen::File(p)) = self.take_pending_fullscreen(req) {
-                        // file diffs have no associated commit: no header
-                        self.show_diff_popup(p, &content, Vec::new());
+                    // so its payload carries the title; file diffs have no
+                    // associated commit, hence no header. The common
+                    // status-pane preview (req None) takes the payload by
+                    // move; only a fullscreen diff clones before installing
+                    // the pane copy.
+                    let fullscreen = self.take_pending_fullscreen(req);
+                    if let Some(PendingFullscreen::File(p)) = fullscreen {
+                        self.status.apply_diff(&path, prepared.clone());
+                        self.show_diff_popup_prepared(p, prepared, Vec::new());
+                    } else {
+                        self.status.apply_diff(&path, prepared);
                     }
                 }
                 Err(e) => {
                     self.take_pending_fullscreen(req);
                     // a failed status-pane preview (no token) must not
-                    // leave the diff panel on "Loading…" forever, and the
-                    // dedup key is cleared so re-selecting the file retries
+                    // leave the diff panel on "Loading…" forever; the dedup
+                    // key stays armed so the failure cannot auto-retry into
+                    // an endless spawn loop (see `StatusTab::diff_failed`)
                     if req.is_none() {
                         self.status.diff_failed(&path);
                     }
-                    self.show_error(format!("svn diff {path}: {e}"));
+                    // identical repeated failures must not pile up one Msg
+                    // popup per svn round-trip
+                    let msg = format!("svn diff {path}: {e}");
+                    if !matches!(self.popups.last(), Some(Popup::Msg(m)) if m.message == msg) {
+                        self.show_error(msg);
+                    }
                 }
             },
             AsyncSvnNotification::Log(id, result) => {
@@ -823,7 +861,12 @@ impl App {
                         self.log.clear_search();
                         self.log.update(entries);
                     }
-                    Err(e) => self.show_error(format!("svn log: {e}")),
+                    Err(e) => {
+                        // leave the log tab out of its Loading state (the
+                        // status error arm does the same for the tree)
+                        self.log.fail_load();
+                        self.show_error(format!("svn log: {e}"));
+                    }
                 }
             }
             AsyncSvnNotification::LogSearch { pattern, result } => {
@@ -924,11 +967,11 @@ impl App {
                 req,
                 result,
             } => match result {
-                Ok(content) => {
+                Ok(prepared) => {
                     if let Some(PendingFullscreen::Range(f, t)) = self.take_pending_fullscreen(req)
                     {
                         let header = diff_view::range_header(f, t, &self.log.entries);
-                        self.show_diff_popup(format!("Diff r{f}..r{t}"), &content, header);
+                        self.show_diff_popup_prepared(format!("Diff r{f}..r{t}"), prepared, header);
                     }
                 }
                 Err(e) => {
@@ -941,7 +984,7 @@ impl App {
                 req,
                 result,
             } => match result {
-                Ok(content) => {
+                Ok(prepared) => {
                     if let Some(PendingFullscreen::Revision(r, path)) =
                         self.take_pending_fullscreen(req)
                     {
@@ -964,7 +1007,7 @@ impl App {
                             Some(p) => format!("Diff r{r}: {p}"),
                             None => format!("Diff r{r}"),
                         };
-                        self.show_diff_popup(title, &content, header);
+                        self.show_diff_popup_prepared(title, prepared, header);
                     }
                 }
                 Err(e) => {
@@ -1100,6 +1143,13 @@ impl App {
 
     pub fn draw(&mut self, f: &mut Frame) -> Result<(), String> {
         let area = f.area();
+        // A degenerate terminal (0 rows — e.g. a collapsed pane or a
+        // resize race) would make the status-bar `set_line` index a cell
+        // outside the ratatui buffer, which panics unconditionally. This
+        // guard is the single gate: it runs before any component draws.
+        if area.width == 0 || area.height == 0 {
+            return Ok(());
+        }
         let status_bar_h = 1u16;
         let main = Rect::new(
             area.x,
@@ -1133,6 +1183,9 @@ impl App {
     }
 
     fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let theme = &self.ctx.theme;
         let mut spans = Vec::new();
         // current branch, always visible
@@ -1177,11 +1230,17 @@ mod tests {
     use super::*;
     use crate::components::Context;
     use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Tab};
-    use crate::svn::models::{BlameLine, LogEntry, StatusEntry, SvnInfo};
+    use crate::svn::models::{BlameLine, LogEntry, PreparedDiff, StatusEntry, SvnInfo};
+    use crate::svn::parser::parse_diff_content;
     use crate::test_support::{self, TestRepo};
     use crate::ui::style::Theme;
     use crossbeam_channel::unbounded;
     use crossterm::event::KeyCode;
+
+    /// A parsed diff payload for notification-construction in tests.
+    fn diff_ok(content: &str) -> Result<PreparedDiff, String> {
+        Ok(parse_diff_content(content))
+    }
     use ratatui::backend::TestBackend;
     use std::time::Duration;
 
@@ -1352,7 +1411,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
             req: None,
-            result: Ok("Index: a.txt\n@@ -1 +1 @@\n-old\n+new\n".into()),
+            result: diff_ok("Index: a.txt\n@@ -1 +1 @@\n-old\n+new\n"),
         });
         assert!(!app.status.diff.pending);
 
@@ -1395,7 +1454,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 1,
             req: Some(1),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
 
@@ -1510,7 +1569,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
             req: Some(1),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         let Some(Popup::Diff(d)) = app.popups.last() else {
             panic!("expected diff popup");
@@ -1528,7 +1587,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 99,
             req: Some(2),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         let Some(Popup::Diff(d2)) = app.popups.last() else {
             panic!("expected diff popup");
@@ -1561,7 +1620,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 2,
             req: Some(1),
-            result: Ok("Index: main.rs\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: main.rs\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         let Some(Popup::Diff(d)) = app.popups.last() else {
             panic!("expected diff popup");
@@ -1614,7 +1673,7 @@ mod tests {
             from: 1,
             to: 3,
             req: Some(1),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         let Some(Popup::Diff(d)) = app.popups.last() else {
             panic!("expected diff popup");
@@ -1640,7 +1699,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
             req: Some(1),
-            result: Ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
     }
@@ -2535,7 +2594,7 @@ mod tests {
             from: 1,
             to: 3,
             req: Some(1),
-            result: Ok("Index: a\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: a\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
         // error path clears the pending request
@@ -2575,7 +2634,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
             req: None,
-            result: Ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
         assert!(app.pending_fullscreen.is_some());
@@ -2583,7 +2642,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
             req: Some(99),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         assert!(!matches!(app.popups.last(), Some(Popup::Diff(_))));
         assert!(app.pending_fullscreen.is_some());
@@ -2591,7 +2650,7 @@ mod tests {
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
             req: Some(1),
-            result: Ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n".into()),
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Diff(_))));
         assert!(app.pending_fullscreen.is_none());
@@ -3206,19 +3265,21 @@ mod tests {
     }
 
     #[test]
-    fn failed_diff_preview_unsticks_panel_and_allows_retry() {
+    fn failed_diff_preview_unsticks_panel_but_does_not_auto_retry() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
         app.handle_async(AsyncSvnNotification::Status(
             0,
-            Ok(vec![entry('M', "a.txt")]),
+            Ok(vec![entry('M', "a.txt"), entry('M', "b.txt")]),
         ));
-        // selecting the file issued a preview diff; the panel is Loading
+        // selecting the first file issued a preview diff; the panel is Loading
         assert!(matches!(recv(&rx), AsyncSvnNotification::Diff { .. }));
         assert!(app.status.diff.pending);
         assert_eq!(app.status.last_diff_requested.as_deref(), Some("a.txt"));
-        // the preview fails: the panel leaves Loading, the dedup key is
-        // cleared and the error is shown
+        // the preview fails: the panel leaves Loading and the error is
+        // shown, but the dedup key stays armed — otherwise the event loop
+        // would re-issue the same failing request on the very next event
+        // (endless svn spawns + one error popup per round-trip)
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
             req: None,
@@ -3226,11 +3287,44 @@ mod tests {
         });
         assert!(!app.status.diff.pending);
         assert!(app.status.diff.empty_reason.is_some());
-        assert!(app.status.last_diff_requested.is_none());
+        assert_eq!(app.status.last_diff_requested.as_deref(), Some("a.txt"));
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        // identical repeated failures do not stack another popup
+        app.handle_async(AsyncSvnNotification::Diff {
+            path: "a.txt".into(),
+            req: None,
+            result: Err("boom".into()),
+        });
+        assert_eq!(app.popups.len(), 1);
+        // no auto-retry while the selection is unchanged
+        assert!(app.status.maybe_request_diff().is_none());
         app.popups.clear();
-        // moving the selection away and back retries the request
+        // selection-driven retry stays bounded: moving to another file
+        // issues a fresh request, and revisiting the failed file re-
+        // requests it (the dedup key compares against the previous one)
+        app.status.tree.event(&ts_key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(app.status.maybe_request_diff().as_deref(), Some("b.txt"));
+        app.status.tree.event(&ts_key(KeyCode::Char('k'))).unwrap();
         assert_eq!(app.status.maybe_request_diff().as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn draw_with_degenerate_terminal_size_does_not_panic() {
+        // repo-less: this must run even where svn is unavailable
+        let (tx, _rx) = unbounded();
+        let queue = Queue::new();
+        let ctx = Context {
+            queue: queue.clone(),
+            theme: Theme::default(),
+        };
+        let cwd = std::env::temp_dir();
+        let svn = crate::svn::Svn::new(cwd.clone(), tx);
+        let mut app = App::new(cwd, svn, ctx);
+        // collapsed panes / resize races can hand the app a 0-row or
+        // 0-col terminal; the 0-row case must not index the empty ratatui
+        // buffer (Buffer::index_of panics unconditionally)
+        test_support::render(0, 30, |f| app.draw(f).unwrap());
+        test_support::render(80, 0, |f| app.draw(f).unwrap());
     }
 
     #[test]
@@ -3240,6 +3334,17 @@ mod tests {
         assert!(app.status.tree.pending);
         app.handle_async(AsyncSvnNotification::Status(0, Err("boom".into())));
         assert!(!app.status.tree.pending);
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn failed_log_unsticks_the_log_tab() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        assert!(app.log.pending);
+        app.handle_async(AsyncSvnNotification::Log(0, Err("boom".into())));
+        // without fail_load the log tab would render "Loading…" forever
+        assert!(!app.log.pending);
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
     }
 

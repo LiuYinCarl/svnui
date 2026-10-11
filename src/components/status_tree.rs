@@ -251,20 +251,33 @@ impl StatusTreeComponent {
     /// The result is deduplicated and sorted (parents sort before their
     /// children).
     pub fn expand_commit_paths(&self, paths: &[String]) -> Vec<String> {
+        let by_path = self.entries_by_path();
+        self.expand_commit_paths_with(paths, &by_path)
+    }
+
+    /// Body of [`StatusTreeComponent::expand_commit_paths`] against a
+    /// prebuilt path→entry map, so a caller touching many paths (commit
+    /// confirmation) builds the map once instead of one linear scan per
+    /// path (O(staged × entries) froze commit on 100k-entry working copies).
+    fn expand_commit_paths_with(
+        &self,
+        paths: &[String],
+        by_path: &HashMap<&str, &StatusEntry>,
+    ) -> Vec<String> {
         let is_added_dir = |e: &StatusEntry| e.is_dir && e.status == 'A';
         let mut out: Vec<String> = paths.to_vec();
         let mut seen: HashSet<String> = paths.iter().cloned().collect();
         for p in paths {
             let mut ancestor = p.as_str();
             while let Some((parent, _)) = ancestor.rsplit_once('/') {
-                if self.entry_for_path(parent).is_some_and(is_added_dir)
+                if by_path.get(parent).copied().is_some_and(is_added_dir)
                     && seen.insert(parent.to_string())
                 {
                     out.push(parent.to_string());
                 }
                 ancestor = parent;
             }
-            if self.entry_for_path(p).is_some_and(is_added_dir) {
+            if by_path.get(p.as_str()).copied().is_some_and(is_added_dir) {
                 let prefix = format!("{p}/");
                 for e in &self.entries {
                     if e.status == 'A' && e.path.starts_with(&prefix) && seen.insert(e.path.clone())
@@ -276,6 +289,20 @@ impl StatusTreeComponent {
         }
         out.sort();
         out
+    }
+
+    /// Commit targets (scheduled-add ancestors/descendants expanded) plus
+    /// their status chars, built from a single path→entry map. The commit
+    /// confirmation message uses this instead of per-target linear scans.
+    pub fn expanded_commit_targets(&self, paths: &[String]) -> Vec<(char, String)> {
+        let by_path = self.entries_by_path();
+        self.expand_commit_paths_with(paths, &by_path)
+            .iter()
+            .map(|p| {
+                let status = by_path.get(p.as_str()).map(|e| e.status).unwrap_or(' ');
+                (status, p.clone())
+            })
+            .collect()
     }
 
     /// Remove paths from the staged set; paths that are not staged are

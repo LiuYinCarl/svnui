@@ -7,6 +7,7 @@ use super::super::components::{
 };
 use crate::keys::{KeyAction, key_match};
 use crate::queue::InternalEvent;
+use crate::svn::models::PreparedDiff;
 use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -21,6 +22,20 @@ impl DiffPopup {
     pub fn new(ctx: &Context, title: String, content: &str) -> Self {
         let mut view = DiffView::new(&title);
         view.set_content(title, content);
+        view.focused = true;
+        view.search_enabled = true;
+        Self {
+            ctx: ctx.clone(),
+            view,
+        }
+    }
+
+    /// Build the popup from a diff already parsed on the svn worker
+    /// thread (repository diffs); `new` stays for UI-side parsing (patch
+    /// previews, tests).
+    pub fn new_prepared(ctx: &Context, title: String, prepared: PreparedDiff) -> Self {
+        let mut view = DiffView::new(&title);
+        view.set_prepared(title, prepared);
         view.focused = true;
         view.search_enabled = true;
         Self {

@@ -1,7 +1,7 @@
 //! Parsers for `svn status` / `svn log` / `svn blame` / `svn diff` output.
 
 use super::models::{
-    BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, StatusEntry, SvnInfo,
+    BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, PreparedDiff, StatusEntry, SvnInfo,
 };
 
 /// Parse `svn --version --quiet` output ("1.14.5" or "1.14.5 (r1876290)")
@@ -550,6 +550,47 @@ pub fn parse_new_file_content(content: &str) -> ParsedDiff {
         });
     }
     ParsedDiff { lines }
+}
+
+/// Decide whether raw content is a unified diff (vs. plain text, e.g. an
+/// unversioned file shown as all-added lines). Only the *start* of the
+/// content counts: every file section of real `svn diff` output begins
+/// with "Index: ", property-only diffs with "Property changes on:", and
+/// patch files (previewed through the diff popup) may be git-format
+/// ("diff --git ") or plain `diff -u` output (a "--- "/"+++ " header
+/// pair). A hunk header ("@@ ...") mid-file is just text.
+pub fn looks_like_diff(content: &str) -> bool {
+    let mut lines = content.trim_start().lines();
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    first.starts_with("Index: ")
+        || first.starts_with("Property changes on:")
+        || first.starts_with("diff --git ")
+        || (first.starts_with("--- ") && lines.next().is_some_and(|l| l.starts_with("+++ ")))
+}
+
+/// Parse arbitrary diff-or-plain-text content into a [`PreparedDiff`].
+///
+/// Pure and allocation-heavy (one owned `String` per line), so this runs
+/// on the svn worker thread for repository diffs — the UI thread only
+/// receives the already-parsed result ([`PreparedDiff`]).
+pub fn parse_diff_content(content: &str) -> PreparedDiff {
+    if content.trim().is_empty() {
+        return PreparedDiff {
+            parsed: ParsedDiff::default(),
+            empty_reason: Some("No textual diff".to_string()),
+        };
+    }
+    let parsed = if looks_like_diff(content) {
+        parse_diff(content)
+    } else {
+        parse_new_file_content(content)
+    };
+    PreparedDiff {
+        parsed,
+        empty_reason: None,
+    }
 }
 
 #[cfg(test)]

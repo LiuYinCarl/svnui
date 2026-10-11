@@ -13,6 +13,7 @@
 //! while hidden.
 
 use ignore::gitignore::Gitignore;
+use std::borrow::Cow;
 use std::path::Path;
 
 /// Name of the ignore file at the working-copy root.
@@ -21,6 +22,11 @@ pub const IGNORE_FILE: &str = ".svnignore";
 /// A loaded `.svnignore` rule set.
 pub struct IgnoreFilter {
     matcher: Gitignore,
+    /// Extra path prefix (relative to the ignore root) prepended to
+    /// status-relative paths before matching — non-empty when the app was
+    /// launched from a subdirectory of the working-copy root and the
+    /// `.svnignore` lives at the root.
+    prefix: String,
 }
 
 impl IgnoreFilter {
@@ -31,6 +37,15 @@ impl IgnoreFilter {
     /// Unparseable lines are dropped by the underlying parser; the valid
     /// remainder still applies.
     pub fn load(root: &Path) -> Option<Self> {
+        Self::load_for(root, root)
+    }
+
+    /// Load `<root>/.svnignore` whose patterns are relative to `root`,
+    /// while the status entries being filtered are relative to
+    /// `status_base`. When the app was launched from a subdirectory of the
+    /// working copy, the status paths are prefixed accordingly so root-
+    /// anchored patterns like `/build/` still match.
+    pub fn load_for(root: &Path, status_base: &Path) -> Option<Self> {
         let path = root.join(IGNORE_FILE);
         if !path.is_file() {
             return None;
@@ -39,14 +54,31 @@ impl IgnoreFilter {
         if matcher.num_ignores() == 0 {
             return None;
         }
-        Some(Self { matcher })
+        let prefix = status_base
+            .strip_prefix(root)
+            .ok()
+            .and_then(|rel| rel.to_str().map(str::to_string))
+            .map(|s| s.replace('\\', "/"));
+        let Some(prefix) = prefix else {
+            // `status_base` is not under `root` (or is non-UTF-8): matching
+            // root patterns against status-relative paths would be wrong
+            // (anchored patterns would silently stop matching). Fall back
+            // to the long-standing cwd-relative semantics instead.
+            return Self::load_for(status_base, status_base);
+        };
+        Some(Self { matcher, prefix })
     }
 
     /// Whether a working-copy-relative path is ignored. Like gitignore, a
     /// path is ignored when any of its parent directories is ignored too.
     pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
+        let joined: Cow<str> = if self.prefix.is_empty() {
+            Cow::Borrowed(path)
+        } else {
+            Cow::Owned(format!("{}/{path}", self.prefix))
+        };
         self.matcher
-            .matched_path_or_any_parents(path, is_dir)
+            .matched_path_or_any_parents(joined.as_ref(), is_dir)
             .is_ignore()
     }
 
@@ -71,7 +103,10 @@ impl IgnoreFilter {
             let _ = builder.add_line(None, line);
         }
         let matcher = builder.build().ok()?;
-        (matcher.num_ignores() > 0).then(|| Self { matcher })
+        (matcher.num_ignores() > 0).then(|| Self {
+            matcher,
+            prefix: String::new(),
+        })
     }
 }
 
@@ -106,6 +141,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn load_for_prefixes_status_paths_to_the_ignore_root() {
+        let root = IgnoreDir::new(Some("build/\n/only_top/\n"));
+        let at_root = root.filter().expect("root ignore file");
+        assert!(at_root.is_ignored("build/x.rs", false));
+        assert!(at_root.is_ignored("only_top/y.rs", false));
+
+        // launched in a subdirectory: status entries are subdir-relative,
+        // so load_for prepends the subdir prefix before matching —
+        // unanchored patterns still hit, anchored ones only at the root
+        let sub = root.0.join("src");
+        let in_sub = IgnoreFilter::load_for(&root.0, &sub).expect("root ignore file");
+        assert!(in_sub.is_ignored("build/x.rs", false));
+        assert!(!in_sub.is_ignored("only_top/y.rs", false));
+
+        // status_base not under root: no prefix is computable, so the
+        // filter falls back to status_base-relative semantics (a plain
+        // load of that dir, which has no .svnignore)
+        let outside = std::env::temp_dir().join("svnui-outside-root");
+        assert!(IgnoreFilter::load_for(&root.0, &outside).is_none());
     }
 
     #[test]

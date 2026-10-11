@@ -5,8 +5,7 @@ use super::EventState;
 use super::text_search::highlight_spans;
 use super::text_view::{SearchOutcome, TextView};
 use crate::keys::{KeyAction, key_match};
-use crate::svn::models::{DiffLine, DiffLineKind, LogEntry, ParsedDiff};
-use crate::svn::parser::{parse_diff, parse_new_file_content};
+use crate::svn::models::{DiffLine, DiffLineKind, LogEntry, ParsedDiff, PreparedDiff};
 use crate::ui::{self, style::Theme};
 use crossterm::event::Event;
 use ratatui::Frame;
@@ -99,24 +98,6 @@ fn line_number_width(parsed: &ParsedDiff) -> usize {
     digits.max(3)
 }
 
-/// Decide whether raw content is a unified diff (vs. plain text, e.g. an
-/// unversioned file shown as all-added lines). Only the *start* of the
-/// content counts: every file section of real `svn diff` output begins
-/// with "Index: ", property-only diffs with "Property changes on:", and
-/// patch files (previewed through the diff popup) may be git-format
-/// ("diff --git ") or plain `diff -u` output (a "--- "/"+++ " header
-/// pair). A hunk header ("@@ ...") mid-file is just text.
-fn looks_like_diff(content: &str) -> bool {
-    let mut lines = content.trim_start().lines();
-    let Some(first) = lines.next() else {
-        return false;
-    };
-    first.starts_with("Index: ")
-        || first.starts_with("Property changes on:")
-        || first.starts_with("diff --git ")
-        || (first.starts_with("--- ") && lines.next().is_some_and(|l| l.starts_with("+++ ")))
-}
-
 impl DiffView {
     pub fn new(title: &str) -> Self {
         Self {
@@ -159,21 +140,20 @@ impl DiffView {
         self.tv.reset();
     }
 
-    /// Set raw diff text (or raw file content for unversioned files).
+    /// Set raw diff text (or raw file content for unversioned files),
+    /// parsed synchronously. Repository diffs use [`DiffView::set_prepared`]
+    /// so large diffs are never parsed on the UI thread.
     pub fn set_content(&mut self, title: String, content: &str) {
+        self.set_prepared(title, crate::svn::parser::parse_diff_content(content));
+    }
+
+    /// Install a diff already parsed on the svn worker thread.
+    pub fn set_prepared(&mut self, title: String, prepared: PreparedDiff) {
         self.title = title;
         self.pending = false;
         self.tv.reset();
-        if content.trim().is_empty() {
-            self.empty_reason = Some("No textual diff".to_string());
-            self.parsed = ParsedDiff::default();
-        } else if looks_like_diff(content) {
-            self.parsed = parse_diff(content);
-            self.empty_reason = None;
-        } else {
-            self.parsed = parse_new_file_content(content);
-            self.empty_reason = None;
-        }
+        self.parsed = prepared.parsed;
+        self.empty_reason = prepared.empty_reason;
         // tabs would be dropped by the terminal buffer (control chars)
         // and trailing blanks are invisible, so content lines get visible
         // markers for both — a whitespace-only change must not render as
