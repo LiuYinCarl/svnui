@@ -1,0 +1,22 @@
+# .svnignore：隐藏过滤 + 内置编辑器实时语法检查
+# 状态页标题显示 [N hidden by .svnignore]；编辑器里先输入一条非法规则
+# （悬空反斜杠）看行内报错，补全后 Ctrl+s 保存，状态树立刻按新规则过滤。
+wait 3.0
+type 4
+wait 2.5
+key end
+key down
+key down
+key end
+key enter
+type *.tmp\
+wait 1.5
+snap svnignore
+key backspace
+wait 1.0
+ctrl s
+wait 1.5
+key esc
+wait 2.0
+snap svnignore-filtered
+type q

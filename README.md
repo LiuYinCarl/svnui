@@ -33,6 +33,10 @@
 | --- | --- |
 | ![仓库概览](docs/screenshots/info.png) | |
 
+| .svnignore：隐藏过滤 + 编辑器实时语法检查 | 非法规则行内报错（保存前拦截） |
+| --- | --- |
+| ![.svnignore](docs/screenshots/svnignore.gif) | ![.svnignore 语法检查](docs/screenshots/svnignore.png) |
+
 ## 功能
 
 覆盖日常最常用的 SVN 操作：

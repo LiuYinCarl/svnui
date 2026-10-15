@@ -34,6 +34,10 @@ with git2svn). The recording pipeline is asciinema + agg; see `scripts/record_de
 | --- | --- |
 | ![repo info](docs/screenshots/info.png) | |
 
+| .svnignore: hidden-entry filter + live syntax check | invalid rules reported inline (before saving) |
+| --- | --- |
+| ![.svnignore](docs/screenshots/svnignore.gif) | ![.svnignore syntax check](docs/screenshots/svnignore.png) |
+
 ## Features
 
 Covers the most common daily SVN operations:
