@@ -1530,21 +1530,19 @@ mod tests {
         assert!(text.contains("M  src/main.rs"), "{text}");
         assert!(text.contains("full message"), "{text}");
         assert!(text.contains("second line"), "{text}");
-        // styling: revision yellow, author cyan, action char in its M color
+        // styling: revision/author use the identity accent, the action
+        // char its status colour (M = warning)
+        let theme = Theme::default();
         let header = &p.lines[0];
-        assert_eq!(
-            header.spans[0].style.fg,
-            Some(ratatui::style::Color::Yellow)
-        );
-        assert_eq!(header.spans[2].style.fg, Some(ratatui::style::Color::Cyan));
+        assert_eq!(header.spans[0].style.fg, theme.log_revision.fg);
+        assert_eq!(header.spans[2].style.fg, theme.log_author.fg);
         let changed = p
             .lines
             .iter()
             .find(|l| l.to_string().contains("src/main.rs"))
             .unwrap();
         assert_eq!(
-            changed.spans[0].style.fg,
-            Some(ratatui::style::Color::Yellow),
+            changed.spans[0].style.fg, theme.log_action_modified.fg,
             "M action color"
         );
         // Esc/q close the popup (OutputPopup behavior): simulate the queue
@@ -2196,7 +2194,9 @@ mod tests {
         assert!(text.contains("7 revisions behind"), "{text}");
         assert!(text.contains("1 modified, 1 unversioned"), "{text}");
         assert!(text.contains("Staged for commit: 1"), "{text}");
-        // styling: the behind warning is yellow, counts carry status colors
+        // styling: the behind warning uses the warning colour, counts
+        // carry their status semantics (M = warning, ? = warning)
+        let theme = Theme::default();
         let behind = o
             .lines
             .iter()
@@ -2204,7 +2204,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             behind.spans.last().unwrap().style.fg,
-            Some(ratatui::style::Color::Yellow)
+            theme.status_modified.fg
         );
         let changes = o
             .lines
@@ -2212,13 +2212,11 @@ mod tests {
             .find(|l| l.to_string().contains("modified"))
             .unwrap();
         assert_eq!(
-            changes.spans[1].style.fg,
-            Some(ratatui::style::Color::Yellow),
+            changes.spans[1].style.fg, theme.status_modified.fg,
             "modified count"
         );
         assert_eq!(
-            changes.spans[3].style.fg,
-            Some(ratatui::style::Color::Cyan),
+            changes.spans[3].style.fg, theme.status_unversioned.fg,
             "unversioned count"
         );
         // unreachable repo: HEAD marked unknown, no panic

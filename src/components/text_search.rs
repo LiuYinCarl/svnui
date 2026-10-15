@@ -459,8 +459,9 @@ mod tests {
     #[test]
     fn highlight_spans_splits_text() {
         let base = Style::default();
-        let hit = Style::default().bg(ratatui::style::Color::Yellow);
-        let cur = Style::default().bg(ratatui::style::Color::Magenta);
+        let theme = crate::ui::style::Theme::default();
+        let hit = theme.search_hit;
+        let cur = theme.search_hit_current;
         // no ranges: single span
         let spans = highlight_spans("abc", base, &[], None, hit, cur);
         assert_eq!(spans.len(), 1);

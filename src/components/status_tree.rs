@@ -740,9 +740,7 @@ impl StatusTreeComponent {
                 let sym = if *expanded { "▼ " } else { "▶ " };
                 spans.push(Span::styled(
                     format!("{sym}{}/", item.name),
-                    Style::default()
-                        .fg(theme.text.fg.unwrap_or(ratatui::style::Color::Gray))
-                        .add_modifier(Modifier::BOLD),
+                    theme.text.add_modifier(Modifier::BOLD),
                 ));
                 let staged_all = info.total > 0 && info.staged == info.total;
                 (Line::from(spans), staged_all)

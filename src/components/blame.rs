@@ -614,7 +614,7 @@ mod tests {
         // the cursor line (first line, row 1 inside the border) is
         // highlighted with the selection background
         let buf = t3.backend().buffer();
-        let sel = ratatui::style::Color::Rgb(0x3b, 0x42, 0x61);
+        let sel = Theme::default().selection_bg;
         assert!((0..80).any(|x| buf[(x, 1)].bg == sel));
     }
 }

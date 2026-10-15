@@ -243,9 +243,7 @@ impl DrawableComponent for FileFinderPopup {
 
 /// A result row: the path with the fuzzy-matched characters highlighted.
 fn result_line(path: &str, matched: &[usize], theme: &Theme) -> Line<'static> {
-    let match_style = Style::default()
-        .fg(theme.info.fg.unwrap_or(ratatui::style::Color::Cyan))
-        .add_modifier(Modifier::BOLD);
+    let match_style = theme.info.add_modifier(Modifier::BOLD);
     let spans: Vec<Span> = path
         .chars()
         .enumerate()
@@ -332,10 +330,11 @@ mod tests {
         // first result row is y=2 (border + input row); "xab.rs" at x=1:
         // matched chars 'a','b' are drawn in the info color, others not
         // (the row selection bolds the whole row, so check fg instead)
-        assert_eq!(buf[(1, 2)].fg, ratatui::style::Color::Gray);
-        assert_eq!(buf[(2, 2)].fg, ratatui::style::Color::Cyan);
-        assert_eq!(buf[(3, 2)].fg, ratatui::style::Color::Cyan);
-        assert_eq!(buf[(4, 2)].fg, ratatui::style::Color::Gray);
+        let theme = Theme::default();
+        assert_eq!(buf[(1, 2)].fg, theme.text.fg.unwrap());
+        assert_eq!(buf[(2, 2)].fg, theme.info.fg.unwrap());
+        assert_eq!(buf[(3, 2)].fg, theme.info.fg.unwrap());
+        assert_eq!(buf[(4, 2)].fg, theme.text.fg.unwrap());
     }
 
     #[test]

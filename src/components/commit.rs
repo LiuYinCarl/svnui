@@ -282,7 +282,6 @@ mod tests {
     use crate::queue::{ConfirmAction, InternalEvent};
     use crate::test_support as ts;
     use crate::ui::style::Theme;
-    use ratatui::style::Color;
 
     fn ev(code: KeyCode) -> Event {
         Event::Key(crossterm::event::KeyEvent::new(
@@ -704,6 +703,6 @@ mod tests {
         assert_eq!(buf[(3, 1)].symbol(), "文");
         assert_eq!(buf[(4, 1)].symbol(), " ");
         // cursor cell (after 中文) carries the selection bg at x = 1 + 4
-        assert_eq!(buf[(5, 1)].bg, Color::Rgb(0x3b, 0x42, 0x61));
+        assert_eq!(buf[(5, 1)].bg, Theme::default().selection_bg);
     }
 }

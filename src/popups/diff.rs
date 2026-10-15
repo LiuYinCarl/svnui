@@ -161,8 +161,9 @@ Index: f
         let buf = t.backend().buffer();
         let has_bg =
             |color: ratatui::style::Color| (0..8).any(|y| (0..60).any(|x| buf[(x, y)].bg == color));
-        assert!(has_bg(ratatui::style::Color::Yellow));
-        assert!(has_bg(ratatui::style::Color::Magenta));
+        let theme = Theme::default();
+        assert!(has_bg(theme.search_hit.bg.unwrap()));
+        assert!(has_bg(theme.search_hit_current.bg.unwrap()));
         assert!(q.pop().is_none());
     }
 
