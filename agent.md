@@ -235,8 +235,11 @@ SVNUI_STRESS_ROUNDS=30 scripts/stress_test.sh   # 快速验证
 
 ## 演示素材录制（README 截图/GIF）
 
-一条命令全量重录：`scripts/record_demos.sh`（首次运行自动调 `scripts/setup_demo_env.sh`
-搭建演示环境）。产物进 `docs/screenshots/`（README 引用），中间产物在演示目录 `out/`。
+一条命令全量重录：`scripts/record_demos.sh`（`SVNUI_DEMO_ONLY=<name>` 只重录单个；首次运行自动调
+`scripts/setup_demo_env.sh` 搭建演示环境）。产物进 `docs/screenshots/`（README 引用），中间产物在演示目录 `out/`。
+
+本机已装好的工具链（asciinema/agg 静态二进制、git2svn、spdlog SVN 源仓库）、
+crates.io USTC 镜像与重建步骤见 `docs/dev-environment.md`。
 
 组成：
 - `scripts/record_demo.py` — pty 按键驱动。`.demo` 脚本 DSL：`wait <秒>` / `type <文本>` /
