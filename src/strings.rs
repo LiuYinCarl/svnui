@@ -37,6 +37,8 @@ pub struct Msg {
     pub empty_log: &'static str,
     pub empty_log_filtered: &'static str,
     pub empty_status: &'static str,
+    /// Status pane empty message while the flat view is active (no M/A/D)
+    pub empty_flat: &'static str,
     pub commit_staged: &'static str,
     pub commit_nothing_staged: &'static str,
     pub revert_confirm: &'static str,
@@ -63,6 +65,7 @@ pub const MSG: Msg = Msg {
     empty_log: "No revisions found",
     empty_log_filtered: "No match in loaded commits — press / then Enter to search all history",
     empty_status: "Working copy is clean",
+    empty_flat: "No M/A/D files in flat view — f toggles the tree",
     commit_staged: "Commit staged changes?",
     commit_nothing_staged: "Nothing staged — stage files with space, or stage all with A",
     revert_confirm: "Revert local changes? (discards modifications)",

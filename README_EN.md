@@ -44,7 +44,7 @@ Covers the most common daily SVN operations:
 
 | Feature | Description |
 | --- | --- |
-| **Status view** | `svn status` rendered as a collapsible directory tree, with color-coded M/A/D/C/? states |
+| **Status view** | `svn status` rendered as a collapsible directory tree, with color-coded M/A/D/C/? states; `f` toggles a flat view (M/A/D files only, abbreviated paths with middle elision) |
 | **Branch info** | The status bar always shows the current branch; the commit confirmation popup shows the target branch and the files to be committed |
 | **Diff pane** | Selecting a file automatically shows its `svn diff` with line numbers and +/− highlighting; unversioned files show their content directly |
 | **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staging an unversioned file runs `svn add` automatically; committing with an empty set is rejected. The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
@@ -96,6 +96,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `Tab` | Commit input: list recent messages, select to fill |
 | `u` | `svn update` |
 | `d` | Fullscreen diff |
+| `f` | Flat view: M/A/D files only, directory names abbreviated (`a/b/c/file`), middle path segments elided when too long; press again for the tree |
 | `b` | Blame file (status tab / file-history popup) |
 | `t` | Selected file's commit history |
 | `Ctrl+p` | Fuzzy file finder (Enter opens file history) |

@@ -20,7 +20,7 @@ pub enum PaneFocus {
 
 /// Status-bar shortcut hints shown while the status tab is active.
 pub const HINTS: &str =
-    "spc stage  c commit  r revert  u update  b blame  / filter  P patch  F5 refresh";
+    "spc stage  c commit  r revert  u update  b blame  / filter  f flat  P patch  F5 refresh";
 
 pub struct StatusTab {
     pub tree: StatusTreeComponent,
@@ -109,14 +109,16 @@ impl StatusTab {
         self.last_diff_requested = None;
         self.update_commit_hint();
         if self.tree.is_empty() && self.tree.selection_entry().is_none() {
-            let reason = match hidden {
-                Some(n) if n > 0 => {
-                    format!(
+            let reason = if self.tree.is_flat() {
+                crate::strings::MSG.empty_flat.to_string()
+            } else {
+                match hidden {
+                    Some(n) if n > 0 => format!(
                         "Working copy is clean ({n} {})",
                         crate::strings::MSG.svnignore_hidden
-                    )
+                    ),
+                    _ => "Working copy is clean".to_string(),
                 }
-                _ => "Working copy is clean".to_string(),
             };
             self.diff.set_hint("Diff".to_string(), reason);
         }
@@ -161,6 +163,13 @@ impl StatusTab {
                     format!("{path} is a directory — select a file")
                 };
                 self.diff.set_hint("Diff".to_string(), reason);
+            } else if self.tree.is_flat() {
+                // flat view with nothing to select (e.g. only unversioned
+                // entries): replace a stale file diff with the mode hint
+                self.diff.set_hint(
+                    "Diff".to_string(),
+                    crate::strings::MSG.empty_flat.to_string(),
+                );
             }
             self.last_diff_requested = sel;
             return None;
@@ -341,6 +350,46 @@ mod tests {
         assert_eq!(
             t.diff.empty_reason.as_deref(),
             Some("Working copy is clean")
+        );
+    }
+
+    #[test]
+    fn update_status_flat_view_empty_hint() {
+        let (mut t, _q) = tab();
+        t.update_status(vec![entry('?', "only.txt"), entry('!', "gone.txt")], None);
+        assert!(!t.tree.is_flat());
+        // 'f' on the focused tree toggles the flat view
+        t.event(&ts::key(crossterm::event::KeyCode::Char('f')))
+            .unwrap();
+        assert!(t.tree.is_flat());
+        assert!(t.tree.is_empty());
+        // the next status application refreshes the diff hint for the mode
+        t.update_status(vec![entry('?', "only.txt"), entry('!', "gone.txt")], None);
+        assert_eq!(
+            t.diff.empty_reason.as_deref(),
+            Some(crate::strings::MSG.empty_flat)
+        );
+    }
+
+    #[test]
+    fn flat_view_empty_toggle_replaces_stale_diff() {
+        let (mut t, _q) = tab();
+        t.update_status(vec![entry('?', "b.txt")], None);
+        t.apply_diff(
+            "b.txt",
+            parse_diff_content("Index: b.txt\n@@ -1 +1 @@\n-a\n+b\n"),
+        );
+        assert!(t.diff.empty_reason.is_none());
+        // 'f' switches to flat: b.txt is untracked, so no flat rows exist
+        t.event(&ts::key(crossterm::event::KeyCode::Char('f')))
+            .unwrap();
+        assert!(t.tree.is_flat());
+        assert!(t.tree.is_empty());
+        // the event loop's diff request must replace the stale file diff
+        assert!(t.maybe_request_diff().is_none());
+        assert_eq!(
+            t.diff.empty_reason.as_deref(),
+            Some(crate::strings::MSG.empty_flat)
         );
     }
 

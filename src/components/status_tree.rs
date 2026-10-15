@@ -1,6 +1,7 @@
 //! Status file tree: shows `svn status` entries grouped by directory,
 //! supports staging (commit set), filtering, and selection-driven diff.
 
+use super::status_flat;
 use super::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
 use crate::queue::{ConfirmAction, InternalEvent};
@@ -51,6 +52,9 @@ pub struct StatusTreeComponent {
     /// bug); `None` when no `.svnignore` is in effect
     svnignore_hidden: Option<usize>,
     filter: String,
+    /// Flat view (`f`): M/A/D files only, path-sorted with compact names,
+    /// instead of the directory tree
+    flat: bool,
     pub pending: bool,
     pub focused: bool,
     /// Cache of per-directory counts, recomputed only when the staged set
@@ -71,6 +75,7 @@ impl StatusTreeComponent {
             staged: HashSet::new(),
             svnignore_hidden: None,
             filter: String::new(),
+            flat: false,
             pending: true,
             focused: true,
             counts_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -105,6 +110,11 @@ impl StatusTreeComponent {
     /// The active path-substring filter (empty = no filtering).
     pub fn filter(&self) -> &str {
         &self.filter
+    }
+
+    /// Whether the flat view is active.
+    pub fn is_flat(&self) -> bool {
+        self.flat
     }
 
     /// Set the path-substring filter and rebuild the visible list. Called
@@ -374,26 +384,27 @@ impl StatusTreeComponent {
 
     fn rebuild_visible(&mut self) {
         let prev = self.selection_path();
-        let mut visible = Vec::new();
-        if self.filter.is_empty() {
+        let visible = if self.flat {
+            self.flat_items()
+        } else if self.filter.is_empty() {
             let nodes = build_tree(&self.entries);
+            let mut visible = Vec::new();
             flatten(&nodes, &self.expanded, 0, &mut visible);
+            visible
         } else {
             let f = self.filter.to_lowercase();
-            for (i, e) in self.entries.iter().enumerate() {
-                if e.is_dir {
-                    continue;
-                }
-                if e.path.to_lowercase().contains(&f) {
-                    visible.push(TreeItem {
-                        depth: 0,
-                        path: e.path.clone(),
-                        name: e.path.clone(),
-                        kind: TreeItemKind::File { entry: i },
-                    });
-                }
-            }
-        }
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.is_dir && e.path.to_lowercase().contains(&f))
+                .map(|(i, e)| TreeItem {
+                    depth: 0,
+                    path: e.path.clone(),
+                    name: e.path.clone(),
+                    kind: TreeItemKind::File { entry: i },
+                })
+                .collect()
+        };
         self.visible = visible;
         self.selection = self
             .visible
@@ -403,6 +414,56 @@ impl StatusTreeComponent {
         if self.selection >= self.visible.len() && !self.visible.is_empty() {
             self.selection = self.visible.len() - 1;
         }
+    }
+
+    /// Flat view rows: M/A/D files only, sorted by path (a directory-major
+    /// order), with compact display names (see `status_flat`). An active
+    /// filter narrows the list like it does in the tree. Directory entries
+    /// are excluded even when `is_dir` is false (`svn rm dir` leaves the
+    /// dir entry without a on-disk dir); they stay visible through their
+    /// children.
+    fn flat_items(&self) -> Vec<TreeItem> {
+        let filter = self.filter.to_lowercase();
+        let dirs = self.dir_prefixes();
+        let mut rows: Vec<(usize, &str)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                status_flat::is_flat_candidate(
+                    display_status(e),
+                    e.is_dir || dirs.contains(e.path.as_str()),
+                )
+            })
+            .filter(|(_, e)| filter.is_empty() || e.path.to_lowercase().contains(&filter))
+            .map(|(i, e)| (i, e.path.as_str()))
+            .collect();
+        rows.sort_by(|a, b| a.1.cmp(b.1));
+        status_flat::display_names(rows.iter().map(|(_, p)| *p))
+            .into_iter()
+            .zip(rows)
+            .map(|(name, (entry, path))| TreeItem {
+                depth: 0,
+                path: path.to_string(),
+                name,
+                kind: TreeItemKind::File { entry },
+            })
+            .collect()
+    }
+
+    /// Paths that are ancestors of other entries, i.e. directories that
+    /// exist in the status list even when `is_dir` is false (a deleted dir
+    /// is gone from disk but still owns its deleted children).
+    fn dir_prefixes(&self) -> HashSet<&str> {
+        let mut dirs: HashSet<&str> = HashSet::new();
+        for e in &self.entries {
+            let mut path = e.path.as_str();
+            while let Some((parent, _)) = path.rsplit_once('/') {
+                dirs.insert(parent);
+                path = parent;
+            }
+        }
+        dirs
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -561,6 +622,9 @@ impl StatusTreeComponent {
                 .push(InternalEvent::Confirm(ConfirmAction::Update));
         } else if key_match(k, KeyAction::Filter) {
             self.ctx.queue.push(InternalEvent::OpenStatusFilter);
+        } else if key_match(k, KeyAction::ToggleFlatView) {
+            self.flat = !self.flat;
+            self.rebuild_visible();
         } else if key_match(k, KeyAction::Escape) {
             // with an active filter Esc clears it; without one Esc is left
             // unconsumed for the caller (e.g. commit pane focus return)
@@ -644,6 +708,9 @@ impl DrawableComponent for StatusTreeComponent {
             theme.border_unfocused
         };
         let mut title = TITLE.status.to_string();
+        if self.flat {
+            title.push_str("  [flat]");
+        }
         if self.pending {
             title.push_str(&format!("  {}", strings::MSG.loading_suffix));
         } else if !self.filter.is_empty() {
@@ -676,9 +743,12 @@ impl DrawableComponent for StatusTreeComponent {
             let end = (scroll + view_height).min(total);
             let mut lines: Vec<Line> = Vec::with_capacity(end - scroll);
             let mut highlights: Vec<(usize, Style)> = Vec::new();
+            // flat rows carry no indentation: the status char + space take
+            // two columns, the rest is available to the compact path
+            let name_budget = self.flat.then(|| inner.width.saturating_sub(2) as usize);
             for i in scroll..end {
                 let item = &self.visible[i];
-                let (line, staged_all) = self.item_line(item, &dir_counts);
+                let (line, staged_all) = self.item_line(item, &dir_counts, name_budget);
                 if staged_all && i != self.selection {
                     highlights.push((i - scroll, Style::default().bg(theme.staged_bg)));
                 }
@@ -696,6 +766,8 @@ impl DrawableComponent for StatusTreeComponent {
         } else {
             let msg = if self.pending {
                 strings::MSG.loading
+            } else if self.flat {
+                strings::MSG.empty_flat
             } else {
                 strings::MSG.empty_status
             };
@@ -717,6 +789,7 @@ impl StatusTreeComponent {
         &self,
         item: &TreeItem,
         dir_counts: &std::collections::HashMap<String, DirCounts>,
+        name_budget: Option<usize>,
     ) -> (Line<'static>, bool) {
         let theme = &self.ctx.theme;
         let mut spans: Vec<Span> = Vec::new();
@@ -757,7 +830,10 @@ impl StatusTreeComponent {
                 } else {
                     spans.push(Span::raw("  "));
                 }
-                let name = item.name.clone();
+                let name = match name_budget {
+                    Some(budget) => status_flat::elide_middle(&item.name, budget),
+                    None => item.name.clone(),
+                };
                 let staged = self.staged.contains(&item.path);
                 let style = if staged {
                     Style::default().add_modifier(Modifier::BOLD)
@@ -1022,6 +1098,7 @@ mod tests {
             staged: HashSet::new(),
             svnignore_hidden: None,
             filter: String::new(),
+            flat: false,
             pending: false,
             focused: true,
             counts_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1301,6 +1378,155 @@ mod interaction_tests {
         // clearing restores the full list
         c.set_filter(String::new());
         assert_eq!(c.visible.len(), 2);
+    }
+
+    #[test]
+    fn flat_view_toggle_shows_mad_files_sorted_and_compact() {
+        let (mut c, _q) = comp_with(vec![
+            entry('?', "untracked.txt"),
+            entry('M', "src/app/main.rs"),
+            entry('A', "src/lib/new.rs"),
+            entry('D', "docs/old.md"),
+            entry('D', "gone"),
+            entry('D', "gone/leaf.txt"),
+            entry('C', "conflict.txt"),
+            entry('!', "missing.txt"),
+            entry('R', "replaced.txt"),
+            dir_entry('?', "newdir"),
+        ]);
+        // tree mode first: directories are there
+        assert!(!c.is_flat());
+        assert!(
+            c.visible
+                .iter()
+                .any(|t| matches!(t.kind, TreeItemKind::Dir { .. }))
+        );
+        // 'f' switches to the flat list and consumes the key
+        assert!(c.event(&key(KeyCode::Char('f'))).unwrap().consumed);
+        assert!(c.is_flat());
+        // only M/A/D files, path-sorted (directory-major), all rows files;
+        // the deleted dir `gone` itself is not a row (its D child is)
+        let paths: Vec<&str> = c.visible.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "docs/old.md",
+                "gone/leaf.txt",
+                "src/app/main.rs",
+                "src/lib/new.rs"
+            ]
+        );
+        assert!(
+            c.visible
+                .iter()
+                .all(|t| matches!(t.kind, TreeItemKind::File { .. }))
+        );
+        // compact names: intermediate dirs abbreviated, file name intact
+        let names: Vec<&str> = c.visible.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["d/old.md", "g/leaf.txt", "s/a/main.rs", "s/l/new.rs"]
+        );
+        // 'f' again restores the tree, dirs first as before
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        assert!(!c.is_flat());
+        assert!(
+            c.visible
+                .iter()
+                .any(|t| matches!(t.kind, TreeItemKind::Dir { .. }))
+        );
+        assert_eq!(c.visible[0].path, "docs");
+    }
+
+    #[test]
+    fn flat_view_falls_back_to_full_path_on_collision() {
+        let (mut c, _q) = comp_with(vec![
+            entry('M', "src/app/main.rs"),
+            entry('M', "src/api/main.rs"),
+        ]);
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        // both abbreviate to s/a/main.rs -> full paths keep rows unambiguous
+        let names: Vec<&str> = c.visible.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["src/api/main.rs", "src/app/main.rs"]);
+    }
+
+    #[test]
+    fn flat_view_respects_filter_and_survives_update() {
+        let (mut c, _q) = comp_with(vec![
+            entry('M', "src/app/main.rs"),
+            entry('M', "docs/readme.md"),
+            entry('?', "src/scratch.txt"),
+        ]);
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(c.visible.len(), 2);
+        c.set_filter("docs".to_string());
+        assert_eq!(c.visible.len(), 1);
+        assert_eq!(c.visible[0].path, "docs/readme.md");
+        // a refresh keeps the mode and the filter: nothing matches now
+        c.update(vec![
+            entry('M', "src/app/main.rs"),
+            entry('A', "src/new.rs"),
+        ]);
+        assert!(c.is_flat());
+        assert!(c.visible.is_empty());
+        // clearing the filter shows the refreshed flat rows
+        c.set_filter(String::new());
+        assert_eq!(c.visible.len(), 2);
+        assert_eq!(c.visible[0].path, "src/app/main.rs");
+    }
+
+    #[test]
+    fn flat_view_selection_supports_diff_and_staging() {
+        let (mut c, q) = comp_with(vec![entry('M', "z.txt"), entry('A', "a.txt")]);
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        // path-sorted: a.txt first
+        assert_eq!(c.selection_path().as_deref(), Some("a.txt"));
+        // flat rows are file rows: Enter requests a diff
+        c.event(&key(KeyCode::Enter)).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::RequestFileDiff)));
+        // staging works on the flat selection
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("a.txt"));
+        // the selection survives a refresh
+        c.update(vec![entry('M', "z.txt"), entry('A', "a.txt")]);
+        assert_eq!(c.selection_path().as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn flat_view_without_mad_files_shows_hint() {
+        let (mut c, _q) = comp_with(vec![entry('?', "only.txt"), entry('!', "gone.txt")]);
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        assert!(c.is_empty());
+        let t = ts::render(60, 6, |f| {
+            c.draw(f, Rect::new(0, 0, 60, 6)).unwrap();
+        });
+        let s = ts::dump(&t);
+        assert!(s.contains("[flat]"), "{s}");
+        assert!(s.contains("No M/A/D files"), "{s}");
+    }
+
+    #[test]
+    fn flat_view_renders_compact_and_elided_paths() {
+        let (mut c, _q) = comp_with(vec![
+            entry('M', "include/spdlog/fmt/fmt.h"),
+            entry('?', "untracked.txt"),
+        ]);
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        let t = ts::render(40, 6, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 6)).unwrap();
+        });
+        let row = row_line(&t, 1);
+        assert!(row.starts_with("M i/s/f/fmt.h"), "{row}");
+        assert!(!ts::dump(&t).contains("untracked.txt"));
+        // a path wider than the pane elides its middle segments
+        let (mut c2, _q) = comp_with(vec![entry('M', "alpha/beta/gamma/delta/epsilon/file.rs")]);
+        c2.event(&key(KeyCode::Char('f'))).unwrap();
+        let t2 = ts::render(20, 6, |f| {
+            c2.draw(f, Rect::new(0, 0, 20, 6)).unwrap();
+        });
+        let row2 = row_line(&t2, 1);
+        // budget = 20 - 2 borders - 2 status char + space = 16
+        assert!(row2.starts_with("M a/b/.../file.rs"), "{row2}");
     }
 
     #[test]
@@ -1865,6 +2091,37 @@ mod perf_tests {
         assert!(
             el < Duration::from_secs(5),
             "StageAll over 100k files took {el:?}; O(n^2) regression?"
+        );
+    }
+
+    /// Toggling the flat view rebuilds the visible list (filter + sort +
+    /// compact names) and must stay fast on 100k entries.
+    #[test]
+    fn perf_toggle_flat_100k() {
+        let (mut c, _q) = comp();
+        c.update(ts::gen_status_entries(100_000, true));
+        let toggle = || {
+            Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('f'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+        };
+        let t = Instant::now();
+        c.event(&toggle()).unwrap();
+        let el = t.elapsed();
+        // gen_status_entries makes every third entry 'M'
+        assert!(c.is_flat());
+        assert_eq!(c.visible_len(), 33_334);
+        assert!(el < Duration::from_secs(5), "flat toggle(100k) took {el:?}");
+        // toggling back to the tree stays fast too
+        let t = Instant::now();
+        c.event(&toggle()).unwrap();
+        assert!(!c.is_flat());
+        assert_eq!(c.visible_len(), 100_000);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "tree toggle back(100k) took {:?}",
+            t.elapsed()
         );
     }
 }

@@ -43,7 +43,8 @@ src/
 │   └── models.rs     数据结构：StatusEntry / LogEntry / BlameLine / ParsedDiff ...
 ├── components/
 │   ├── mod.rs        DrawableComponent trait、EventState、Context
-│   ├── status_tree.rs  文件树（目录折叠、暂存、路径过滤）——最大的组件
+│   ├── status_tree.rs  文件树（目录折叠、暂存、路径过滤、平铺视图 `f`）——最大的组件
+│   ├── status_flat.rs  平铺视图的路径显示（目录缩写、碰撞回退全路径、中间省略）
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用；h/l 横向滚动看长行；
 │   │                 [/] 在多文件 diff 中按文件节跳转——边界取 parser 判出的 Header 行）
 │   ├── commit.rs     提交信息输入栏（tui-textarea-2，Tab 回填最近提交信息）

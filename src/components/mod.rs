@@ -12,6 +12,7 @@ pub mod log_search;
 pub mod patches;
 pub mod repo_info;
 pub mod status_filter;
+pub mod status_flat;
 pub mod status_tree;
 pub mod text_search;
 pub mod text_view;

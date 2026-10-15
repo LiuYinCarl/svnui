@@ -49,6 +49,8 @@ pub enum KeyAction {
     DiffFull,
     Blame,
     Filter,
+    /// Status tab: toggle the flat view — only M/A/D files, compact paths (`f`)
+    ToggleFlatView,
     Refresh,
     SwitchTabStatus,
     SwitchTabLog,
@@ -116,6 +118,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::DiffFull => is_key(ev, KeyCode::Char('d')),
         KeyAction::Blame => is_key(ev, KeyCode::Char('b')),
         KeyAction::Filter => is_key(ev, KeyCode::Char('/')),
+        KeyAction::ToggleFlatView => is_key(ev, KeyCode::Char('f')),
         KeyAction::Refresh => is_key(ev, KeyCode::F(5)) || is_key(ev, KeyCode::Char('R')),
         KeyAction::SwitchTabStatus => is_key(ev, KeyCode::Char('1')),
         KeyAction::SwitchTabLog => is_key(ev, KeyCode::Char('2')),
@@ -232,6 +235,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("b", "Blame file (svn blame)"),
                 KeyBinding::new("t", "File history (svn log of selected file)"),
                 KeyBinding::new("/", "Filter status files (popup)"),
+                KeyBinding::new("f", "Toggle flat view (only M/A/D files, compact paths)"),
                 KeyBinding::new("c", "Focus commit message / commit"),
                 KeyBinding::new("Enter / Ctrl+s", "Commit (in commit input)"),
                 KeyBinding::new("Tab", "Commit input: pick a recent message"),
@@ -344,6 +348,19 @@ mod tests {
         assert!(key_match(&key(KeyCode::Char('d')), KeyAction::DiffFull));
         assert!(key_match(&key(KeyCode::Char('b')), KeyAction::Blame));
         assert!(key_match(&key(KeyCode::Char('/')), KeyAction::Filter));
+        assert!(key_match(
+            &key(KeyCode::Char('f')),
+            KeyAction::ToggleFlatView
+        ));
+        // Ctrl+f / Alt+f must not toggle the flat view
+        assert!(!key_match(
+            &KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            KeyAction::ToggleFlatView
+        ));
+        assert!(!key_match(
+            &KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            KeyAction::ToggleFlatView
+        ));
         assert!(key_match(&key(KeyCode::Char(']')), KeyAction::NextDiffFile));
         assert!(key_match(&key(KeyCode::Char('[')), KeyAction::PrevDiffFile));
         assert!(key_match(&key(KeyCode::F(5)), KeyAction::Refresh));
