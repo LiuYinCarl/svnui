@@ -71,6 +71,7 @@ struct Stats {
     infos: usize,
     marks: usize,
     histories: usize,
+    flat_views: usize,
     benign_errors: usize,
     anomalies: usize,
 }
@@ -81,7 +82,7 @@ impl std::fmt::Display for Stats {
             f,
             "commits={} reverts={} diffs={} blames={} searches={} patches={} \
              refreshes={} updates={} infos={} marks={} histories={} \
-             benign_errors={} anomalies={}",
+             flat_views={} benign_errors={} anomalies={}",
             self.commits,
             self.reverts,
             self.diffs,
@@ -93,6 +94,7 @@ impl std::fmt::Display for Stats {
             self.infos,
             self.marks,
             self.histories,
+            self.flat_views,
             self.benign_errors,
             self.anomalies,
         )
@@ -568,6 +570,41 @@ impl Harness {
         }
     }
 
+    /// Status tab: toggle the flat view (M/A/D files, compact paths), open
+    /// the selected row's diff, then switch back to the tree.
+    fn act_flat_view(&mut self) {
+        self.action = "status/flat-view";
+        self.goto_tab('1');
+        self.ensure_clean();
+        let f = self.files[self.rng.below(self.files.len())].clone();
+        append_line(&self.wc.join(&f), &format!("// flat {}", self.rng.next()));
+        self.input(key(KeyCode::F(5)));
+        self.settle();
+        self.input(key(KeyCode::Char('f')));
+        if !self.app.status.tree.is_flat() {
+            self.fail("'f' did not enable the flat view");
+        }
+        for _ in 0..self.rng.below(3) {
+            self.input(key(KeyCode::Char('j')));
+        }
+        self.draw_once();
+        // the modified file is the only flat row: Enter opens its diff
+        self.input(key(KeyCode::Enter));
+        self.settle();
+        if !matches!(self.app.popups.last(), Some(Popup::Diff(_))) {
+            self.fail("expected a diff popup from the flat row");
+        }
+        self.draw_once();
+        self.stats.diffs += 1;
+        self.input(key(KeyCode::Esc));
+        self.input(key(KeyCode::Char('f')));
+        if self.app.status.tree.is_flat() {
+            self.fail("'f' did not restore the tree view");
+        }
+        self.revert_picked(&[f]);
+        self.stats.flat_views += 1;
+    }
+
     /// Commit everything currently changed (the files this round modified):
     /// stage all, type a generated message, confirm.
     fn commit_picked(&mut self) {
@@ -836,11 +873,12 @@ fn stress_workflow() {
             12..=23 => h.act_revision_diff(),
             24..=35 => h.act_finder_blame(),
             36..=47 => h.act_log_search(),
-            48..=62 => h.act_modify(),
-            63..=76 => h.act_patch(),
-            77..=82 => h.act_repo_info(),
-            83..=88 => h.act_log_mark(),
-            89..=93 => h.act_file_history(),
+            48..=60 => h.act_modify(),
+            61..=73 => h.act_patch(),
+            74..=78 => h.act_flat_view(),
+            79..=84 => h.act_repo_info(),
+            85..=90 => h.act_log_mark(),
+            91..=95 => h.act_file_history(),
             _ => h.act_refresh(),
         }
         h.app.tick(); // spinner tick, as in main.rs

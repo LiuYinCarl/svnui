@@ -420,7 +420,7 @@ impl StatusTreeComponent {
     /// order), with compact display names (see `status_flat`). An active
     /// filter narrows the list like it does in the tree. Directory entries
     /// are excluded even when `is_dir` is false (`svn rm dir` leaves the
-    /// dir entry without a on-disk dir); they stay visible through their
+    /// dir entry without an on-disk dir); they stay visible through their
     /// children.
     fn flat_items(&self) -> Vec<TreeItem> {
         let filter = self.filter.to_lowercase();
@@ -1490,6 +1490,32 @@ mod interaction_tests {
         // the selection survives a refresh
         c.update(vec![entry('M', "z.txt"), entry('A', "a.txt")]);
         assert_eq!(c.selection_path().as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn flat_toggle_round_trip_keeps_expansion_and_selection() {
+        let (mut c, _q) = comp_with(vec![
+            entry('M', "src/main.rs"),
+            entry('M', "src/lib.rs"),
+            entry('?', "scratch.txt"),
+        ]);
+        // expand src and select a file inside it
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        assert!(c.expanded.contains("src"));
+        c.event(&key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(c.selection_path().as_deref(), Some("src/lib.rs"));
+        let tree_len = c.visible.len();
+        // flat mode keeps the selected file; the unversioned file drops out
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        assert!(c.is_flat());
+        assert_eq!(c.selection_path().as_deref(), Some("src/lib.rs"));
+        assert_eq!(c.visible.len(), 2);
+        // back to the tree: expansion and selection are still intact
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        assert!(!c.is_flat());
+        assert!(c.expanded.contains("src"));
+        assert_eq!(c.visible.len(), tree_len);
+        assert_eq!(c.selection_path().as_deref(), Some("src/lib.rs"));
     }
 
     #[test]

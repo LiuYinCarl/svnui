@@ -21,8 +21,10 @@ pub const ELISION: &str = "...";
 
 /// Status codes listed in the flat view: modified, added, deleted.
 ///
-/// Directories are excluded — the flat view lists files only (a deleted
-/// directory still shows up through its `D` children).
+/// The flat view lists files only. Callers must pass `true` for
+/// structural directories too — an entry that is an ancestor of another
+/// entry is a directory even when svn reported `is_dir == false` (a
+/// deleted directory still owns its deleted children).
 pub fn is_flat_candidate(code: char, is_dir: bool) -> bool {
     !is_dir && matches!(code, 'M' | 'A' | 'D')
 }
@@ -229,5 +231,41 @@ mod tests {
         assert_eq!(elide_middle("a/b/c", 1), "c");
         // single segment (no slash): plain width-aware clip
         assert_eq!(elide_middle("文件名.rs", 4), "文…");
+    }
+
+    /// Width contract relied on by the renderer: the result never exceeds
+    /// the column budget, and it is never empty while there is room for
+    /// at least one cell and the path has a file name. Abbreviations must
+    /// never lengthen a path.
+    #[test]
+    fn elide_middle_respects_the_width_budget() {
+        let paths = [
+            "a",
+            "a/b",
+            "a/b/c",
+            "Cargo.toml",
+            "include/spdlog/fmt/fmt.h",
+            "alpha/beta/gamma/delta/epsilon/file.rs",
+            "源码/核心/主.rs",
+            ".github/workflows/ci.yml",
+            "verylongnamewithoutslashes.rs",
+        ];
+        for path in paths {
+            let full = UnicodeWidthStr::width(path);
+            for max in 0..=full + 3 {
+                let out = elide_middle(path, max);
+                assert!(
+                    UnicodeWidthStr::width(out.as_str()) <= max,
+                    "{path:?} at {max} -> {out:?} overflows"
+                );
+                if max > 0 {
+                    assert!(!out.is_empty(), "{path:?} at {max} produced nothing");
+                }
+            }
+            assert!(
+                abbreviate_dirs(path).len() <= path.len(),
+                "abbreviation must not lengthen {path:?}"
+            );
+        }
     }
 }

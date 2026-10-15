@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | asciinema 3.2.1 | `~/.local/bin/asciinema` | **静态 musl** 二进制（GitHub release `asciinema-x86_64-unknown-linux-musl`）。不能装 PyPI 上的 2.4：2.x 不支持 `record_demos.sh` 用的 `--headless` / `--window-size` |
 | agg 1.9.0 | `~/.local/bin/agg` | **静态 musl** 二进制（release `agg-x86_64-unknown-linux-musl`）。同页的 glibc 版要求 `GLIBC_2.38`，本机 Ubuntu 22.04 只有 2.35，会报 `version 'GLIBC_2.38' not found` |
-| git2svn | `~/github/git2svn/git2svn` | 独立 clone（`LiuYinCarl/git2svn`）后 `go build -o git2svn .`；演示源仓库和压测的转换都靠它 |
+| git2svn | `~/github/git2svn/git2svn` | 独立 clone（`LiuYinCarl/git2svn`）后 `go build -o git2svn .`；演示源仓库和压测的转换都靠它。注意 `scripts/stress_test.sh` 默认找 `~/dev/github/git2svn`，本机要用 `GIT2SVN_DIR=$HOME/github/git2svn` 覆盖 |
 | spdlog 演示源仓库 | `~/dev/spdlog-svn-repo` | spdlog 的 git `v1.x` 分支（2978 个 first-parent 修订）经 `git2svn dump` 转成的 SVN 仓库，`scripts/setup_demo_env.sh` 的默认 `SVNUI_DEMO_SRC_REPO` |
 | spdlog git 克隆 | `target/tmp/spdlog-git` | 转换素材；可随时删掉重克隆（在 gitignore 的 `target/` 里） |
 | 演示工作副本 | `/tmp/svnui-demo` | `setup_demo_env.sh` 生成（`repo/` 热拷贝、`wc/`、`wc-base/`、`patches/`、`out/`）；可删，下次录制自动重建 |
@@ -72,3 +72,11 @@ SVNUI_DEMO_ONLY=svnignore scripts/record_demos.sh   # 只重录单个
 录制相关环境变量：`SVNUI_DEMO_DIR`、`SVNUI_DEMO_SRC_REPO`、`SVNUI_DEMO_SIZE`、
 `AGG_THEME`、`AGG_SPEED`、`SVNUI_DEMO_ONLY`（见 `scripts/record_demos.sh` 头部）。
 运行前确保 `~/.local/bin` 和 `~/.cargo/bin` 在 `PATH` 里。
+
+本机压测（转换 + 检出 + tree parity + 无头驱动，默认 200 轮）：
+
+```bash
+STRESS_GIT_REPO=target/tmp/spdlog-git STRESS_GIT_BRANCH=v1.x \
+GIT2SVN_DIR="$HOME/github/git2svn" scripts/stress_test.sh
+# 快速验证： SVNUI_STRESS_ROUNDS=30 ... （压测脚本会自己重建 wc）
+```
