@@ -23,6 +23,11 @@ type MutationJob = Box<dyn FnOnce() + Send + 'static>;
 /// features svnui uses: `svn log --search` (1.8) and `svn patch` (1.7).
 pub const MIN_SVN_VERSION: (u32, u32, u32) = (1, 8, 0);
 
+/// Path-list size above which `--targets <file>` is used instead of argv.
+/// The exact value only avoids temp files for routine small operations;
+/// the important property is that huge stage-all lists stay below ARG_MAX.
+const TARGETS_THRESHOLD: usize = 128;
+
 /// Result of a finished SVN background operation.
 #[derive(Clone, Debug)]
 pub enum AsyncSvnNotification {
@@ -179,6 +184,13 @@ impl Svn {
     /// Allocate the next request sequence number (see `request_seq`).
     fn next_request_id(&self) -> u64 {
         self.request_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Point the client at a different working-copy directory. Used once at
+    /// startup when `svn info` reports the real working-copy root (the app
+    /// may have been launched from a subdirectory).
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd = cwd;
     }
 
     /// Run `f`, converting a panic into the operation's error
@@ -346,6 +358,9 @@ impl Svn {
     fn read_content_fallback(cwd: &Path, path: &str) -> Result<String, String> {
         let full = cwd.join(path);
         match std::fs::metadata(&full) {
+            // Never open a FIFO/socket/device here: read_to_string() would
+            // block the worker forever waiting for a writer.
+            Ok(m) if !m.is_file() => Ok("(not a regular file, content not shown)".to_string()),
             // a placeholder beats an empty result: the UI would otherwise
             // show a misleading "no textual diff" for a huge file
             Ok(m) if m.len() > 2_000_000 => {
@@ -461,10 +476,11 @@ impl Svn {
     /// `-l N` limits the number of revisions *scanned* (newest N), not
     /// the number of matches shown — a limit would silently reduce the
     /// search to recent history.
-    pub fn log_search(&self, pattern: &str) {
+    pub fn log_search(&self, pattern: &str) -> u64 {
         let cwd = self.cwd.clone();
         let pattern = pattern.to_string();
         let err_pattern = pattern.clone();
+        let id = self.next_request_id();
         self.spawn(
             move || {
                 let result =
@@ -477,6 +493,7 @@ impl Svn {
                 result: Err(e),
             },
         );
+        id
     }
 
     /// Fetch revisions older than `before_rev` (log tab pagination).
@@ -499,22 +516,86 @@ impl Svn {
         );
     }
 
-    /// List all versioned files in the working copy (`svn list -R`).
+    /// List the versioned files currently present in the working copy.
     /// Directory entries (trailing '/') are filtered out.
     ///
-    /// The `.@HEAD` peg is required: plain `svn list -R` lists the wc root
-    /// at its BASE revision, which in a mixed-revision working copy (e.g.
-    /// right after a commit, before update) can be stale or even empty.
+    /// `svn list .@HEAD` supplies the repository tree, but it is not the
+    /// working copy: locally deleted files are still listed and locally
+    /// added files are missing. Apply `svn status` on top (drop D/!, add
+    /// A/R) and require the file to exist locally, so the finder only
+    /// offers paths that can actually be opened.
+    ///
+    /// The `.@HEAD` peg is still used for the list itself: plain
+    /// `svn list -R` lists the wc root at its BASE revision, which in a
+    /// mixed-revision working copy (e.g. right after a commit, before
+    /// update) can be stale or even empty.
     pub fn list_files(&self) {
         let cwd = self.cwd.clone();
         self.spawn(
             move || {
-                let result = Self::run_in(&cwd, &["list", "-R", ".@HEAD"]).map(|out| {
-                    out.lines()
-                        .map(|l| l.trim_end_matches('\r'))
-                        .filter(|l| !l.is_empty() && !l.ends_with('/'))
-                        .map(str::to_string)
-                        .collect()
+                let listed = Self::run_in(&cwd, &["list", "-R", ".@HEAD"]);
+                let result = listed.map(|out| {
+                    let mut removed_files: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let mut removed_dirs: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let mut added: Vec<String> = Vec::new();
+                    if let Ok(status) = Self::run_in(&cwd, &["status", "--ignore-externals"]) {
+                        for e in parser::parse_status(&status, &cwd) {
+                            match e.status {
+                                'D' | '!' if e.is_dir => {
+                                    removed_dirs.insert(e.path);
+                                }
+                                'D' | '!' => {
+                                    removed_files.insert(e.path);
+                                }
+                                'A' | 'R' if !e.is_dir => added.push(e.path),
+                                _ => {}
+                            }
+                        }
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    let mut files = Vec::new();
+                    for f in out.lines() {
+                        let f = f.trim_end_matches('\r');
+                        #[cfg(windows)]
+                        let f = f.replace('\\', "/");
+                        #[cfg(not(windows))]
+                        let f = f.to_string();
+                        if f.is_empty() || f.ends_with('/') {
+                            continue;
+                        }
+                        if removed_files.contains(f.as_str()) {
+                            continue;
+                        }
+                        let mut ancestor = f.as_str();
+                        let mut under_deleted_dir = false;
+                        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                            if removed_dirs.contains(parent) {
+                                under_deleted_dir = true;
+                                break;
+                            }
+                            ancestor = parent;
+                        }
+                        if under_deleted_dir {
+                            continue;
+                        }
+                        // HEAD may contain paths that are not checked out
+                        // (sparse/mixed-revision wc): the finder must only
+                        // offer files that can be blamed/history'd locally.
+                        if !cwd.join(&f).is_file() {
+                            continue;
+                        }
+                        if seen.insert(f.clone()) {
+                            files.push(f);
+                        }
+                    }
+                    for f in added {
+                        if cwd.join(&f).is_file() && seen.insert(f.clone()) {
+                            files.push(f);
+                        }
+                    }
+                    files
                 });
                 AsyncSvnNotification::ListFiles(result)
             },
@@ -523,17 +604,22 @@ impl Svn {
     }
 
     /// Diff of a single revision (`svn diff -c rev`). With `path` the diff
-    /// is limited to that one file (file history popup). NB: no peg suffix
-    /// on the path — svn diff rejects pegged wc targets (E155010) and
-    /// treats a trailing "@xxx" as plain path text.
+    /// is limited to that one file (file history popup). The empty peg
+    /// suffix is required here: `svn diff -c` parses `foo@bar` as
+    /// `path@peg`, unlike a plain working-copy `svn diff` (which rejects
+    /// pegged wc targets and accepts the literal `@` suffix).
     pub fn revision_diff(&self, revision: u64, path: Option<&str>, req: Option<u64>) {
         let cwd = self.cwd.clone();
         let path = path.map(str::to_string);
         self.spawn(
             move || {
                 let rev = revision.to_string();
+                let pegged;
                 let args: Vec<&str> = match &path {
-                    Some(p) => vec!["diff", "-c", &rev, "--", p],
+                    Some(p) => {
+                        pegged = Self::peg(p);
+                        vec!["diff", "-c", &rev, "--", &pegged]
+                    }
                     None => vec!["diff", "-c", &rev],
                 };
                 let result = Self::run_in(&cwd, &args).map(|t| parse_diff_content(&t));
@@ -612,10 +698,15 @@ impl Svn {
         let paths = paths.to_vec();
         self.spawn_mutating(
             move || {
-                let mut args: Vec<String> = vec!["add".into(), "--".into()];
-                args.extend(paths.iter().map(|p| Self::peg(p)));
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
+                let result = if paths.len() > TARGETS_THRESHOLD {
+                    Self::run_with_targets(&cwd, &["add"], &paths)
+                } else {
+                    let mut args: Vec<String> = vec!["add".into(), "--".into()];
+                    args.extend(paths.iter().map(|p| Self::peg(p)));
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    Self::run_in(&cwd, &arg_refs)
+                }
+                .map(|_| paths.clone());
                 AsyncSvnNotification::Add(result)
             },
             |e| AsyncSvnNotification::Add(Err(e)),
@@ -648,10 +739,15 @@ impl Svn {
         let paths = paths.to_vec();
         self.spawn_mutating(
             move || {
-                let mut args: Vec<String> = vec!["revert".into(), "-R".into(), "--".into()];
-                args.extend(paths.iter().map(|p| Self::peg(p)));
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
+                let result = if paths.len() > TARGETS_THRESHOLD {
+                    Self::run_with_targets(&cwd, &["revert", "-R"], &paths)
+                } else {
+                    let mut args: Vec<String> = vec!["revert".into(), "-R".into(), "--".into()];
+                    args.extend(paths.iter().map(|p| Self::peg(p)));
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    Self::run_in(&cwd, &arg_refs)
+                }
+                .map(|_| paths.clone());
                 AsyncSvnNotification::Revert(result)
             },
             |e| AsyncSvnNotification::Revert(Err(e)),
@@ -665,7 +761,7 @@ impl Svn {
             move || {
                 let result = Self::run_in(
                     &cwd,
-                    &["resolve", "--accept=working", "--", &Self::peg(&path)],
+                    &["resolve", "--accept=working", "-R", "--", &Self::peg(&path)],
                 );
                 AsyncSvnNotification::Resolve(result.map(|_| path.clone()))
             },
@@ -927,10 +1023,15 @@ impl Svn {
                 args.push("--force-log".into());
                 args.push("-m".into());
                 args.push(message);
-                args.push("--".into());
-                args.extend(paths.iter().map(|p| Self::peg(p)));
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let result = Self::run_in(&cwd, &arg_refs);
+                let result = if paths.len() > TARGETS_THRESHOLD {
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    Self::run_with_targets(&cwd, &arg_refs, &paths)
+                } else {
+                    args.push("--".into());
+                    args.extend(paths.iter().map(|p| Self::peg(p)));
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    Self::run_in(&cwd, &arg_refs)
+                };
                 AsyncSvnNotification::Commit(result)
             },
             |e| AsyncSvnNotification::Commit(Err(e)),
@@ -945,6 +1046,35 @@ impl Svn {
     /// against this: peg parsing applies to every target argument.
     fn peg(path: &str) -> String {
         format!("{path}@")
+    }
+
+    /// Above this many targets, pass paths through `--targets` instead of
+    /// argv: 100k paths can exceed the OS argument-size limit (ARG_MAX),
+    /// making stage-all commits/adds fail with E2BIG on large working
+    /// copies. Each line still gets the empty peg suffix, just like argv.
+    fn run_with_targets(
+        cwd: &Path,
+        base_args: &[&str],
+        paths: &[String],
+    ) -> Result<String, String> {
+        static TARGETS_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TARGETS_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file =
+            std::env::temp_dir().join(format!("svnui-targets-{}-{seq}.txt", std::process::id()));
+        let mut body = String::new();
+        for p in paths {
+            body.push_str(&Self::peg(p));
+            body.push('\n');
+        }
+        std::fs::write(&file, body)
+            .map_err(|e| format!("cannot write target list {}: {e}", file.display()))?;
+        let mut args: Vec<String> = base_args.iter().map(|s| (*s).to_string()).collect();
+        args.push("--targets".into());
+        args.push(file.to_string_lossy().into_owned());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = Self::run_in(cwd, &arg_refs);
+        let _ = std::fs::remove_file(&file);
+        result
     }
 
     fn run_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
@@ -1667,6 +1797,30 @@ mod tests {
     }
 
     #[test]
+    fn list_files_reflects_working_copy_changes() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("newfile.txt"), "new\n");
+        test_support::write_file(&repo.wc.join("unversioned.txt"), "x\n");
+        repo.svn(&["rm", "Cargo.toml"]);
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.add(&["newfile.txt".to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Ok(_))));
+        c.list_files();
+        match recv(&rx) {
+            AsyncSvnNotification::ListFiles(Ok(files)) => {
+                // A locally added file is in the working copy but not at
+                // HEAD; a locally deleted file is at HEAD but no longer in
+                // the working copy. Neither may confuse the finder.
+                assert!(files.contains(&"newfile.txt".to_string()), "{files:?}");
+                assert!(!files.contains(&"Cargo.toml".to_string()), "{files:?}");
+                assert!(!files.contains(&"unversioned.txt".to_string()), "{files:?}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn range_diff_combines_revisions() {
         let Some(repo) = TestRepo::new() else { return };
         test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
@@ -1711,6 +1865,32 @@ mod tests {
                 let d = diff_text(&d);
                 assert!(d.contains("Index: Cargo.toml"), "{d}");
                 assert!(!d.contains("src/main.rs"), "{d}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revision_diff_with_at_sign_path_is_pegged() {
+        let Some(repo) = TestRepo::new() else { return };
+        let name = "unit@.service";
+        test_support::write_file(&repo.wc.join(name), "[Unit]\nDescription=t\n");
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.add(&[name.to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Ok(_))));
+        c.commit("add unit template", &[name.to_string()], false);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Commit(Ok(_))));
+        // File history / blame use a path-limited revision diff; without
+        // a peg suffix svn parses ".service" as a revision and fails.
+        c.revision_diff(2, Some(name), None);
+        match recv(&rx) {
+            AsyncSvnNotification::RevisionDiff {
+                result: Ok(diff), ..
+            } => {
+                let diff = diff_text(&diff);
+                assert!(diff.contains(name), "{diff}");
+                assert!(diff.contains("+[Unit]"), "{diff}");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1976,6 +2156,44 @@ mod tests {
         let (tx, rx) = unbounded();
         Svn::new(repo.wc.clone(), tx).remove(&["nosuch.txt".to_string()]);
         assert!(matches!(recv(&rx), AsyncSvnNotification::Remove(Err(_))));
+    }
+
+    #[test]
+    fn large_path_lists_use_a_targets_file() {
+        let Some(repo) = TestRepo::new() else { return };
+        // More than TARGETS_THRESHOLD: both add and commit must switch to
+        // --targets instead of argv (which would hit ARG_MAX on a real
+        // 100k-file stage-all).
+        let mut names: Vec<String> = (0..TARGETS_THRESHOLD + 2)
+            .map(|i| format!("bulk_{i:03}.txt"))
+            .collect();
+        // Also exercise the peg handling inside the --targets file.
+        names.push("unit@.service".to_string());
+        for name in &names {
+            test_support::write_file(&repo.wc.join(name), "x\n");
+        }
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.add(&names);
+        match recv(&rx) {
+            AsyncSvnNotification::Add(Ok(added)) => assert_eq!(added.len(), names.len()),
+            other => panic!("unexpected: {other:?}"),
+        }
+        c.commit("add bulk files", &names, false);
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(out)) => {
+                assert!(out.contains("Committed revision"), "{out}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for name in &names {
+            test_support::write_file(&repo.wc.join(name), "changed\n");
+        }
+        c.revert(&names);
+        match recv(&rx) {
+            AsyncSvnNotification::Revert(Ok(reverted)) => assert_eq!(reverted.len(), names.len()),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// A panicking worker must still deliver exactly one notification;

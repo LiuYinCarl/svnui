@@ -136,7 +136,12 @@ impl IgnoreEditor {
             )));
             return;
         }
-        let content = std::fs::read_to_string(&self.path).unwrap_or_default();
+        // Only regular files: a FIFO placed at .svnignore must not block
+        // the UI thread in read_to_string().
+        let content = match std::fs::metadata(&self.path) {
+            Ok(m) if m.is_file() => std::fs::read_to_string(&self.path).unwrap_or_default(),
+            _ => String::new(),
+        };
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
         self.textarea = TextArea::new(lines);
         self.textarea.set_style(self.ctx.theme.text);
@@ -286,10 +291,13 @@ impl DrawableComponent for IgnoreEditor {
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
         // bracketed paste: insert verbatim
         if let Event::Paste(text) = ev {
+            let before = self.content();
             self.textarea.insert_str(text);
-            self.dirty = true;
-            self.notice = None;
-            self.validate();
+            if self.content() != before {
+                self.dirty = true;
+                self.notice = None;
+                self.validate();
+            }
             return Ok(EventState::consumed());
         }
         let Event::Key(k) = ev else {
@@ -313,12 +321,24 @@ impl DrawableComponent for IgnoreEditor {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && matches!(k.code, KeyCode::Char(_))
             {
+                // Let the global Ctrl+C quit mapping through only when
+                // there are no unsaved rules; everything else (Ctrl+S is
+                // handled above) must not insert a letter.
+                if key_match(k, KeyAction::Quit) && !self.dirty {
+                    return Ok(EventState::not_consumed());
+                }
                 return Ok(EventState::consumed());
             }
+            let before = self.content();
             self.textarea.input(*k);
-            self.dirty = true;
-            self.notice = None;
-            self.validate();
+            // Cursor movement keys also reach the textarea; only a real
+            // content change may mark the file dirty (otherwise F5 would
+            // refuse to reload after merely browsing the file).
+            if self.content() != before {
+                self.dirty = true;
+                self.notice = None;
+                self.validate();
+            }
         }
         Ok(EventState::consumed())
     }
@@ -485,6 +505,24 @@ mod tests {
         std::fs::write(root.0.join(IGNORE_FILE), "external\n").unwrap();
         e.event(&key(KeyCode::F(5))).unwrap();
         assert_eq!(e.content(), "external");
+    }
+
+    #[test]
+    fn cursor_moves_do_not_mark_dirty() {
+        let root = Root::new();
+        std::fs::write(root.0.join(IGNORE_FILE), "*.log\n").unwrap();
+        let (mut e, q) = editor(&root);
+        assert!(!e.is_dirty());
+        // Right/Home/End only move the cursor; they must not make the file
+        // look edited (F5 would then refuse to reload).
+        e.event(&key(KeyCode::Right)).unwrap();
+        e.event(&key(KeyCode::End)).unwrap();
+        assert!(!e.is_dirty());
+        e.event(&key(KeyCode::F(5))).unwrap();
+        assert!(q.pop().is_none(), "clean reload must not pop a warning");
+        // A real edit still dirties it.
+        e.event(&key(KeyCode::Char('x'))).unwrap();
+        assert!(e.is_dirty());
     }
 
     #[test]

@@ -1,16 +1,16 @@
-//! Bottom commit bar: single-line message input.
-//!
-//! Text editing is delegated to the `tui-textarea` crate (the same approach
-//! gitui uses), which handles wide characters (CJK), grapheme-aware deletion
-//! and horizontal scrolling — so the cursor stays aligned with mixed
-//! Chinese/ASCII input.
+//! Bottom commit bar. Text editing is delegated to the `tui-textarea`
+//! crate (the same approach gitui uses), which handles wide characters
+//! (CJK), grapheme-aware deletion and horizontal scrolling — so the cursor
+//! stays aligned with mixed Chinese/ASCII input. Enter commits; a
+//! bracketed paste may still contain newlines, so the view reserves a row
+//! for the hint instead of overpainting the second text line.
 
 use super::{Context, DrawableComponent, EventState};
 use crate::keys::{KeyAction, key_match};
 use crate::queue::{ConfirmAction, InternalEvent};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -183,11 +183,22 @@ impl DrawableComponent for CommitComponent {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        // The textarea draws its own (unicode-width aware) cursor cell.
-        f.render_widget(&self.textarea, inner);
+        // Keep the hint on its own row: drawing it over the textarea's last
+        // row hid the second line of a pasted multi-line message.
+        let (text_area, hint_area) = if inner.height >= 2 {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            (rows[0], Some(rows[1]))
+        } else {
+            (inner, None)
+        };
 
-        // hint line below (only if the bar is tall enough)
-        if area.height >= 4 {
+        // The textarea draws its own (unicode-width aware) cursor cell.
+        f.render_widget(&self.textarea, text_area);
+
+        if let Some(hint_area) = hint_area {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(
@@ -196,7 +207,7 @@ impl DrawableComponent for CommitComponent {
                     ),
                     theme.dim,
                 ))),
-                Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+                hint_area,
             );
         }
 

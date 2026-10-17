@@ -24,7 +24,7 @@
   （否则 --depth empty 会提交空目录、把子文件留在工作副本）；`svn add` / `svn rm` 失败
   的路径会从提交集回滚（`unstage_paths()`）。缺失目录可整树暂存：`svn rm` 会把整棵子树
   调度为 D，目录 target 的 `--depth empty` 提交会连同子孙删除一起入库（验证于 svn 1.15.0）。
-- 状态树支持 `.svnignore`（工作副本根目录，.gitignore 语法，见 `src/ignore_filter.rs`）：
+- 状态树支持 `.svnignore`（工作副本根目录，.gitignore 语法，见 `src/ignore_filter.rs`；`App` 在 `svn info` 成功后会把工作目录重定位到 WC 根目录）：
   命中的条目不展示也不可操作，标题栏显示 `[N hidden by .svnignore]` 提示；`4` 键打开
   内置编辑器标签页（`ignore_editor.rs`），带实时语法检查。
 - 禁止使用 `unsafe`。新代码必须通过 `cargo clippy --all-targets -- -D warnings`（CI 门禁）。
@@ -58,7 +58,7 @@ src/
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
 │   ├── status_filter.rs 状态文件过滤弹窗（输入时实时筛选，回车保留，Esc 还原；Esc 在状态页清除筛选）
 │   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
-│   ├── file_finder.rs  模糊文件搜索弹窗（数据源 svn list -R .@HEAD，fuzzy-matcher 匹配）
+│   ├── file_finder.rs  模糊文件搜索弹窗（svn list HEAD + status 修正本地增删，fuzzy-matcher 匹配）
 │   ├── blame.rs      blame 弹窗（/ 增量搜索 + n/N 跳转 + 光标行 Enter 看该修订中该文件的
 │   │                 diff + h/l 横滚）
 │   ├── patches.rs    补丁标签页（列出 patch 目录、预览/应用/删除补丁；patch_dir() 解析存储目录，
@@ -103,6 +103,8 @@ src/
 - `build_tree` 为 O(n)：一次性 HashMap 建节点 + 索引装配 + 排序；
 - 虚拟化渲染：文件树 / 日志列表 / Diff / Blame 每次 draw 只构建可见窗口（O(屏幕高度)）；
 - `dir_staged_counts` 缓存：按目录的暂存计数只在暂存集合或条目变化时重算；
+- 提交路径索引一次构建：`expand_commit_paths`/`status_chars` 不再对每个路径线性扫描；
+- add/commit/revert 超过 128 个路径时走 `svn --targets` 临时文件，避免 ARG_MAX；
 - `cargo test perf` 是 CI 强制的带时间预算回归测试，复杂度回归会被门禁拦下；
   `cargo bench --bench tree`（criterion，release）提供本地精确数据。
 
@@ -165,7 +167,8 @@ cargo fmt --all --check     # 格式门禁
   它们固定 `env_remove("LC_ALL")` + `LC_MESSAGES=C` 保证英文输出。**禁止改成 `LC_ALL=C`**
   （会把 native 编码固定为 ASCII，破坏非 ASCII 的提交与日志显示）。
 - `svn commit` 必须带 `--encoding UTF-8`（`-m` 消息是 UTF-8 字节）。
-- `svn status`：7 列状态字符后接路径（路径从第 8 个字符开始，验证于 svn 1.14.5）。
+- `svn status`：7 列状态字符后接路径（路径从第 8 个字符开始，验证于 svn 1.14.5）；
+  Windows 上输出可能是 `dir\file`，解析器统一归一化为 `/`，树的路径逻辑只认 `/`。
   工作副本有冲突时输出尾部固定带 `Summary of conflicts:` 块，解析器显式跳过。
   属性冲突标在**第 2 列**（` C`），`StatusEntry::is_conflicted` 覆盖第 1/2/7 列。
 - `svn log`：必须显式传范围 `-r HEAD:0 -l N`（`HEAD:1` 在 r0 空仓库上报 E160006）。
@@ -218,9 +221,10 @@ cargo fmt --all --check     # 格式门禁
   （不是状态页键）：锁是在哪个标签页的操作上冒出来的无法预料，弹窗/文本输入会先消费按键。
 - 文件名含 `@`（如 systemd 的 `foo@.service`）：log/blame/info/add/revert/resolve/commit
   都必须给路径追加空 peg（`path@`，见 `Svn::peg`），否则报 E205000/E200009；
-  **`svn diff` 例外**——它根本不接受带 peg 的 wc 目标（E155010），但不带 peg 时会把
-  无效的 `@xxx` 后缀当普通路径处理，所以 diff 不传 peg（验证于 svn 1.14.5）。
-- `svn commit -m "docs"` 这类"像路径"的消息会报 E205005，需要 `--force-log` 或用更长文本。
+  **工作副本 `svn diff` 例外**——它根本不接受带 peg 的 wc 目标（E155010），但不带 peg 时会把
+  无效的 `@xxx` 后缀当普通路径处理，所以工作副本 diff 不传 peg；`svn diff -c`（单修订 diff）
+  必须传空 peg，否则会把 `foo@.service` 的 `.service` 当成铆钉版本解析（验证于 svn 1.14.5）。
+- `svn commit -m "docs"` 这类"像路径"的消息在部分 svn 版本会报 E205005，需要 `--force-log` 或用更长文本。
 - `svn revert` 一个刚 add 的文件：取消 add，文件留在磁盘上（变成 `?`）。
 - `svn commit` 对缺失（`!`）目标**静默跳过**，不报错也不删除——提交删除必须先 `svn rm`
   调度。`svn rm` 对缺失文件/目录（含整棵子树，重叠的 dir+child target 也接受）以及
@@ -307,8 +311,8 @@ crates.io USTC 镜像与重建步骤见 `docs/dev-environment.md`。
 
 注意事项：
 - 驱动会剔除 `NO_COLOR` 并设 `TERM=xterm-256color`（crossterm 尊重 NO_COLOR，否则录制无色）；
-- 异步操作后的消息弹窗（"Added to version control"、"Reverted" 等）"press any key to close"
-  会吞掉下一个按键——`.demo` 脚本在这类操作后要先 `key esc`；
+- 异步操作后的消息弹窗（"Added to version control"、"Reverted" 等）除 `j/k` 滚动外，
+  任意按键都会关闭并吞掉下一个按键——`.demo` 脚本在这类操作后要先 `key esc`；
 - 提交信息输入框聚焦时 `q` 是文本输入而非退出，退出前先 `key esc` 切回焦点；
 - 换演示源仓库（非 spdlog）时要同步改 `.demo` 脚本里的文件名/搜索词。
 

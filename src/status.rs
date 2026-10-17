@@ -100,7 +100,12 @@ impl StatusTab {
         let (entries, hidden) = match ignore {
             Some(f) => {
                 let (visible, hidden) = f.partition(entries, |e| e.path.as_str(), |e| e.is_dir);
-                (visible, Some(hidden.len()))
+                let hidden = if hidden.is_empty() {
+                    None
+                } else {
+                    Some(hidden.len())
+                };
+                (visible, hidden)
             }
             None => (entries, None),
         };
@@ -249,7 +254,7 @@ impl StatusTab {
         let theme = &self.commit.ctx.theme;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(4)])
+            .constraints([Constraint::Min(0), Constraint::Length(5)])
             .split(area);
         let content = chunks[0];
         let horiz = Layout::default()
@@ -357,6 +362,11 @@ mod tests {
         // only the non-ignored file reaches the tree
         assert_eq!(t.tree.visible_len(), 1);
         assert_eq!(t.tree.selection_path().as_deref(), Some("a.txt"));
+        // a filter that hides nothing must not show "[0 hidden ...]"
+        let term = ts::render(80, 24, |f| {
+            t.draw(f, Rect::new(0, 0, 80, 24)).unwrap();
+        });
+        assert!(!ts::dump(&term).contains("0 hidden by .svnignore"));
         // everything hidden: the diff hint says so instead of "clean"
         t.update_status(vec![entry('?', "error.log")], Some(&filter));
         assert!(t.tree.is_empty());
@@ -572,9 +582,28 @@ mod tests {
         let s = ts::dump(&terminal);
         assert!(s.contains("a.txt"), "{s}");
         assert!(s.contains("Commit message"), "{s}");
-        // the bar is 4 rows tall so the shortcut hint line is visible
+        // the bar is 5 rows tall: two textarea rows plus the shortcut hint
         assert!(s.contains("[Tab] history"), "{s}");
         assert!(s.contains("old"), "{s}");
         assert!(s.contains("new"), "{s}");
+    }
+
+    #[test]
+    fn multiline_paste_is_visible_above_the_hint() {
+        let (mut t, _q) = tab();
+        t.set_focus(PaneFocus::Commit);
+        let _ = t
+            .event(&crossterm::event::Event::Paste(
+                "first line\nsecond line".to_string(),
+            ))
+            .unwrap();
+        assert_eq!(t.commit.text(), "first line\nsecond line");
+        let terminal = ts::render(120, 30, |f| {
+            t.draw(f, Rect::new(0, 0, 120, 30)).unwrap();
+        });
+        let s = ts::dump(&terminal);
+        assert!(s.contains("first line"), "{s}");
+        assert!(s.contains("second line"), "{s}");
+        assert!(s.contains("[Tab] history"), "{s}");
     }
 }

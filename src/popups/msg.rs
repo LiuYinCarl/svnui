@@ -1,17 +1,21 @@
-//! Message popup for errors and info. Dismissed by any key.
+//! Message popup for errors and info. `j/k`/PageUp/PageDown/Home/End scroll
+//! long messages; any other key dismisses it.
 
 use super::super::components::{Context, DrawableComponent, EventState};
+use crate::keys::{KeyAction, key_match};
 use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use std::cell::Cell;
 
 pub struct MsgPopup {
     ctx: Context,
     pub message: String,
     pub is_error: bool,
+    scroll: Cell<usize>,
 }
 
 impl MsgPopup {
@@ -20,6 +24,7 @@ impl MsgPopup {
             ctx: ctx.clone(),
             message,
             is_error,
+            scroll: Cell::new(0),
         }
     }
 }
@@ -49,24 +54,50 @@ impl DrawableComponent for MsgPopup {
             .lines()
             .map(|l| Line::from(Span::styled(l.to_string(), style)))
             .collect();
-        f.render_widget(Paragraph::new(msg_lines).wrap(Wrap { trim: false }), inner);
+        let scroll = self.scroll.get().min(u16::MAX as usize) as u16;
+        f.render_widget(
+            Paragraph::new(msg_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            inner,
+        );
         // footer hint, one row above the bottom border
         if inner.height > 0 {
             let y = inner.y + inner.height - 1;
             f.buffer_mut()
-                .set_string(inner.x, y, "press any key to close", theme.dim);
+                .set_string(inner.x, y, "j/k scroll · press any key to close", theme.dim);
         }
         Ok(())
     }
 
     fn event(&mut self, ev: &Event) -> Result<EventState, String> {
-        match ev {
-            Event::Key(_) | Event::Mouse(_) => {
+        let Event::Key(k) = ev else {
+            return if matches!(ev, Event::Mouse(_)) {
                 self.ctx.queue.push(crate::queue::InternalEvent::ClosePopup);
                 Ok(EventState::consumed())
-            }
-            _ => Ok(EventState::not_consumed()),
+            } else {
+                Ok(EventState::not_consumed())
+            };
+        };
+        let mut scroll = self.scroll.get();
+        if key_match(k, KeyAction::MoveDown) {
+            scroll = scroll.saturating_add(1);
+        } else if key_match(k, KeyAction::MoveUp) {
+            scroll = scroll.saturating_sub(1);
+        } else if key_match(k, KeyAction::PageDown) {
+            scroll = scroll.saturating_add(20);
+        } else if key_match(k, KeyAction::PageUp) {
+            scroll = scroll.saturating_sub(20);
+        } else if key_match(k, KeyAction::Home) {
+            scroll = 0;
+        } else if key_match(k, KeyAction::End) {
+            scroll = self.message.lines().count().saturating_sub(1);
+        } else {
+            self.ctx.queue.push(crate::queue::InternalEvent::ClosePopup);
+            return Ok(EventState::consumed());
         }
+        self.scroll.set(scroll);
+        Ok(EventState::consumed())
     }
 }
 
@@ -91,6 +122,15 @@ mod tests {
         // another key event closes as well
         let mut p2 = MsgPopup::new(&c, "boom".to_string(), false);
         p2.event(&ts::key(crossterm::event::KeyCode::Enter))
+            .unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+        // movement keys scroll a long error instead of dismissing it
+        let mut p3 = MsgPopup::new(&c, "line0\nline1\nline2".to_string(), true);
+        p3.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert_eq!(p3.scroll.get(), 1);
+        assert!(q.pop().is_none(), "j must not close");
+        p3.event(&ts::key(crossterm::event::KeyCode::Char('z')))
             .unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
     }

@@ -149,12 +149,23 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
         if text == ' ' && props == ' ' && tree_conflict == ' ' {
             continue;
         }
-        let is_dir = root.join(path).is_dir();
+        // svn prints local-style paths on Windows (`dir\file`), while all
+        // tree/path logic here uses the repository-style '/' separator.
+        #[cfg(windows)]
+        let path = path.replace('\\', "/");
+        #[cfg(not(windows))]
+        let path = path.to_string();
+        // Do not follow symlinks: SVN versions a symlink as a file even when
+        // its target is a directory. symlink_metadata() also avoids treating
+        // such a link as an expandable tree node.
+        let is_dir = std::fs::symlink_metadata(root.join(&path))
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
         entries.push(StatusEntry {
             status: text,
             props_status: props,
             tree_conflict,
-            path: path.to_string(),
+            path,
             is_dir,
         });
     }
@@ -793,6 +804,34 @@ Last Changed Date: 2026-01-01 10:00:00 +0000 (Thu, 01 Jan 2026)
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].status, '?');
         assert_eq!(entries[0].path, ">new.txt");
+    }
+
+    #[test]
+    fn test_parse_status_symlink_to_dir_is_a_file() {
+        // A versioned symlink is a file for SVN, even when its target is a
+        // directory. Path::is_dir() would follow the link and turn the
+        // symlink into an (unusable) expandable tree node.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dir =
+                std::env::temp_dir().join(format!("svnui-parse-symlink-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("real")).unwrap();
+            symlink("real", dir.join("link")).unwrap();
+            let entries = parse_status("?       link\n", &dir);
+            assert_eq!(entries.len(), 1);
+            assert!(!entries[0].is_dir, "symlink must stay a file entry");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_parse_status_normalizes_windows_separators() {
+        let entries = parse_status("M       src\\main.rs\n", no_root());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "src/main.rs");
     }
 
     #[test]

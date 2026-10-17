@@ -200,7 +200,12 @@ fn main() -> Result<(), String> {
         Ok(t) => t,
         Err(e) => {
             disable_raw_mode().ok();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(
+                io::stdout(),
+                LeaveAlternateScreen,
+                crossterm::cursor::Show,
+                crossterm::event::DisableBracketedPaste
+            );
             return Err(format!("terminal init: {e}"));
         }
     };

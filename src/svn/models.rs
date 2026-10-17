@@ -44,7 +44,8 @@ pub struct StatusEntry {
     pub props_status: char,
     /// Tree conflict marker (seventh column), 'C' when present
     pub tree_conflict: char,
-    /// Path relative to the working copy root (as reported by svn)
+    /// Path relative to the working-copy root (the app re-roots itself
+    /// there after `svn info`)
     pub path: String,
     /// Whether the path is a directory on disk
     pub is_dir: bool,

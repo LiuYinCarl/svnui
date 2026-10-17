@@ -153,6 +153,14 @@ pub struct App {
         crate::svn::models::FileOverlay,
         Option<u64>,
     )>,
+    /// Request id of the active full-history search. Plain `svn log`
+    /// requests issued before this search must not clear its results when
+    /// they finish late.
+    search_request_id: Option<u64>,
+    /// Working-copy mutations currently queued/running. `q` is refused
+    /// while this is non-zero so an in-flight commit/update is not killed
+    /// by process exit mid-transaction.
+    pending_mutations: usize,
     /// FIFO of `svn add` batches in flight (mutations run serialized, so
     /// notifications arrive in issue order); a failed add un-stages its
     /// paths so they cannot poison the next commit
@@ -191,6 +199,8 @@ impl App {
             last_status_id: 0,
             last_log_id: 0,
             pending_file: None,
+            search_request_id: None,
+            pending_mutations: 0,
             pending_adds: std::collections::VecDeque::new(),
             pending_removes: std::collections::VecDeque::new(),
         }
@@ -434,7 +444,14 @@ impl App {
             return Ok(());
         };
         if key_match(k, KeyAction::Quit) {
-            self.quitting = true;
+            if self.pending_mutations > 0 {
+                self.show_info(
+                    "A working-copy operation is still running — wait for it to finish before quitting"
+                        .to_string(),
+                );
+            } else {
+                self.quitting = true;
+            }
         } else if key_match(k, KeyAction::Help) {
             let ctx = self.ctx.clone();
             self.push_popup(Popup::help(&ctx));
@@ -499,6 +516,14 @@ impl App {
     pub fn tick(&mut self) {
         self.spinner_frame
             .set(self.spinner_frame.get().saturating_add(1));
+    }
+
+    /// Account for a working-copy mutation. Mutations are tracked
+    /// separately from read-only requests so quitting can be deferred
+    /// while a commit/update is in flight.
+    fn begin_mutation(&mut self) {
+        self.pending_mutations = self.pending_mutations.saturating_add(1);
+        self.pending += 1;
     }
 
     // ----- queue events (pushed by components) -----
@@ -568,7 +593,7 @@ impl App {
             }
             InternalEvent::SearchLog(pattern) => {
                 self.log.set_search_active(pattern.clone());
-                self.svn.log_search(&pattern);
+                self.search_request_id = Some(self.svn.log_search(&pattern));
                 self.pending += 1;
             }
             InternalEvent::LogLoadMore => {
@@ -701,7 +726,7 @@ impl App {
                     // (mutations run serialized: results arrive in order)
                     self.pending_adds.push_back(paths.clone());
                     self.svn.add(&paths);
-                    self.pending += 1;
+                    self.begin_mutation();
                 }
             }
             InternalEvent::RemoveFiles(paths) => {
@@ -893,15 +918,15 @@ impl App {
                 // commit (file targets are unaffected by it)
                 let depth_empty = from_staged && self.status.tree.any_dir(&paths);
                 self.svn.commit(&message, &paths, depth_empty);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::Revert(paths) => {
                 self.svn.revert(&paths);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::Update => {
                 self.svn.update();
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::Cleanup => {
                 // repair the whole working copy, not just the start
@@ -918,15 +943,15 @@ impl App {
             }
             ConfirmAction::Resolve(path) => {
                 self.svn.resolve(&path);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::UpdateToRevision(rev) => {
                 self.svn.update_to_revision(rev);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::ApplyPatch(path) => {
                 self.svn.apply_patch(&path);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::DeletePatch(path) => {
                 let name = patch_name(&path);
@@ -967,6 +992,18 @@ impl App {
 
     pub fn handle_async(&mut self, notif: AsyncSvnNotification) {
         self.pending = self.pending.saturating_sub(1);
+        if matches!(
+            &notif,
+            AsyncSvnNotification::Add(_)
+                | AsyncSvnNotification::Revert(_)
+                | AsyncSvnNotification::Resolve(_)
+                | AsyncSvnNotification::Update(_)
+                | AsyncSvnNotification::UpdateToRevision(_)
+                | AsyncSvnNotification::Commit(_)
+                | AsyncSvnNotification::ApplyPatch(_)
+        ) {
+            self.pending_mutations = self.pending_mutations.saturating_sub(1);
+        }
         match notif {
             AsyncSvnNotification::Version(result) => {
                 // check_info fails fatally on its own when svn is missing;
@@ -991,6 +1028,20 @@ impl App {
             }
             AsyncSvnNotification::Info(result) => match result {
                 Ok(info) => {
+                    // The CLI accepts any directory inside a working copy,
+                    // but all status/log paths are relative to the *working
+                    // copy root*. Re-root once here so the tree, the
+                    // `.svnignore` file and the confirmation labels all use
+                    // the same directory. The `.svn` probe also keeps tests
+                    // with synthetic info from switching away from their
+                    // temporary repository.
+                    if !info.wc_root.is_empty() {
+                        let root = PathBuf::from(&info.wc_root);
+                        if root != self.cwd && root.join(".svn").is_dir() {
+                            self.svn.set_cwd(root.clone());
+                            self.cwd = root;
+                        }
+                    }
                     self.svn_info = Some(info);
                     // the working-copy root is only known here; re-point
                     // the ignore editor (launched from a subdir, it may
@@ -1098,6 +1149,17 @@ impl App {
                 if id < self.last_log_id {
                     return;
                 }
+                // A plain log issued before the active search may finish
+                // after it started (large repo / startup): it must not
+                // discard the search state, or the later LogSearch result
+                // would be dropped as "stale". A plain log issued *after*
+                // the search (refresh) still supersedes it.
+                if let Some(search_id) = self.search_request_id {
+                    if id < search_id {
+                        return;
+                    }
+                    self.search_request_id = None;
+                }
                 self.last_log_id = id;
                 match result {
                     Ok(entries) => {
@@ -1134,6 +1196,7 @@ impl App {
                     Err(e) => {
                         // the search did not happen; don't leave the list in
                         // "unfiltered server results" mode
+                        self.search_request_id = None;
                         self.log.clear_search();
                         self.show_error(format!("svn log --search: {e}"));
                     }
@@ -1734,6 +1797,80 @@ mod tests {
             )
         ));
         assert!(app.pending > 0);
+    }
+
+    #[test]
+    fn info_reroots_a_subdirectory_launch() {
+        let Some(repo) = TestRepo::new() else { return };
+        let sub = repo.wc.join("src");
+        // One change in the subtree and one at the root: only the latter
+        // proves that status is now executed at the working-copy root.
+        test_support::write_file(&sub.join("main.rs"), "fn main() {}\n");
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+
+        let (tx, rx) = unbounded();
+        let q = Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let svn = Svn::new(sub.clone(), tx);
+        let mut app = App::new(sub.clone(), svn, ctx);
+        // `svn info` from the subdirectory reports the real WC root.
+        let info = crate::svn::parser::parse_info(&test_support::svn(&sub, &["info"]));
+        let expected_root = std::fs::canonicalize(&repo.wc).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&info.wc_root).unwrap(),
+            expected_root,
+            "svn info must report the working-copy root"
+        );
+        let info_root = info.wc_root.clone();
+        app.handle_async(AsyncSvnNotification::Info(Ok(info)));
+
+        assert_eq!(std::fs::canonicalize(&app.cwd).unwrap(), expected_root);
+        assert_eq!(
+            app.ignore.path(),
+            PathBuf::from(&info_root).join(".svnignore")
+        );
+        while app.pending > 0 {
+            let notif = rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("timed out waiting for the re-rooted status/log");
+            app.handle_async(notif);
+        }
+        assert_eq!(app.status.tree.status_char("Cargo.toml"), 'M');
+        assert_eq!(app.status.tree.status_char("src/main.rs"), 'M');
+    }
+
+    #[test]
+    fn quit_is_deferred_while_a_mutation_runs() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.perform_confirmed(ConfirmAction::Revert(vec!["Cargo.toml".to_string()]));
+        assert_eq!(app.pending_mutations, 1);
+
+        app.handle_input(&ts_key(KeyCode::Char('q'))).unwrap();
+        assert!(!app.quitting, "q must not quit during a mutation");
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+
+        let notif = recv(&rx);
+        app.handle_async(notif);
+        assert_eq!(app.pending_mutations, 0);
+        app.popups.clear();
+        app.handle_input(&ts_key(KeyCode::Char('q'))).unwrap();
+        assert!(app.quitting);
+    }
+
+    #[test]
+    fn ctrl_c_quits_like_q() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let ctrl_c = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_input(&ctrl_c).unwrap();
+        assert!(app.quitting);
     }
 
     #[test]
@@ -3184,7 +3321,12 @@ mod tests {
         // Esc/refresh cleared the search: a late search result must not
         // overwrite the fresh list
         app.log.clear_search();
-        app.handle_async(AsyncSvnNotification::Log(0, Ok(vec![log_entry(5, "five")])));
+        // A fresh plain-log request has an id allocated after the search;
+        // id 0 would be a pre-search request and is deliberately dropped.
+        app.handle_async(AsyncSvnNotification::Log(
+            999,
+            Ok(vec![log_entry(5, "five")]),
+        ));
         app.handle_async(AsyncSvnNotification::LogSearch {
             pattern: "other".into(),
             result: Ok(vec![log_entry(9, "stale")]),
@@ -4197,6 +4339,38 @@ mod tests {
         ));
         assert_eq!(app.log.entries[0].revision, 7);
         assert!(app.log.search_pattern().is_none());
+    }
+
+    #[test]
+    fn plain_log_issued_before_search_does_not_clear_it() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // Consume id 0 with a read request, so the full-history search gets
+        // id 1. A plain log result carrying id 0 was issued *before* the
+        // search and must not clear its state when it finishes late.
+        app.svn.status();
+        app.queue.push(InternalEvent::SearchLog("fix".into()));
+        app.handle_queue_events();
+        assert_eq!(app.log.search_pattern(), Some("fix"));
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "third")]),
+        ));
+        assert_eq!(
+            app.log.search_pattern(),
+            Some("fix"),
+            "a pre-search plain log must not clear the active search"
+        );
+        app.handle_async(AsyncSvnNotification::LogSearch {
+            pattern: "fix".into(),
+            result: Ok(vec![log_entry(9, "fix something")]),
+        });
+        assert_eq!(app.log.entries.len(), 1);
+        assert_eq!(app.log.entries[0].revision, 9);
+        // Drain the two real worker notifications (status + search) so the
+        // temporary repo is not dropped while they are still running.
+        let _ = rx.recv_timeout(Duration::from_secs(15));
+        let _ = rx.recv_timeout(Duration::from_secs(15));
     }
 
     #[test]

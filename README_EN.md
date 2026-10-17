@@ -47,12 +47,12 @@ Covers the most common daily SVN operations:
 | **Status view** | `svn status` rendered as a collapsible directory tree, with color-coded M/A/D/C/? states; `f` toggles a flat view (M/A/D files only, abbreviated paths with middle elision) |
 | **Branch info** | The status bar always shows the current branch; the commit confirmation popup shows the target branch and the files to be committed |
 | **Diff pane** | Selecting a file automatically shows its `svn diff` with line numbers and +/− highlighting; tabs are expanded to spaces (no arrow glyphs, like a browser's diff); a whitespace-only edit is shown with **background colours** — dark red on the removed side, dark green on the added side, with tab cells in a neutral grey so a tab never reads as spaces (no `·`-style glyphs for invisible characters); `w` shows only whitespace-only changes (file and hunk headers kept, the reading position is preserved); `f` shows the whole file — the working copy for a pending diff, the file **as of that revision** for a historical one (for multi-file diffs: the `Index:` section under the cursor; patch previews have no file), as a **full-context diff**: every line is there, added lines stay green and removed lines are inserted in red at their position; unversioned files show their content directly |
-| **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staged files/directories carry a green `*` in front of their name in the tree (a directory is marked once its whole subtree is staged), unstaged rows carry none; staging an unversioned file runs `svn add` automatically, staging a file/directory deleted from disk runs `svn rm` to schedule the deletion; committing with an empty set is rejected. The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
+| **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staged files/directories carry a green `*` in front of their name in the tree (a directory is marked once its whole subtree is staged), unstaged rows carry none; staging an unversioned file runs `svn add` automatically, staging a file/directory deleted from disk runs `svn rm` to schedule the deletion; committing with an empty set is rejected. Unstaging only removes paths from the commit set; an already executed `svn add` stays scheduled in SVN (use revert to undo it). The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
 | **Log view** | `svn log -v` revision list with changed paths and message details; scrolling to the bottom loads older revisions (paged, 50 at a time); `/` opens a search box (live-filters the loaded list while typing, Enter searches the full history with `svn log --search`, also paged); mark revisions with `space` and view a combined diff with `d`/`Enter` |
 | **File history** | `t` shows the selected file's `svn log` history; `Enter` in the popup opens that revision's diff, `b` opens its blame. Scrolling to the bottom loads older revisions (paged, 50 at a time), the title shows how many are loaded, and paging stops at the file's first revision |
 | **File finder** | `Ctrl+p` fzf-style fuzzy file search with highlighted matches; Enter jumps to the file's history, `Ctrl+b` opens its blame |
 | **Blame** | `svn blame` with per-revision coloring (status tree `b`, file-history popup `b`, file finder `Ctrl+b`); in the popup `j/k` moves the cursor line, `Enter` opens the diff of that line's revision |
-| **Revert** | `svn revert` (with confirmation) |
+| **Revert** | `svn revert` for the selection, or for the whole commit set when it is non-empty (with confirmation) |
 | **Update** | `svn update` and update-to-revision (`svn update -r N`), both confirmed; the confirmation shows the working-copy path being updated |
 | **Switch branch** | `s` opens a branch picker: it lists the repository's switch targets asynchronously (`^/trunk`, `^/branches/*`, `^/tags/*`, from `svn list`), and any URL or `^/path` can be typed instead; `↑/↓` picks from the list and `Enter` confirms an `svn switch` (local changes are kept, conflicts are postponed). The status and branch info refresh afterwards |
 | **Conflict resolution** | `svn resolve --accept=working` (with confirmation) |
@@ -73,8 +73,8 @@ cargo build --release
 
 # run inside an SVN working copy
 svnui
-# or point at a directory
-svnui /path/to/working-copy
+# or point at a directory inside one; svnui re-roots to the working-copy root
+svnui /path/to/working-copy/subdir
 ```
 
 Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are attached to every [GitHub Release](https://github.com/LiuYinCarl/svnui/releases).
@@ -83,7 +83,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 
 | Key | Action |
 | --- | --- |
-| `q` | Quit |
+| `q` / `Ctrl+C` | Quit (deferred while a working-copy mutation is running) |
 | `j` / `↓` / `k` / `↑` | Move selection |
 | `h` / `←` / `l` / `→` | Collapse / expand directory |
 | `g` / `G` | Jump to first / last entry |
@@ -91,7 +91,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `space` | Stage / unstage (toggle commit set) |
 | `A` / `U` | Stage all / unstage all |
 | `a` | `svn add` selected unversioned files |
-| `r` | `svn revert` selected files (confirmed) |
+| `r` | `svn revert` selected files; when the commit set is non-empty, revert the whole staged set (confirmed) |
 | `x` | Resolve conflict (accept working copy) |
 | `c` | Focus the commit message input |
 | `Enter` | Commit (inside the input) |
@@ -113,7 +113,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `i` | Repository overview (local info + remote HEAD comparison + change summary) |
 | `F5` / `R` | Refresh status / log / patch list / reload the open diff popup |
 | `P` | Save working-copy changes as a patch file (snapshot, no revert) |
-| `Tab` / `Shift+Tab` | Cycle pane focus within the tab (status: tree/diff/commit, log: list/details); use `1`/`2`/`3` to switch tabs |
+| `Tab` / `Shift+Tab` | Cycle pane focus within the tab (status: tree/diff/commit, log: list/details); in the commit input `Tab` opens the recent-message picker instead. Use `1`/`2`/`3` to switch tabs |
 | `1` / `2` / `3` / `4` | Status / log / patches / `.svnignore` editor tabs |
 | `Enter` / `d` | Log tab: diff of the selected (or marked) revisions |
 | `space` | Log tab: mark / unmark revision |

@@ -115,7 +115,10 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::End => is_key(ev, KeyCode::End) || is_key(ev, KeyCode::Char('G')),
         KeyAction::Enter => is_key(ev, KeyCode::Enter),
         KeyAction::Escape => is_key(ev, KeyCode::Esc),
-        KeyAction::Quit => is_key(ev, KeyCode::Char('q')),
+        KeyAction::Quit => {
+            is_key(ev, KeyCode::Char('q'))
+                || (ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL))
+        }
         KeyAction::ToggleStage => is_key(ev, KeyCode::Char(' ')),
         KeyAction::StageAll => is_key(ev, KeyCode::Char('A')),
         KeyAction::UnstageAll => is_key(ev, KeyCode::Char('U')),
@@ -222,7 +225,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 ),
                 KeyBinding::new(
                     "Tab / Shift+Tab",
-                    "Cycle pane focus (status: tree/diff/commit, log: list/details)",
+                    "Cycle pane focus (status: tree/diff/commit, log: list/details); in the commit input Tab opens history",
                 ),
                 KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
                 KeyBinding::new("P", "Save working-copy changes as a patch file (no revert)"),
@@ -233,7 +236,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("F5 / R", "Refresh status / log / patch list"),
                 KeyBinding::new("i", "Show repository / working-copy info (svn info)"),
                 KeyBinding::new("?", "Show this help"),
-                KeyBinding::new("q", "Quit svnui"),
+                KeyBinding::new(
+                    "q / Ctrl+C",
+                    "Quit svnui (Ctrl+C is ignored during working-copy mutations)",
+                ),
             ],
         },
         KeyGroup {
@@ -246,7 +252,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("space", "Stage / unstage (toggle commit set)"),
                 KeyBinding::new("A / U", "Stage all changes / unstage all"),
                 KeyBinding::new("a", "Add selected files (svn add)"),
-                KeyBinding::new("r", "Revert selected files (svn revert)"),
+                KeyBinding::new(
+                    "r",
+                    "Revert selected files (or the whole staged set; svn revert)",
+                ),
                 KeyBinding::new("x", "Resolve conflict (accept working copy)"),
                 KeyBinding::new("Enter / d", "Diff of the selected file"),
                 KeyBinding::new("b", "Blame file (svn blame)"),
@@ -309,6 +318,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "Ctrl+d / Ctrl+u",
                     "File history popup: scroll commit message",
                 ),
+                KeyBinding::new("j / k", "Message popup: scroll a long error"),
                 KeyBinding::new("Esc", "Close popup / cancel / clear search highlights"),
             ],
         },
@@ -482,6 +492,10 @@ mod tests {
         // Alt+letter must not trigger bare-letter actions
         let alt_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT);
         assert!(!key_match(&alt_q, KeyAction::Quit));
+        // Ctrl+C also quits (raw mode turns it into a key, not SIGINT)
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(key_match(&ctrl_c, KeyAction::Quit));
+        assert!(!key_match(&ctrl_c, KeyAction::Commit));
         let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
         assert!(!key_match(&alt_c, KeyAction::Commit));
         // Ctrl+Enter / Alt+Enter must not commit

@@ -246,9 +246,10 @@ impl StatusTreeComponent {
 
     /// Whether any of the given paths is a directory with a status entry.
     pub fn any_dir(&self, paths: &[String]) -> bool {
+        let by_path = self.entries_by_path();
         paths
             .iter()
-            .any(|p| self.entry_for_path(p).is_some_and(|e| e.is_dir))
+            .any(|p| by_path.get(p.as_str()).is_some_and(|e| e.is_dir))
     }
 
     /// Expand commit target paths so svn accepts and completes the commit:
@@ -291,13 +292,32 @@ impl StatusTreeComponent {
                 }
                 ancestor = parent;
             }
-            if by_path.get(p.as_str()).copied().is_some_and(is_added_dir) {
-                let prefix = format!("{p}/");
-                for e in &self.entries {
-                    if e.status == 'A' && e.path.starts_with(&prefix) && seen.insert(e.path.clone())
-                    {
-                        out.push(e.path.clone());
+        }
+        // Expand scheduled-add descendants only for scheduled-add dirs that
+        // were actually in the staged set (not for ancestors pulled in
+        // above). A single pass over entries keeps this linear:
+        let dir_targets: HashSet<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| by_path.get(*p).copied().is_some_and(is_added_dir))
+            .collect();
+        if !dir_targets.is_empty() {
+            for e in &self.entries {
+                if e.status != 'A' {
+                    continue;
+                }
+                let mut ancestor = e.path.as_str();
+                let under_target = loop {
+                    let Some((parent, _)) = ancestor.rsplit_once('/') else {
+                        break false;
+                    };
+                    if dir_targets.contains(parent) {
+                        break true;
                     }
+                    ancestor = parent;
+                };
+                if under_target && seen.insert(e.path.clone()) {
+                    out.push(e.path.clone());
                 }
             }
         }
@@ -566,17 +586,19 @@ impl StatusTreeComponent {
             let mut needs_remove = Vec::new();
             let mut skipped = 0usize;
             for e in &self.entries {
-                if e.is_dir && e.status != '!' {
-                    continue;
-                }
                 if !stageable(e) {
                     skipped += 1;
                     continue;
                 }
-                match e.status {
-                    '?' => needs_add.push(e.path.clone()),
-                    '!' => needs_remove.push(e.path.clone()),
-                    _ => {}
+                // Directories have their own status entries too (unversioned
+                // new dirs, prop-only changes, scheduled adds/deletes). They
+                // must be staged as well: in particular `? newdir` has no
+                // child entries yet, so skipping it would silently omit the
+                // whole new tree from "stage all".
+                if e.status == '?' {
+                    needs_add.push(e.path.clone());
+                } else if e.status == '!' {
+                    needs_remove.push(e.path.clone());
                 }
                 all.push(e.path.clone());
             }
@@ -635,7 +657,11 @@ impl StatusTreeComponent {
                 ));
             }
         } else if key_match(k, KeyAction::ResolveConflict) {
-            if let Some(e) = self.selection_entry()
+            // Directories can carry tree conflicts too, but they have no
+            // `selection_entry` (only files do). Look the selected path up
+            // in the entry list instead.
+            let entry = self.selection_path().and_then(|p| self.entry_for_path(&p));
+            if let Some(e) = entry
                 && e.is_conflicted()
             {
                 self.ctx
@@ -1410,6 +1436,15 @@ mod interaction_tests {
         ))
         .unwrap();
         assert!(q2.pop().is_none());
+        // Directories can carry tree conflicts too; they have no
+        // selection_entry(), but must still be resolvable.
+        let (mut c3, q3) = comp_with(vec![dir_entry('C', "conflict-dir")]);
+        c3.event(&key(KeyCode::Char('x'))).unwrap();
+        assert!(matches!(
+            q3.pop(),
+            Some(InternalEvent::Confirm(crate::queue::ConfirmAction::Resolve(p)))
+                if p == "conflict-dir"
+        ));
     }
 
     #[test]
@@ -1418,13 +1453,16 @@ mod interaction_tests {
             entry('M', "a.txt"),
             entry('?', "new.txt"),
             entry('M', "dir/b.txt"),
+            dir_entry('?', "newdir"),
         ]);
-        // A stages everything; unversioned files are svn-added
+        // A stages everything, including unversioned directories
         c.event(&key(KeyCode::Char('A'))).unwrap();
-        assert_eq!(c.staged_count(), 3);
+        assert_eq!(c.staged_count(), 4);
+        assert!(c.staged.contains("newdir"));
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::AddFiles(paths)) if paths == vec!["new.txt".to_string()]
+            Some(InternalEvent::AddFiles(paths))
+                if paths == vec!["new.txt".to_string(), "newdir".to_string()]
         ));
         // U clears the commit set
         c.event(&key(KeyCode::Char('U'))).unwrap();
@@ -2412,6 +2450,25 @@ mod perf_tests {
             t.elapsed() < Duration::from_secs(5),
             "tree toggle back(100k) took {:?}",
             t.elapsed()
+        );
+    }
+
+    /// Commit confirmation expands the staged set and looks up every target's
+    /// status. Both used to be O(n^2) through `entry_for_path`; on a 100k
+    /// working copy that froze the UI for minutes.
+    #[test]
+    fn perf_commit_expansion_100k() {
+        let (mut c, _q) = comp();
+        let entries = ts::gen_status_entries(100_000, true);
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        c.update(entries);
+        let t = Instant::now();
+        let targets = c.expanded_commit_targets(&paths);
+        let el = t.elapsed();
+        assert_eq!(targets.len(), 100_000);
+        assert!(
+            el < Duration::from_secs(5),
+            "commit expansion/status lookup over 100k files took {el:?}; O(n^2) regression?"
         );
     }
 }

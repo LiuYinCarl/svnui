@@ -268,14 +268,24 @@ fn list_patch_files(dir: &Path) -> Vec<PatchFile> {
     let mut out: Vec<PatchFile> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
+            // DirEntry::file_type() does not follow symlinks. Only real
+            // .patch files belong to this tab; allowing every regular file
+            // in a user-supplied SVNUI_PATCH_DIR made `d` a footgun.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.to_ascii_lowercase().ends_with(".patch") {
+                continue;
+            }
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            if !meta.is_file() {
-                continue;
-            }
             out.push(PatchFile {
-                name: entry.file_name().to_string_lossy().into_owned(),
+                name,
                 path: entry.path(),
                 size: meta.len(),
                 modified: meta.modified().ok(),
@@ -465,6 +475,9 @@ mod tests {
         write_patch(&dir, "a.patch", "a");
         write_patch(&dir, "b.patch", "bb");
         write_patch(&dir, "c.patch", "ccc");
+        // Non-patch files must not show up (and therefore cannot be
+        // deleted by mistake from a user-supplied SVNUI_PATCH_DIR).
+        write_patch(&dir, "notes.txt", "not a patch");
         // a subdirectory is not a patch file
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
         // pin the mtimes (filesystem timestamps are too coarse to rely on
@@ -484,6 +497,7 @@ mod tests {
         // the directory read itself returns the entries newest first
         let names: Vec<&str> = comp.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["b.patch", "a.patch", "c.patch"], "{names:?}");
+        assert!(!names.contains(&"notes.txt"));
         // same mtime: the name-descending tiebreak decides
         set_mtime("c.patch", 300);
         comp.refresh();
