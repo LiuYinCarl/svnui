@@ -13,12 +13,15 @@
   代码里绝不能出现 `git` 命令或 git 语义（索引、HEAD、rebase 等）。
 - SVN **没有暂存区**。"暂存"被实现为**提交集**（`StatusTreeComponent::staged: HashSet<String>`）：
   只有加入提交集的路径才会随下一次 `svn commit` 提交；未版本化（`?`）文件暂存时自动
-  `svn add`；提交集为空时拒绝提交（确认弹窗前与 `perform_confirmed` 双重拦截）。
+  `svn add`；缺失（`!`）文件/目录暂存时自动 `svn rm` 调度删除（否则 `svn commit` 会静默
+  跳过缺失路径，删除永远进不了版本库）；提交集为空时拒绝提交（确认弹窗前与
+  `perform_confirmed` 双重拦截）。
   提交集含目录路径时 commit 自动带 `--depth empty`（按扩展后的提交目标判定），目录 target
   只提交自身改动、不递归卷入未列出的子孙；提交前 `expand_commit_paths()` 会扩展目标：
   拉入新增（A）祖先目录（否则 svn 报 E200009），并把"新增目录 target"展开为其新增子孙
-  （否则 --depth empty 会提交空目录、把子文件留在工作副本）；`svn add` 失败的路径会从
-  提交集回滚（`unstage_paths()`）。
+  （否则 --depth empty 会提交空目录、把子文件留在工作副本）；`svn add` / `svn rm` 失败
+  的路径会从提交集回滚（`unstage_paths()`）。缺失目录可整树暂存：`svn rm` 会把整棵子树
+  调度为 D，目录 target 的 `--depth empty` 提交会连同子孙删除一起入库（验证于 svn 1.15.0）。
 - 状态树支持 `.svnignore`（工作副本根目录，.gitignore 语法，见 `src/ignore_filter.rs`）：
   命中的条目不展示也不可操作，标题栏显示 `[N hidden by .svnignore]` 提示；`4` 键打开
   内置编辑器标签页（`ignore_editor.rs`），带实时语法检查。
@@ -179,6 +182,10 @@ cargo fmt --all --check     # 格式门禁
   无效的 `@xxx` 后缀当普通路径处理，所以 diff 不传 peg（验证于 svn 1.14.5）。
 - `svn commit -m "docs"` 这类"像路径"的消息会报 E205005，需要 `--force-log` 或用更长文本。
 - `svn revert` 一个刚 add 的文件：取消 add，文件留在磁盘上（变成 `?`）。
+- `svn commit` 对缺失（`!`）目标**静默跳过**，不报错也不删除——提交删除必须先 `svn rm`
+  调度。`svn rm` 对缺失文件/目录（含整棵子树，重叠的 dir+child target 也接受）以及
+  "add 后又被从磁盘删掉"的文件（直接撤销 add）都成立；`svn status` 会把整棵被删目录
+  折叠成目录自身的一行 `D`（验证于 svn 1.15.0）。
 - `svn patch` 已验证（svn 1.14.5）同时接受 `--` 分隔与补丁路径尾部空 peg——补丁文件名
   以 `-` 开头或含尾部 `@` 后缀（如 `fix@HEAD.patch`）时也不会误解析，`apply_patch` 两个都带。
 

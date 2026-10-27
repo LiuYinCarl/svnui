@@ -157,8 +157,11 @@ impl StatusTreeComponent {
     ///
     /// Dir-toggle semantics: if anything stageable under the selection is
     /// unstaged, stage it all (complete, don't invert); only when everything
-    /// is staged does the toggle unstage. Missing ('!'), obstructed ('~')
-    /// and conflicted entries cannot be committed and are never staged.
+    /// is staged does the toggle unstage. Obstructed ('~') and conflicted
+    /// entries cannot be committed and are never staged. Missing ('!')
+    /// entries are staged too — staging them queues an `svn rm` so the
+    /// deletion is scheduled and can be committed (see the ToggleStage
+    /// handler).
     pub fn toggle_stage_at_selection(&mut self) -> (Vec<String>, Vec<String>) {
         let paths = self.paths_at_selection();
         if paths.is_empty() {
@@ -185,7 +188,7 @@ impl StatusTreeComponent {
         }
         if stageable_paths.is_empty() {
             self.ctx.queue.push(InternalEvent::ShowInfoMsg(
-                "Nothing stageable here (missing/obstructed/conflicted files must be fixed first)"
+                "Nothing stageable here (obstructed/conflicted files must be fixed first)"
                     .to_string(),
             ));
             return (Vec::new(), Vec::new());
@@ -534,24 +537,45 @@ impl StatusTreeComponent {
                 if !needs_add.is_empty() {
                     self.ctx.queue.push(InternalEvent::AddFiles(needs_add));
                 }
+                // Missing paths must be scheduled for deletion before they
+                // can be committed: `svn commit` silently skips a missing
+                // target, so without `svn rm` the deletion would never be
+                // recorded. A failed remove rolls the paths back out of
+                // the commit set (same contract as AddFiles).
+                let needs_remove: Vec<String> = added
+                    .iter()
+                    .filter(|p| by_path.get(p.as_str()).is_some_and(|e| e.status == '!'))
+                    .cloned()
+                    .collect();
+                if !needs_remove.is_empty() {
+                    self.ctx
+                        .queue
+                        .push(InternalEvent::RemoveFiles(needs_remove));
+                }
             }
         } else if key_match(k, KeyAction::StageAll) {
             // One pass over the entries: no per-path lookups, and files svn
-            // cannot commit (missing/obstructed/conflicted) are skipped so
-            // the next commit does not fail wholesale.
+            // cannot commit (obstructed/conflicted) are skipped so the
+            // next commit does not fail wholesale. Missing entries are
+            // staged and scheduled for deletion (dirs too — without the
+            // dir target its deletion would stay uncommittable, and `svn
+            // rm` on a missing dir schedules its whole subtree anyway).
             let mut all = Vec::new();
             let mut needs_add = Vec::new();
+            let mut needs_remove = Vec::new();
             let mut skipped = 0usize;
             for e in &self.entries {
-                if e.is_dir {
+                if e.is_dir && e.status != '!' {
                     continue;
                 }
                 if !stageable(e) {
                     skipped += 1;
                     continue;
                 }
-                if e.status == '?' {
-                    needs_add.push(e.path.clone());
+                match e.status {
+                    '?' => needs_add.push(e.path.clone()),
+                    '!' => needs_remove.push(e.path.clone()),
+                    _ => {}
                 }
                 all.push(e.path.clone());
             }
@@ -559,9 +583,14 @@ impl StatusTreeComponent {
             if !needs_add.is_empty() {
                 self.ctx.queue.push(InternalEvent::AddFiles(needs_add));
             }
+            if !needs_remove.is_empty() {
+                self.ctx
+                    .queue
+                    .push(InternalEvent::RemoveFiles(needs_remove));
+            }
             if skipped > 0 {
                 self.ctx.queue.push(InternalEvent::ShowInfoMsg(format!(
-                    "Skipped {skipped} missing/obstructed/conflicted file(s)"
+                    "Skipped {skipped} obstructed/conflicted file(s)"
                 )));
             }
         } else if key_match(k, KeyAction::UnstageAll) {
@@ -679,11 +708,12 @@ impl StatusTreeComponent {
     }
 }
 
-/// Whether an entry can be committed as-is. Missing ('!') and obstructed
-/// ('~') files make `svn commit` fail wholesale; conflicted files must be
-/// resolved first.
+/// Whether an entry can be committed. Obstructed ('~') files make
+/// `svn commit` fail wholesale and conflicted files must be resolved
+/// first. Missing ('!') entries are committable once `svn rm` has
+/// scheduled their deletion, which staging arranges (see ToggleStage).
 fn stageable(e: &StatusEntry) -> bool {
-    !matches!(e.status, '!' | '~') && !e.is_conflicted()
+    !matches!(e.status, '~') && !e.is_conflicted()
 }
 
 /// Status char shown for an entry: a tree conflict dominates, then the
@@ -1731,8 +1761,8 @@ mod interaction_tests {
     }
 
     #[test]
-    fn missing_obstructed_conflicted_files_are_not_staged() {
-        for status in ['!', '~', 'C'] {
+    fn obstructed_conflicted_files_are_not_staged() {
+        for status in ['~', 'C'] {
             let (mut c, q) = comp_with(vec![entry(status, "bad.txt")]);
             c.event(&key(KeyCode::Char(' '))).unwrap();
             assert!(c.staged.is_empty(), "status {status} must not stage");
@@ -1749,13 +1779,47 @@ mod interaction_tests {
         let (mut c, _q) = comp_with(vec![entry('M', "f.txt")]);
         c.event(&key(KeyCode::Char(' '))).unwrap();
         assert!(c.staged.contains("f.txt"));
-        c.update(vec![entry('!', "f.txt")]);
+        c.update(vec![entry('~', "f.txt")]);
         c.event(&key(KeyCode::Char(' '))).unwrap();
         assert!(c.staged.is_empty());
     }
 
+    /// A missing file is staged like any other change; staging queues the
+    /// `svn rm` that schedules the deletion so a commit can record it.
     #[test]
-    fn stage_all_skips_missing_obstructed_conflicted() {
+    fn missing_file_stages_and_requests_remove() {
+        let (mut c, q) = comp_with(vec![entry('!', "gone.txt")]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("gone.txt"));
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RemoveFiles(paths)) if paths == vec!["gone.txt".to_string()]
+        ));
+        // unstaging does not queue another remove
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.is_empty());
+        assert!(q.pop().is_none());
+    }
+
+    /// A missing directory stages its own entry plus the descendant file
+    /// entries and queues one `svn rm` batch for all of them.
+    #[test]
+    fn missing_dir_stages_subtree_and_requests_remove() {
+        let (mut c, q) = comp_with(vec![dir_entry('!', "docs"), entry('!', "docs/readme.md")]);
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("docs"));
+        assert!(c.staged.contains("docs/readme.md"));
+        match q.pop() {
+            Some(InternalEvent::RemoveFiles(paths)) => {
+                assert!(paths.contains(&"docs".to_string()), "{paths:?}");
+                assert!(paths.contains(&"docs/readme.md".to_string()), "{paths:?}");
+            }
+            other => panic!("expected RemoveFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage_all_stages_missing_and_skips_obstructed_conflicted() {
         let (mut c, q) = comp_with(vec![
             entry('M', "ok.txt"),
             entry('!', "missing.txt"),
@@ -1763,9 +1827,37 @@ mod interaction_tests {
             entry('C', "conflicted.txt"),
         ]);
         c.event(&key(KeyCode::Char('A'))).unwrap();
-        assert_eq!(c.staged_count(), 1);
+        assert_eq!(c.staged_count(), 2);
         assert!(c.staged.contains("ok.txt"));
+        assert!(c.staged.contains("missing.txt"));
+        // the missing path is scheduled for deletion, then the skip note
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::RemoveFiles(paths)) if paths == vec!["missing.txt".to_string()]
+        ));
         assert!(matches!(q.pop(), Some(InternalEvent::ShowInfoMsg(_))));
+    }
+
+    /// A missing directory is included by stage-all: without the dir
+    /// target its deletion could never be committed, and `svn rm` on the
+    /// dir schedules the whole subtree anyway.
+    #[test]
+    fn stage_all_includes_missing_dirs() {
+        let (mut c, q) = comp_with(vec![
+            dir_entry('!', "docs"),
+            entry('!', "docs/readme.md"),
+            entry('M', "ok.txt"),
+        ]);
+        c.event(&key(KeyCode::Char('A'))).unwrap();
+        assert_eq!(c.staged_count(), 3);
+        assert!(c.staged.contains("docs"));
+        match q.pop() {
+            Some(InternalEvent::RemoveFiles(paths)) => {
+                assert!(paths.contains(&"docs".to_string()), "{paths:?}");
+                assert!(paths.contains(&"docs/readme.md".to_string()), "{paths:?}");
+            }
+            other => panic!("expected RemoveFiles, got {other:?}"),
+        }
     }
 
     #[test]

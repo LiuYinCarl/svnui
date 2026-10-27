@@ -47,7 +47,7 @@ Covers the most common daily SVN operations:
 | **Status view** | `svn status` rendered as a collapsible directory tree, with color-coded M/A/D/C/? states; `f` toggles a flat view (M/A/D files only, abbreviated paths with middle elision) |
 | **Branch info** | The status bar always shows the current branch; the commit confirmation popup shows the target branch and the files to be committed |
 | **Diff pane** | Selecting a file automatically shows its `svn diff` with line numbers and +/− highlighting; unversioned files show their content directly |
-| **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staging an unversioned file runs `svn add` automatically; committing with an empty set is rejected. The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
+| **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staging an unversioned file runs `svn add` automatically, staging a file/directory deleted from disk runs `svn rm` to schedule the deletion; committing with an empty set is rejected. The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
 | **Log view** | `svn log -v` revision list with changed paths and message details; scrolling to the bottom loads older revisions (paged, 50 at a time); `/` opens a search box (live-filters the loaded list while typing, Enter searches the full history with `svn log --search`, also paged); mark revisions with `space` and view a combined diff with `d`/`Enter` |
 | **File history** | `t` shows the selected file's `svn log` history; `Enter` in the popup opens that revision's diff, `b` opens its blame |
 | **File finder** | `Ctrl+p` fzf-style fuzzy file search with highlighted matches; Enter jumps to the file's history, `Ctrl+b` opens its blame |
@@ -164,7 +164,7 @@ The architecture follows gitui:
 - `src/popups/` — confirm, message, output viewer, fullscreen diff, etc. (gitui's `popups/`)
 - `src/keys.rs` — central key-binding definitions (gitui's `keys/`)
 
-SVN has no staging area like git, so "staging" is implemented as a **commit set**: the files marked to go into the next commit; staging an unversioned file runs `svn add` automatically; committing with an empty set is rejected.
+SVN has no staging area like git, so "staging" is implemented as a **commit set**: the files marked to go into the next commit; staging an unversioned file runs `svn add` automatically; staging a missing (`!`) file/directory deleted from disk runs `svn rm` to schedule the deletion — otherwise `svn commit` would silently skip it and the deletion could never be recorded; committing with an empty set is rejected.
 
 ## Testing
 

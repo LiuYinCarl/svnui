@@ -109,6 +109,9 @@ pub struct App {
     /// notifications arrive in issue order); a failed add un-stages its
     /// paths so they cannot poison the next commit
     pending_adds: std::collections::VecDeque<Vec<String>>,
+    /// FIFO of `svn rm` batches in flight, mirroring `pending_adds`; a
+    /// failed remove un-stages its paths the same way
+    pending_removes: std::collections::VecDeque<Vec<String>>,
 }
 
 impl App {
@@ -139,6 +142,7 @@ impl App {
             last_status_id: 0,
             last_log_id: 0,
             pending_adds: std::collections::VecDeque::new(),
+            pending_removes: std::collections::VecDeque::new(),
         }
     }
 
@@ -460,6 +464,16 @@ impl App {
                     // (mutations run serialized: results arrive in order)
                     self.pending_adds.push_back(paths.clone());
                     self.svn.add(&paths);
+                    self.pending += 1;
+                }
+            }
+            InternalEvent::RemoveFiles(paths) => {
+                if !paths.is_empty() {
+                    // remembered so a failed remove can un-stage its
+                    // paths (mutations run serialized: results arrive
+                    // in order)
+                    self.pending_removes.push_back(paths.clone());
+                    self.svn.remove(&paths);
                     self.pending += 1;
                 }
             }
@@ -1085,6 +1099,22 @@ impl App {
                     let paths = self.pending_adds.pop_front().unwrap_or_default();
                     self.status.unset_staged(&paths);
                     self.show_error(format!("svn add: {e}"));
+                }
+            },
+            AsyncSvnNotification::Remove(result) => match result {
+                Ok(_) => {
+                    self.pending_removes.pop_front();
+                    // no set_staged write-back, as on Add
+                    self.show_info(MSG.remove_done.to_string());
+                    self.refresh_after_op();
+                }
+                Err(e) => {
+                    // roll the failed paths out of the commit set, as on
+                    // Add: left staged, a path svn would not delete
+                    // would poison the next commit
+                    let paths = self.pending_removes.pop_front().unwrap_or_default();
+                    self.status.unset_staged(&paths);
+                    self.show_error(format!("svn rm: {e}"));
                 }
             },
             AsyncSvnNotification::Revert(result) => match result {
@@ -3408,6 +3438,118 @@ mod tests {
         app.log.event(&ts_key(KeyCode::End)).unwrap();
         app.handle_queue_events();
         assert!(matches!(recv(&rx), AsyncSvnNotification::LogAppend { .. }));
+    }
+
+    #[test]
+    fn failed_remove_unstages_the_failed_paths() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.status.set_staged(&["ghost.txt".into()]);
+        app.queue
+            .push(InternalEvent::RemoveFiles(vec!["ghost.txt".into()]));
+        app.handle_queue_events();
+        // the real svn rm fails (the path is not under version control)
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Remove(Err(_))));
+        app.handle_async(AsyncSvnNotification::Remove(Err("svn: E200005".into())));
+        // the failed paths are rolled out of the commit set
+        assert_eq!(app.status.tree.staged_count(), 0);
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    /// A versioned file deleted from disk (status `!`) can be staged:
+    /// staging schedules the deletion via `svn rm`, so the commit records
+    /// it instead of silently skipping the missing path.
+    #[test]
+    fn commit_with_staged_missing_file_deletes_it() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        std::fs::remove_file(repo.wc.join("Cargo.toml")).unwrap();
+        let missing = StatusEntry {
+            status: '!',
+            props_status: ' ',
+            tree_conflict: ' ',
+            path: "Cargo.toml".into(),
+            is_dir: false,
+        };
+        app.handle_async(AsyncSvnNotification::Status(0, Ok(vec![missing])));
+        app.status.set_staged(&["Cargo.toml".into()]);
+        app.queue
+            .push(InternalEvent::RemoveFiles(vec!["Cargo.toml".into()]));
+        app.handle_queue_events();
+        // the status update also triggered a diff preview for the selected
+        // file (read-only worker): skip notifications until the remove
+        loop {
+            match recv(&rx) {
+                AsyncSvnNotification::Remove(Ok(_)) => break,
+                AsyncSvnNotification::Diff { .. } => continue,
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        app.perform_confirmed(ConfirmAction::Commit {
+            message: "delete Cargo.toml".into(),
+            paths: vec![],
+        });
+        loop {
+            match recv(&rx) {
+                AsyncSvnNotification::Commit(Ok(_)) => break,
+                AsyncSvnNotification::Diff { .. } => continue,
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        let out = repo.svn(&["status"]);
+        assert!(out.trim().is_empty(), "{out}");
+        // the deletion reached the repository
+        let ls = repo.svn(&["list", "-R", ".@HEAD"]);
+        assert!(!ls.contains("Cargo.toml"), "{ls}");
+    }
+
+    /// A missing directory tree commits its deletion when the directory
+    /// itself is a commit target (`--depth empty` still carries the
+    /// scheduled child deletions along with the directory's own).
+    #[test]
+    fn commit_with_staged_missing_dir_deletes_the_tree() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        std::fs::remove_dir_all(repo.wc.join("docs")).unwrap();
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![
+                StatusEntry {
+                    status: '!',
+                    props_status: ' ',
+                    tree_conflict: ' ',
+                    path: "docs".into(),
+                    is_dir: true,
+                },
+                StatusEntry {
+                    status: '!',
+                    props_status: ' ',
+                    tree_conflict: ' ',
+                    path: "docs/readme.md".into(),
+                    is_dir: false,
+                },
+            ]),
+        ));
+        app.status
+            .set_staged(&["docs".into(), "docs/readme.md".into()]);
+        app.queue.push(InternalEvent::RemoveFiles(vec![
+            "docs".into(),
+            "docs/readme.md".into(),
+        ]));
+        app.handle_queue_events();
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Remove(Ok(_))));
+        app.perform_confirmed(ConfirmAction::Commit {
+            message: "delete docs".into(),
+            paths: vec![],
+        });
+        match recv(&rx) {
+            AsyncSvnNotification::Commit(Ok(_)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let out = repo.svn(&["status"]);
+        assert!(out.trim().is_empty(), "{out}");
+        let ls = repo.svn(&["list", "-R", ".@HEAD"]);
+        assert!(!ls.contains("docs"), "{ls}");
     }
 
     #[test]

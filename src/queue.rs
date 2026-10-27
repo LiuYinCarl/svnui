@@ -60,6 +60,8 @@ pub enum InternalEvent {
     RefreshStatus,
     /// Run svn add on the given paths
     AddFiles(Vec<String>),
+    /// Run svn rm on the given paths (schedule deletion of missing files)
+    RemoveFiles(Vec<String>),
     /// Request a diff of the currently selected file (fullscreen)
     RequestFileDiff,
     /// Request blame of a file (path relative to the working copy root)

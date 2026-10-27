@@ -77,6 +77,8 @@ pub enum AsyncSvnNotification {
     Update(Result<String, String>),
     Commit(Result<String, String>),
     Add(Result<Vec<String>, String>),
+    /// `svn rm` of missing (`!`) paths: schedules their deletion
+    Remove(Result<Vec<String>, String>),
     Revert(Result<Vec<String>, String>),
     Resolve(Result<String, String>),
     /// Working copy updated to a specific revision (svn update -r N)
@@ -551,6 +553,27 @@ impl Svn {
                 AsyncSvnNotification::Add(result)
             },
             |e| AsyncSvnNotification::Add(Err(e)),
+        );
+    }
+
+    /// Schedule deletion of versioned paths that are gone from disk (`!`
+    /// in status), so they can be committed. `svn rm` accepts missing
+    /// files and directories (a directory's children are scheduled with
+    /// it), and it also just unschedules a file that was added and then
+    /// deleted again. Without this step `svn commit` silently skips the
+    /// missing paths, so the deletion would never be recorded.
+    pub fn remove(&self, paths: &[String]) {
+        let cwd = self.cwd.clone();
+        let paths = paths.to_vec();
+        self.spawn_mutating(
+            move || {
+                let mut args: Vec<String> = vec!["rm".into(), "--".into()];
+                args.extend(paths.iter().map(|p| Self::peg(p)));
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let result = Self::run_in(&cwd, &arg_refs).map(|_| paths.clone());
+                AsyncSvnNotification::Remove(result)
+            },
+            |e| AsyncSvnNotification::Remove(Err(e)),
         );
     }
 
@@ -1435,6 +1458,46 @@ mod tests {
         let (tx, rx) = unbounded();
         Svn::new(repo.wc.clone(), tx).add(&["Cargo.toml".to_string()]);
         assert!(matches!(recv(&rx), AsyncSvnNotification::Add(Err(_))));
+    }
+
+    /// A versioned file deleted from disk (status `!`) is skipped silently
+    /// by `svn commit`; `svn rm` schedules its deletion so it can be
+    /// committed.
+    #[test]
+    fn remove_missing_file_schedules_deletion() {
+        let Some(repo) = TestRepo::new() else { return };
+        std::fs::remove_file(repo.wc.join("Cargo.toml")).unwrap();
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).remove(&["Cargo.toml".to_string()]);
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::Remove(Ok(paths)) if paths == vec!["Cargo.toml"]
+        ));
+        let st = repo.svn(&["status"]);
+        assert!(st.starts_with('D'), "{st}");
+    }
+
+    /// `svn rm` of a missing directory schedules the whole subtree, and
+    /// overlapping dir + child targets (what the staged set contains when
+    /// a missing directory is staged) are accepted. Status folds the
+    /// deleted tree into the directory's single `D` entry.
+    #[test]
+    fn remove_missing_dir_schedules_the_whole_tree() {
+        let Some(repo) = TestRepo::new() else { return };
+        std::fs::remove_dir_all(repo.wc.join("docs")).unwrap();
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).remove(&["docs".to_string(), "docs/readme.md".to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Remove(Ok(_))));
+        let st = repo.svn(&["status"]);
+        assert_eq!(st, "D       docs\n", "{st}");
+    }
+
+    #[test]
+    fn remove_unversioned_path_errors() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).remove(&["nosuch.txt".to_string()]);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Remove(Err(_))));
     }
 
     /// A panicking worker must still deliver exactly one notification;
