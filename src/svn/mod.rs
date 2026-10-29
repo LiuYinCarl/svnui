@@ -52,6 +52,14 @@ pub enum AsyncSvnNotification {
         path: String,
         result: Result<Vec<LogEntry>, String>,
     },
+    /// Older revisions appended to a file's history (pagination);
+    /// `before_rev` is the oldest revision loaded when the request was
+    /// issued (correlation, as on `LogAppend`)
+    FileLogAppend {
+        path: String,
+        before_rev: u64,
+        result: Result<Vec<LogEntry>, String>,
+    },
     /// All versioned files in the working copy (`svn list -R`)
     ListFiles(Result<Vec<String>, String>),
     RevisionDiff {
@@ -356,7 +364,8 @@ impl Svn {
         );
     }
 
-    /// `svn log` restricted to a single file (its history).
+    /// `svn log` restricted to a single file (its history), newest page
+    /// first. Older pages are fetched by [`Svn::file_log_more`].
     pub fn file_log(&self, path: &str, limit: usize) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
@@ -382,6 +391,45 @@ impl Svn {
             },
             move |e| AsyncSvnNotification::FileLog {
                 path: err_path,
+                result: Err(e),
+            },
+        );
+    }
+
+    /// Older revisions of a single file's history (pagination for the
+    /// file-history popup): everything below `before_rev`.
+    pub fn file_log_more(&self, path: &str, before_rev: u64, limit: usize) {
+        let cwd = self.cwd.clone();
+        let path = path.to_string();
+        let err_path = path.clone();
+        self.spawn(
+            move || {
+                let pegged = Self::peg(&path);
+                // saturating like log_more: before_rev 0/1 mean "0:0"
+                let range = format!("{}:0", before_rev.saturating_sub(1));
+                let result = Self::run_in(
+                    &cwd,
+                    &[
+                        "log",
+                        "-v",
+                        "-r",
+                        &range,
+                        "-l",
+                        &limit.to_string(),
+                        "--",
+                        &pegged,
+                    ],
+                )
+                .map(|out| parser::parse_log(&out));
+                AsyncSvnNotification::FileLogAppend {
+                    path,
+                    before_rev,
+                    result,
+                }
+            },
+            move |e| AsyncSvnNotification::FileLogAppend {
+                path: err_path,
+                before_rev,
                 result: Err(e),
             },
         );
@@ -1059,6 +1107,64 @@ mod tests {
                 );
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_log_more_pages_older_revisions_of_one_file() {
+        let Some(repo) = TestRepo::new() else { return };
+        // a second file changes too: the path filter must still apply to
+        // the older page, otherwise sibling revisions would leak in
+        for (i, msg) in [(2, "bump cargo"), (3, "touch other")] {
+            test_support::write_file(
+                &repo
+                    .wc
+                    .join(if i == 2 { "Cargo.toml" } else { "other.txt" }),
+                &format!("v{i}\n"),
+            );
+            if i == 3 {
+                repo.svn(&["add", "other.txt"]);
+            }
+            repo.svn(&["commit", "-m", msg]);
+        }
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        // everything older than r2 that touched Cargo.toml: just r1
+        c.file_log_more("Cargo.toml", 2, 50);
+        match recv(&rx) {
+            AsyncSvnNotification::FileLogAppend {
+                path,
+                before_rev: 2,
+                result,
+            } => {
+                assert_eq!(path, "Cargo.toml");
+                let entries = result.unwrap();
+                assert_eq!(entries.len(), 1, "{entries:?}");
+                assert_eq!(entries[0].revision, 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// Below r2 there is nothing: `svn log -r 0:0 -- <path>` fails with
+    /// E195012 instead of returning an empty page (unlike the repo-wide
+    /// `log_more`, which yields an empty result). The popup never asks
+    /// that low (`oldest > 1` guard) and treats E195012 as end of
+    /// history.
+    #[test]
+    fn file_log_more_below_revision_two_is_end_of_history() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        for before_rev in [0, 1] {
+            c.file_log_more("Cargo.toml", before_rev, 50);
+            match recv(&rx) {
+                AsyncSvnNotification::FileLogAppend { result, .. } => {
+                    let err = result.expect_err("expected E195012");
+                    assert!(err.contains("E195012"), "{err}");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 

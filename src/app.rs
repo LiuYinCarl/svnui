@@ -403,6 +403,16 @@ impl App {
                     self.pending += 1;
                 }
             }
+            InternalEvent::FileLogLoadMore { path, before_rev } => {
+                if before_rev > 1 {
+                    self.svn.file_log_more(
+                        &path,
+                        before_rev,
+                        crate::components::file_log::FILE_LOG_PAGE,
+                    );
+                    self.pending += 1;
+                }
+            }
             InternalEvent::ShowCommitInfo(entry) => {
                 self.show_commit_info(&entry);
             }
@@ -589,7 +599,7 @@ impl App {
         let ctx = self.ctx.clone();
         self.push_popup(Popup::file_log(&ctx, path));
         self.svn
-            .file_log(path, crate::components::file_log::FILE_LOG_LIMIT);
+            .file_log(path, crate::components::file_log::FILE_LOG_PAGE);
         self.pending += 1;
     }
 
@@ -956,6 +966,42 @@ impl App {
                     self.show_error(format!("svn log {path}: {e}"));
                 }
             },
+            AsyncSvnNotification::FileLogAppend {
+                path,
+                before_rev,
+                result,
+            } => {
+                // the popup may have been closed, or its list replaced by a
+                // fresh first page, while the older page was in flight
+                let Some(fl) = self.popups.iter_mut().rev().find_map(|p| match p {
+                    Popup::FileLog(fl) if fl.path == path => Some(fl),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                // only apply if the list still ends where the request was
+                // issued from, otherwise older pages would be appended onto
+                // a different list
+                if fl.oldest_revision() != Some(before_rev) {
+                    fl.append_failed();
+                    return;
+                }
+                match result {
+                    Ok(entries) => fl.append(entries),
+                    Err(e) => {
+                        // E195012: the file did not exist before the oldest
+                        // loaded revision — the end of its history, not an
+                        // error; stop paging instead of retrying on every
+                        // scroll to the bottom
+                        if e.contains("E195012") {
+                            fl.mark_history_exhausted();
+                        } else {
+                            fl.append_failed();
+                            self.show_error(format!("svn log {path}: {e}"));
+                        }
+                    }
+                }
+            }
             AsyncSvnNotification::ListFiles(result) => match result {
                 Ok(files) => {
                     for popup in self.popups.iter_mut().rev() {
@@ -2737,6 +2783,107 @@ mod tests {
         app.handle_queue_events();
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
         assert!(!app.popups.iter().any(|p| matches!(p, Popup::FileLog(_))));
+    }
+
+    #[test]
+    fn file_history_paging() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.push_popup(Popup::file_log(&app.ctx.clone(), "main.rs"));
+        // first page: 50 revisions, oldest is r11
+        let page: Vec<_> = (11..=60u64).rev().map(|r| log_entry(r, "m")).collect();
+        app.handle_async(AsyncSvnNotification::FileLog {
+            path: "main.rs".into(),
+            result: Ok(page),
+        });
+        // the popup asks for the next page from its oldest revision
+        app.queue.push(InternalEvent::FileLogLoadMore {
+            path: "main.rs".into(),
+            before_rev: 11,
+        });
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::FileLogAppend {
+                path,
+                before_rev: 11,
+                ..
+            } if path == "main.rs"
+        ));
+        // a stale page (the list moved on) is dropped, not appended
+        app.handle_async(AsyncSvnNotification::FileLogAppend {
+            path: "main.rs".into(),
+            before_rev: 99,
+            result: Ok(vec![log_entry(1, "stale")]),
+        });
+        let len = app
+            .popups
+            .iter()
+            .find_map(|p| match p {
+                Popup::FileLog(fl) => Some(fl.entries.len()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(len, 50);
+        // the matching page appends
+        app.handle_async(AsyncSvnNotification::FileLogAppend {
+            path: "main.rs".into(),
+            before_rev: 11,
+            result: Ok(vec![log_entry(10, "ten")]),
+        });
+        let fl = app
+            .popups
+            .iter()
+            .find_map(|p| match p {
+                Popup::FileLog(fl) => Some(fl),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(fl.entries.len(), 51);
+        assert_eq!(fl.oldest_revision(), Some(10));
+        // the start of the history (E195012) is not an error: the popup
+        // keeps its list and stops paging
+        app.handle_async(AsyncSvnNotification::FileLogAppend {
+            path: "main.rs".into(),
+            before_rev: 10,
+            result: Err("svn: E195012: Unable to find repository location".into()),
+        });
+        assert!(
+            app.popups.iter().all(|p| !matches!(p, Popup::Msg(_))),
+            "E195012 must not pop an error"
+        );
+        let len = app
+            .popups
+            .iter()
+            .find_map(|p| match p {
+                Popup::FileLog(fl) => Some(fl.entries.len()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(len, 51, "the list must survive the end of history");
+        // an older page for a popup that is gone is dropped silently
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::FileLogAppend {
+            path: "main.rs".into(),
+            before_rev: 10,
+            result: Ok(vec![log_entry(9, "nine")]),
+        });
+        assert!(app.popups.is_empty());
+        // a real error is reported
+        app.push_popup(Popup::file_log(&app.ctx.clone(), "main.rs"));
+        app.handle_async(AsyncSvnNotification::FileLog {
+            path: "main.rs".into(),
+            result: Ok(vec![log_entry(10, "ten")]),
+        });
+        app.handle_async(AsyncSvnNotification::FileLogAppend {
+            path: "main.rs".into(),
+            before_rev: 10,
+            result: Err("svn: boom".into()),
+        });
+        assert!(
+            app.popups.iter().any(|p| matches!(p, Popup::Msg(_))),
+            "a failed older page must be reported"
+        );
     }
 
     #[test]

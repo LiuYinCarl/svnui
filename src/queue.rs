@@ -90,6 +90,9 @@ pub enum InternalEvent {
     StatusFilterInput(String),
     /// Load older revisions at the bottom of the log list
     LogLoadMore,
+    /// Load the next page of a file's history (file history popup);
+    /// `before_rev` is the oldest revision currently loaded
+    FileLogLoadMore { path: String, before_rev: u64 },
     /// Show the full info of the selected commit (log tab)
     ShowCommitInfo(LogEntry),
     /// Preview a patch file in the diff popup (patches tab)
