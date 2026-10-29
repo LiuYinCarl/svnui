@@ -3,6 +3,7 @@
 
 use crate::components::{
     Context, DrawableComponent, diff_view,
+    file_log::FileLogPopup,
     ignore_editor::{self, IgnoreEditor},
     log::{self, LogComponent},
     patches::{self, PatchesComponent},
@@ -66,6 +67,16 @@ fn patch_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Topmost file-history popup for `path`, if it is still open. Pops are a
+/// stack, so the same path can appear more than once (history re-opened
+/// from the finder while an older popup is underneath).
+fn file_log_mut<'a>(popups: &'a mut [Popup], path: &str) -> Option<&'a mut FileLogPopup> {
+    popups.iter_mut().rev().find_map(|p| match p {
+        Popup::FileLog(fl) if fl.path == path => Some(fl),
+        _ => None,
+    })
 }
 
 /// Cap for the patch preview: the file is read and parsed synchronously
@@ -944,24 +955,14 @@ impl App {
             }
             AsyncSvnNotification::FileLog { path, result } => match result {
                 Ok(entries) => {
-                    for popup in self.popups.iter_mut().rev() {
-                        if let Popup::FileLog(fl) = popup
-                            && fl.path == path
-                        {
-                            fl.update(entries);
-                            break;
-                        }
+                    if let Some(fl) = file_log_mut(&mut self.popups, &path) {
+                        fl.update(entries);
                     }
                 }
                 Err(e) => {
                     // leave no popup stuck on "Loading..."
-                    for popup in self.popups.iter_mut().rev() {
-                        if let Popup::FileLog(fl) = popup
-                            && fl.path == path
-                        {
-                            fl.pending = false;
-                            break;
-                        }
+                    if let Some(fl) = file_log_mut(&mut self.popups, &path) {
+                        fl.pending = false;
                     }
                     self.show_error(format!("svn log {path}: {e}"));
                 }
@@ -971,35 +972,28 @@ impl App {
                 before_rev,
                 result,
             } => {
-                // the popup may have been closed, or its list replaced by a
-                // fresh first page, while the older page was in flight
-                let Some(fl) = self.popups.iter_mut().rev().find_map(|p| match p {
-                    Popup::FileLog(fl) if fl.path == path => Some(fl),
-                    _ => None,
-                }) else {
-                    return;
-                };
-                // only apply if the list still ends where the request was
-                // issued from, otherwise older pages would be appended onto
-                // a different list
-                if fl.oldest_revision() != Some(before_rev) {
-                    fl.append_failed();
-                    return;
-                }
-                match result {
-                    Ok(entries) => fl.append(entries),
-                    Err(e) => {
-                        // E195012: the file did not exist before the oldest
-                        // loaded revision — the end of its history, not an
-                        // error; stop paging instead of retrying on every
-                        // scroll to the bottom
-                        if e.contains("E195012") {
-                            fl.mark_history_exhausted();
-                        } else {
-                            fl.append_failed();
-                            self.show_error(format!("svn log {path}: {e}"));
+                // the popup may have been closed while the page was in
+                // flight; the list may also have been replaced by a fresh
+                // first page, in which case appending would mix histories
+                let mut error = None;
+                if let Some(fl) = file_log_mut(&mut self.popups, &path) {
+                    if fl.oldest_revision() != Some(before_rev) {
+                        fl.append_failed();
+                    } else {
+                        match result {
+                            Ok(entries) => fl.append(entries),
+                            // E195012: nothing older than the loaded page —
+                            // the end of the history, not an error
+                            Err(e) if e.contains("E195012") => fl.mark_history_exhausted(),
+                            Err(e) => {
+                                fl.append_failed();
+                                error = Some(e);
+                            }
                         }
                     }
+                }
+                if let Some(e) = error {
+                    self.show_error(format!("svn log {path}: {e}"));
                 }
             }
             AsyncSvnNotification::ListFiles(result) => match result {

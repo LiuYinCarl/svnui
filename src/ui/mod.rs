@@ -15,6 +15,16 @@ pub fn clamp_scroll(scroll: usize, len: usize, height: usize) -> usize {
     scroll.min(len.saturating_sub(height))
 }
 
+/// Rows of headroom above the end of a paginated list at which the next
+/// page is requested, so the list never visibly runs dry.
+pub const PAGE_HEADROOM: usize = 10;
+
+/// Whether `selection` is close enough to the end of a `len`-entry list to
+/// need the next page.
+pub fn near_list_end(selection: usize, len: usize) -> bool {
+    selection + PAGE_HEADROOM >= len
+}
+
 /// Clamp a selection index into range.
 pub fn clamp_index(idx: usize, len: usize) -> usize {
     if len == 0 {
@@ -242,6 +252,18 @@ mod tests {
         assert_eq!(clamp_index(100, 0), 0);
         assert_eq!(clamp_index(100, 3), 2);
         assert_eq!(clamp_index(1, 3), 1);
+    }
+
+    #[test]
+    fn near_list_end_keeps_headroom() {
+        // rows of headroom before the last row
+        assert!(!near_list_end(0, 50));
+        assert!(!near_list_end(39, 50));
+        assert!(near_list_end(40, 50));
+        assert!(near_list_end(49, 50));
+        // short and empty lists are "at the end" from row 0
+        assert!(near_list_end(0, 1));
+        assert!(near_list_end(0, 0));
     }
 
     #[test]

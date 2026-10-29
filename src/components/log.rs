@@ -204,7 +204,7 @@ impl LogComponent {
         }
         let len = self.visible_indices().len();
         let oldest = self.entries.last().map(|e| e.revision).unwrap_or(1);
-        if len > 0 && oldest > 1 && self.selection + 10 >= len {
+        if len > 0 && oldest > 1 && ui::near_list_end(self.selection, len) {
             self.loading_more = true;
             self.ctx.queue.push(InternalEvent::LogLoadMore);
         }

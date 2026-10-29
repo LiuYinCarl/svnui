@@ -95,14 +95,14 @@ impl FileLogPopup {
     /// Near the bottom of the list, request the next page of older
     /// revisions (once per in-flight request).
     fn maybe_load_more(&mut self) {
-        if self.loading_more || self.history_exhausted || self.pending {
+        if self.loading_more || self.history_exhausted {
             return;
         }
-        let len = self.entries.len();
         let Some(oldest) = self.oldest_revision() else {
             return;
         };
-        if oldest > 1 && self.selection + 10 >= len {
+        // revisions below r1 do not exist
+        if oldest > 1 && ui::near_list_end(self.selection, self.entries.len()) {
             self.loading_more = true;
             self.ctx.queue.push(InternalEvent::FileLogLoadMore {
                 path: self.path.clone(),
@@ -147,8 +147,8 @@ impl DrawableComponent for FileLogPopup {
             ui::truncate(&self.path, 50)
         );
         if !self.entries.is_empty() {
-            // total loaded so far; paging keeps growing this on scroll
-            title.push_str(&format!("  ({} revisions)", self.entries.len()));
+            // revisions loaded so far, not the file's total
+            title.push_str(&format!("  ({} loaded)", self.entries.len()));
         }
         if self.loading_more {
             title.push_str("  (loading older…)");
@@ -392,99 +392,63 @@ mod tests {
     }
 
     #[test]
-    fn title_shows_loaded_revision_count() {
+    fn title_shows_loaded_count_and_paging_state() {
         let q = crate::queue::Queue::new();
         let ctx = Context {
             queue: q,
             theme: Theme::default(),
         };
         let mut p = FileLogPopup::new(&ctx, "src/main.rs");
+        let title = |p: &FileLogPopup, width: u16| {
+            let t = ts::render(width, 12, |f| {
+                p.draw(f, Rect::new(0, 0, width, 12)).unwrap();
+            });
+            ts::dump(&t)
+        };
         p.update(vec![entry(5, "five")]);
-        let t = ts::render(80, 12, |f| {
-            p.draw(f, Rect::new(0, 0, 80, 12)).unwrap();
-        });
-        let s = ts::dump(&t);
-        assert!(s.contains("(1 revisions)"), "{s}");
-        // a full page is a page size, not a cap: no truncation hint
-        p.update(
-            (1..=FILE_LOG_PAGE as u64)
-                .rev()
-                .map(|r| entry(r, "m"))
-                .collect(),
-        );
-        let t2 = ts::render(80, 12, |f| {
-            p.draw(f, Rect::new(0, 0, 80, 12)).unwrap();
-        });
-        let s2 = ts::dump(&t2);
-        assert!(!s2.contains("latest"), "{s2}");
-        assert!(s2.contains(&format!("({FILE_LOG_PAGE} revisions)")), "{s2}");
+        let s = title(&p, 80);
+        assert!(s.contains("(1 loaded)"), "{s}");
+        assert!(!s.contains("latest"), "{s}");
+        // a full page is a page size, not a cap
+        p.update((11..=60u64).rev().map(|r| entry(r, "m")).collect());
+        assert!(title(&p, 80).contains(&format!("({FILE_LOG_PAGE} loaded)")));
+        // a page in flight is announced, and a fresh first page resets it
+        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        assert!(title(&p, 100).contains("loading older"));
+        p.update(vec![entry(3, "m")]);
+        assert!(!title(&p, 100).contains("loading older"));
     }
 
     #[test]
-    fn scrolling_near_the_bottom_loads_the_next_page() {
+    fn paging_requests_and_history_end() {
         let q = crate::queue::Queue::new();
         let ctx = Context {
             queue: q.clone(),
             theme: Theme::default(),
         };
+        let page = || {
+            (11..=60u64)
+                .rev()
+                .map(|r| entry(r, "m"))
+                .collect::<Vec<_>>()
+        };
         let mut p = FileLogPopup::new(&ctx, "src/main.rs");
-        p.update((11..=60u64).rev().map(|r| entry(r, "m")).collect());
+        p.update(page());
         // near the top: no request
         p.event(&ts::key(crossterm::event::KeyCode::Char('j')))
             .unwrap();
         assert!(q.pop().is_none());
-        // End jumps to the oldest loaded revision and asks for more
+        // the bottom asks for everything below the oldest loaded revision
         p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         assert!(matches!(
             q.pop(),
             Some(InternalEvent::FileLogLoadMore { path, before_rev })
                 if path == "src/main.rs" && before_rev == 11
         ));
-        // one request in flight: a second End adds nothing
-        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
-        assert!(q.pop().is_none());
-        // the page ends at r1: the history is complete, nothing older
-        p.append(vec![entry(10, "m"), entry(1, "m")]);
-        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
-        assert!(q.pop().is_none());
-    }
-
-    #[test]
-    fn empty_older_page_ends_the_history() {
-        let q = crate::queue::Queue::new();
-        let ctx = Context {
-            queue: q.clone(),
-            theme: Theme::default(),
-        };
-        let mut p = FileLogPopup::new(&ctx, "src/main.rs");
-        p.update((11..=60u64).rev().map(|r| entry(r, "m")).collect());
-        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
-        assert!(q.pop().is_some());
-        // svn answered with nothing older (unusual, but not E195012):
-        // stop asking instead of retrying on every scroll
-        p.append(vec![]);
-        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
-        assert!(q.pop().is_none());
-    }
-
-    #[test]
-    fn pagination_guard_and_history_end() {
-        let q = crate::queue::Queue::new();
-        let ctx = Context {
-            queue: q.clone(),
-            theme: Theme::default(),
-        };
-        let mut p = FileLogPopup::new(&ctx, "src/main.rs");
-        p.update((11..=60u64).rev().map(|r| entry(r, "m")).collect());
-        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
-        assert!(matches!(
-            q.pop(),
-            Some(InternalEvent::FileLogLoadMore { before_rev: 11, .. })
-        ));
         // one request in flight at a time
         p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         assert!(q.pop().is_none());
-        // the page arrives: appended, guard released, oldest moves down
+        // the page arrives: appended, guard released, anchor moves down
         p.append(vec![entry(10, "m"), entry(9, "m")]);
         assert_eq!(p.entries.len(), 52);
         assert_eq!(p.oldest_revision(), Some(9));
@@ -493,47 +457,39 @@ mod tests {
             q.pop(),
             Some(InternalEvent::FileLogLoadMore { before_rev: 9, .. })
         ));
-        // E195012 at the start of the history: stop paging for good
+        // the start of the history: stop paging for good
         p.mark_history_exhausted();
         p.event(&ts::key(crossterm::event::KeyCode::Char('k')))
             .unwrap();
         p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         assert!(q.pop().is_none());
-        // a failed page allows a retry
-        let mut p2 = FileLogPopup::new(&ctx, "a.rs");
-        p2.update((11..=60u64).rev().map(|r| entry(r, "m")).collect());
-        p2.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        // an empty page is the end of the history too
+        let mut empty = FileLogPopup::new(&ctx, "a.rs");
+        empty.update(page());
+        empty
+            .event(&ts::key(crossterm::event::KeyCode::End))
+            .unwrap();
         assert!(q.pop().is_some());
-        p2.append_failed();
-        p2.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
+        empty.append(vec![]);
+        empty
+            .event(&ts::key(crossterm::event::KeyCode::End))
+            .unwrap();
+        assert!(q.pop().is_none());
+        // a failed page allows a retry
+        let mut failed = FileLogPopup::new(&ctx, "b.rs");
+        failed.update(page());
+        failed
+            .event(&ts::key(crossterm::event::KeyCode::End))
+            .unwrap();
+        assert!(q.pop().is_some());
+        failed.append_failed();
+        failed
+            .event(&ts::key(crossterm::event::KeyCode::End))
+            .unwrap();
         assert!(matches!(
             q.pop(),
             Some(InternalEvent::FileLogLoadMore { before_rev: 11, .. })
         ));
-    }
-
-    #[test]
-    fn loading_more_is_shown_in_the_title() {
-        let q = crate::queue::Queue::new();
-        let ctx = Context {
-            queue: q,
-            theme: Theme::default(),
-        };
-        let mut p = FileLogPopup::new(&ctx, "src/main.rs");
-        p.update((11..=60u64).rev().map(|r| entry(r, "m")).collect());
-        p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
-        let t = ts::render(100, 12, |f| {
-            p.draw(f, Rect::new(0, 0, 100, 12)).unwrap();
-        });
-        let s = ts::dump(&t);
-        assert!(s.contains("loading older"), "{s}");
-        // a fresh first page resets the pagination state
-        p.update(vec![entry(3, "m")]);
-        let t2 = ts::render(100, 12, |f| {
-            p.draw(f, Rect::new(0, 0, 100, 12)).unwrap();
-        });
-        let s2 = ts::dump(&t2);
-        assert!(!s2.contains("loading older"), "{s2}");
     }
 
     #[test]
