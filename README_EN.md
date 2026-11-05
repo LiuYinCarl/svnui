@@ -107,7 +107,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `h` / `l` | Diff / blame views: scroll long lines left / right (narrow terminals) |
 | `[` / `]` | Diff view: jump to the previous / next file section (multi-file diffs) |
 | `i` | Repository overview (local info + remote HEAD comparison + change summary) |
-| `F5` / `R` | Refresh status / log / patch list |
+| `F5` / `R` | Refresh status / log / patch list / reload the open diff popup |
 | `P` | Save working-copy changes as a patch file (snapshot, no revert) |
 | `Tab` / `Shift+Tab` | Cycle pane focus within the tab (status: tree/diff/commit, log: list/details); use `1`/`2`/`3` to switch tabs |
 | `1` / `2` / `3` / `4` | Status / log / patches / `.svnignore` editor tabs |

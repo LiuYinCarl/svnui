@@ -58,6 +58,8 @@ pub enum InternalEvent {
     SwitchTab(Tab),
     /// Refresh status from the working copy
     RefreshStatus,
+    /// Re-run the request behind the open fullscreen diff (F5 in the popup)
+    RefreshDiff,
     /// Run svn add on the given paths
     AddFiles(Vec<String>),
     /// Run svn rm on the given paths (schedule deletion of missing files)

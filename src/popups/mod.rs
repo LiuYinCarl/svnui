@@ -18,6 +18,24 @@ pub use diff::DiffPopup;
 pub use msg::MsgPopup;
 pub use output::OutputPopup;
 
+/// Confirm popup: 60% wide and 40% high, grown to fit its message. A file
+/// list would otherwise be clipped on short terminals (the footer and
+/// borders take three rows; long lines wrap onto extra rows).
+fn confirm_rect(p: &ConfirmPopup, area: Rect) -> Rect {
+    use unicode_width::UnicodeWidthStr;
+    let base = ui::popup_area(area, 60, 40);
+    let inner_w = usize::from(base.width.saturating_sub(2)).max(1);
+    let msg_rows: usize = p
+        .message
+        .lines()
+        .map(|l| UnicodeWidthStr::width(l).div_ceil(inner_w).max(1))
+        .sum();
+    let wanted = (msg_rows + 3).min(usize::from(area.height));
+    let height = wanted.max(usize::from(base.height)) as u16;
+    let y = area.y + (area.height - height) / 2;
+    Rect::new(base.x, y, base.width, height)
+}
+
 /// One entry in the popup stack.
 pub enum Popup {
     Confirm(ConfirmPopup),
@@ -36,7 +54,7 @@ impl Popup {
     /// The rectangle this popup occupies within the screen.
     pub fn rect(&self, area: Rect) -> Rect {
         match self {
-            Popup::Confirm(_) => ui::popup_area(area, 60, 40),
+            Popup::Confirm(p) => confirm_rect(p, area),
             Popup::Msg(_) => ui::popup_area(area, 65, 35),
             Popup::Help(_) => ui::popup_area(area, 75, 75),
             Popup::Output(_) => ui::popup_area(area, 80, 65),

@@ -12,10 +12,28 @@ use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::Clear;
+use std::path::PathBuf;
+
+/// What a fullscreen diff was loaded from. F5 in the popup re-runs this
+/// same request (svn diff / svn diff -c / svn diff -r / patch re-read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffSource {
+    /// Working-copy diff of one file (`svn diff`)
+    File(String),
+    /// A revision diff, optionally limited to one file (`svn diff -c`)
+    Revision(u64, Option<String>),
+    /// Combined diff of revisions `from..=to` (`svn diff -r`)
+    Range(u64, u64),
+    /// A patch file shown as a diff (re-read from disk)
+    Patch(PathBuf),
+}
 
 pub struct DiffPopup {
     ctx: Context,
     pub view: DiffView,
+    /// Request that produced the content; `None` for static content,
+    /// which F5 cannot reload
+    pub source: Option<DiffSource>,
 }
 
 impl DiffPopup {
@@ -27,6 +45,7 @@ impl DiffPopup {
         Self {
             ctx: ctx.clone(),
             view,
+            source: None,
         }
     }
 
@@ -41,6 +60,36 @@ impl DiffPopup {
         Self {
             ctx: ctx.clone(),
             view,
+            source: None,
+        }
+    }
+
+    /// Install a freshly loaded diff in place (F5). The scroll position,
+    /// the horizontal offset and an active search survive; the header is
+    /// replaced.
+    pub fn reload(&mut self, prepared: PreparedDiff, header: Vec<String>) {
+        let scroll = self.view.tv.scroll.get();
+        let hscroll = self.view.tv.hscroll.get();
+        // `set_prepared` resets the text view, which would drop the search
+        let search = std::mem::take(&mut self.view.tv.search);
+        let title = self.view.title.clone();
+        self.view.set_prepared(title, prepared);
+        self.view.set_header(header);
+        self.view
+            .tv
+            .scroll
+            .set(scroll.min(self.view.parsed.lines.len()));
+        self.view.tv.hscroll.set(hscroll);
+        self.view.tv.search = search;
+        if self.view.tv.search.is_active() {
+            let lines: Vec<&str> = self
+                .view
+                .parsed
+                .lines
+                .iter()
+                .map(|l| l.content.as_str())
+                .collect();
+            self.view.tv.search.recompute(&lines, scroll);
         }
     }
 }
@@ -71,6 +120,16 @@ impl DrawableComponent for DiffPopup {
             && key_match(k, KeyAction::Quit)
         {
             self.ctx.queue.push(InternalEvent::ClosePopup);
+            return Ok(EventState::consumed());
+        }
+        // F5 / R: re-run the request behind this diff. Checked after the
+        // search input, so 'R' typed into a search pattern stays text.
+        if let Event::Key(k) = ev
+            && key_match(k, KeyAction::Refresh)
+        {
+            if self.source.is_some() {
+                self.ctx.queue.push(InternalEvent::RefreshDiff);
+            }
             return Ok(EventState::consumed());
         }
         let consumed = self.view.event(ev);
@@ -219,6 +278,44 @@ Index: f
             p.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
         });
         assert!(ts::dump(&t).contains("/zzz  [no match]"));
+    }
+
+    #[test]
+    fn f5_requests_reload_only_with_a_source() {
+        let (mut p, q) = popup(SEARCH_DIFF);
+        // static content (no source) has nothing to re-run
+        p.event(&ts::key(KeyCode::F(5))).unwrap();
+        assert!(q.pop().is_none());
+        p.source = Some(DiffSource::File("f".into()));
+        p.event(&ts::key(KeyCode::F(5))).unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::RefreshDiff)));
+        // 'R' reloads as well, but typed into a search pattern it is text
+        p.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        p.event(&ts::key(KeyCode::Char('R'))).unwrap();
+        assert_eq!(p.view.tv.search.pattern(), "R");
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn reload_keeps_scroll_and_search() {
+        let (mut p, _q) = popup(SEARCH_DIFF);
+        p.event(&ts::key(KeyCode::Char('/'))).unwrap();
+        for c in "needle".chars() {
+            p.event(&ts::key(KeyCode::Char(c))).unwrap();
+        }
+        p.event(&ts::key(KeyCode::Enter)).unwrap();
+        assert_eq!(p.view.tv.scroll.get(), 8);
+        assert_eq!(p.view.tv.search.status_text(), "/needle  [1/2]");
+        // the reloaded content gains a third match below the scroll offset
+        let fresh = format!("{SEARCH_DIFF}+needle three\n");
+        p.reload(
+            crate::svn::parser::parse_diff_content(&fresh),
+            vec!["hdr".into()],
+        );
+        assert_eq!(p.view.tv.scroll.get(), 8);
+        assert_eq!(p.view.header(), &["hdr"]);
+        assert!(p.view.tv.search.is_active());
+        assert_eq!(p.view.tv.search.status_text(), "/needle  [1/3]");
     }
 
     #[test]

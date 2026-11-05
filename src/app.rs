@@ -10,6 +10,7 @@ use crate::components::{
     repo_info,
 };
 use crate::keys::{KeyAction, key_match};
+use crate::popups::diff::DiffSource;
 use crate::popups::{DiffPopup, OutputPopup, Popup};
 use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Queue, Tab};
 use crate::status::StatusTab;
@@ -25,38 +26,22 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-/// A diff request that will turn into a fullscreen popup when loaded.
-///
-/// Token semantics: `App::pending_fullscreen` pairs this with a unique
-/// request id (`App::next_req_id`) handed to the svn layer, which echoes
-/// it back on the notification. Only a notification whose token equals the
-/// pending one opens the popup / clears the error — a stale result for a
-/// superseded request (same file/revision asked twice in a row) would
-/// otherwise hijack the newer request under plain value matching.
-#[derive(Clone, Debug)]
-enum PendingFullscreen {
-    File(String),
-    /// A revision diff, optionally limited to one file (file history /
-    /// blame popup)
-    Revision(u64, Option<String>),
-    /// Combined diff of revisions `from..=to`
-    Range(u64, u64),
-}
-
-/// Cap for path lists in confirmation messages; beyond it a
-/// ", … and N more" tail is appended (same style as the commit
-/// confirmation's file list).
+/// Cap for file lists in confirmation messages: beyond it a
+/// "… and N more" tail is appended, so reverting a huge directory cannot
+/// build an MB-scale popup.
 const MAX_CONFIRM_LISTED: usize = 8;
 
-/// Join paths for a confirmation message, capped at
-/// [`MAX_CONFIRM_LISTED`] entries: reverting a huge directory would
-/// otherwise build an MB-scale popup string.
-fn join_paths_capped(paths: &[String]) -> String {
-    let mut out = paths[..paths.len().min(MAX_CONFIRM_LISTED)].join(", ");
-    if paths.len() > MAX_CONFIRM_LISTED {
+/// One `  <status> <path>` line per file (commit and revert confirmations),
+/// capped at [`MAX_CONFIRM_LISTED`] lines. Empty for an empty list.
+fn file_list_lines(targets: &[(char, String)]) -> String {
+    let mut out = String::new();
+    for (status, path) in targets.iter().take(MAX_CONFIRM_LISTED) {
+        out.push_str(&format!("  {status} {path}\n"));
+    }
+    if targets.len() > MAX_CONFIRM_LISTED {
         out.push_str(&format!(
-            ", … and {} more",
-            paths.len() - MAX_CONFIRM_LISTED
+            "  … and {} more\n",
+            targets.len() - MAX_CONFIRM_LISTED
         ));
     }
     out
@@ -84,6 +69,28 @@ fn file_log_mut<'a>(popups: &'a mut [Popup], path: &str) -> Option<&'a mut FileL
 /// freeze the app. 8 MB is far beyond any reasonable hand-written patch.
 const MAX_PATCH_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Read a patch file for the preview popup; the error is user-facing.
+fn read_patch_content(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_PATCH_PREVIEW_BYTES => Err(format!(
+            "{} is too large to preview ({})",
+            patch_name(path),
+            patches::human_size(meta.len())
+        )),
+        _ => std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Header line of a patch preview: file name and size.
+fn patch_header(path: &std::path::Path, content: &str) -> Vec<String> {
+    vec![format!(
+        "{} ({})",
+        patch_name(path),
+        patches::human_size(content.len() as u64)
+    )]
+}
+
 pub struct App {
     pub svn: Svn,
     pub queue: Queue,
@@ -107,8 +114,17 @@ pub struct App {
     pub quitting: bool,
     pub fatal_error: Option<String>,
     pub spinner_frame: Cell<usize>,
-    pending_fullscreen: Option<(u64, PendingFullscreen)>,
-    /// Next token for a fullscreen diff request (see [`PendingFullscreen`])
+    /// A diff request that will turn into a fullscreen popup when loaded.
+    /// Token semantics: the request id (`next_req_id`) is handed to the svn
+    /// layer, which echoes it back on the notification. Only a notification
+    /// whose token equals the pending one opens the popup / clears the error
+    /// — a stale result for a superseded request (same file/revision asked
+    /// twice in a row) would otherwise hijack the newer request.
+    pending_fullscreen: Option<(u64, DiffSource)>,
+    /// Token of an in-flight F5 reload of the open diff popup: its result
+    /// replaces that popup's content instead of opening a new one
+    reload_token: Option<u64>,
+    /// Next token for a fullscreen diff request
     next_req_id: u64,
     /// Highest applied `svn status` request id; older results arriving
     /// out of order are dropped (a stale snapshot would overwrite newer
@@ -149,6 +165,7 @@ impl App {
             fatal_error: None,
             spinner_frame: Cell::new(0),
             pending_fullscreen: None,
+            reload_token: None,
             next_req_id: 1,
             last_status_id: 0,
             last_log_id: 0,
@@ -170,11 +187,58 @@ impl App {
     /// Take the pending fullscreen diff request when the notification's
     /// token matches it; a stale or token-less (`None` = status-pane
     /// preview) notification leaves the pending request untouched.
-    fn take_pending_fullscreen(&mut self, req: Option<u64>) -> Option<PendingFullscreen> {
+    /// Also reports whether the request was an F5 reload of the open popup.
+    fn take_pending_fullscreen(&mut self, req: Option<u64>) -> Option<(DiffSource, bool)> {
         if matches!(&self.pending_fullscreen, Some((id, _)) if Some(*id) == req) {
-            self.pending_fullscreen.take().map(|(_, p)| p)
+            // a reload's token is also recorded in `reload_token` (set only
+            // together with `pending_fullscreen`), so this is exact
+            let reload = self.reload_token.take() == req;
+            self.pending_fullscreen.take().map(|(_, p)| (p, reload))
         } else {
             None
+        }
+    }
+
+    /// The source of the diff popup on top of the stack, if it can be
+    /// reloaded (F5). Static content (no source) yields `None`.
+    fn open_diff_source(&self) -> Option<DiffSource> {
+        match self.popups.last() {
+            Some(Popup::Diff(d)) => d.source.clone(),
+            _ => None,
+        }
+    }
+
+    /// Replace the content of the diff popup loaded from `source` in place,
+    /// the topmost one when several match. Does nothing when it was closed.
+    fn replace_open_diff(
+        &mut self,
+        source: &DiffSource,
+        prepared: PreparedDiff,
+        header: Vec<String>,
+    ) {
+        let target = self.popups.iter_mut().rev().find_map(|p| match p {
+            Popup::Diff(d) if d.source.as_ref() == Some(source) => Some(d),
+            _ => None,
+        });
+        if let Some(d) = target {
+            d.reload(prepared, header);
+        }
+    }
+
+    /// Deliver a loaded fullscreen diff: an F5 reload replaces the open
+    /// popup (see `replace_open_diff`), anything else opens a new popup.
+    fn deliver_diff(
+        &mut self,
+        reload: bool,
+        source: DiffSource,
+        title: String,
+        prepared: PreparedDiff,
+        header: Vec<String>,
+    ) {
+        if reload {
+            self.replace_open_diff(&source, prepared, header);
+        } else {
+            self.show_diff_popup_prepared(source, title, prepared, header);
         }
     }
 
@@ -198,10 +262,17 @@ impl App {
         self.push_popup(Popup::output(&ctx, title, content));
     }
 
-    fn show_diff_popup(&mut self, title: String, content: &str, header: Vec<String>) {
+    fn show_diff_popup(
+        &mut self,
+        source: DiffSource,
+        title: String,
+        content: &str,
+        header: Vec<String>,
+    ) {
         let ctx = self.ctx.clone();
         let mut popup = DiffPopup::new(&ctx, title, content);
         popup.view.set_header(header);
+        popup.source = Some(source);
         self.push_popup(Popup::Diff(popup));
     }
 
@@ -209,6 +280,7 @@ impl App {
     /// worker thread (repository diffs only).
     fn show_diff_popup_prepared(
         &mut self,
+        source: DiffSource,
         title: String,
         prepared: PreparedDiff,
         header: Vec<String>,
@@ -216,7 +288,48 @@ impl App {
         let ctx = self.ctx.clone();
         let mut popup = DiffPopup::new_prepared(&ctx, title, prepared);
         popup.view.set_header(header);
+        popup.source = Some(source);
         self.push_popup(Popup::Diff(popup));
+    }
+
+    /// Re-run an svn-backed fullscreen diff under a fresh token; its result
+    /// replaces the open popup (see `deliver_diff`). Shares the single
+    /// in-flight fullscreen slot with the other diff requests.
+    fn request_diff_reload(&mut self, source: DiffSource) {
+        if self.pending_fullscreen.is_some() {
+            return;
+        }
+        let id = self.next_req_id;
+        self.next_req_id += 1;
+        match &source {
+            DiffSource::File(path) => self.svn.diff(path, Some(id)),
+            DiffSource::Revision(rev, path) => {
+                self.svn.revision_diff(*rev, path.as_deref(), Some(id))
+            }
+            DiffSource::Range(from, to) => self.svn.range_diff(*from, *to, Some(id)),
+            // patches never reach the svn worker (see `RefreshDiff`)
+            DiffSource::Patch(_) => return,
+        }
+        self.pending_fullscreen = Some((id, source));
+        self.reload_token = Some(id);
+        self.pending += 1;
+    }
+
+    /// Re-read a patch preview from disk into the open popup (F5).
+    fn reload_patch_preview(&mut self, path: &std::path::Path) {
+        match read_patch_content(path) {
+            Ok(content) => {
+                let header = patch_header(path, &content);
+                let prepared = crate::svn::parser::parse_diff_content(&content);
+                let source = DiffSource::Patch(path.to_path_buf());
+                self.replace_open_diff(&source, prepared, header);
+            }
+            Err(e) => {
+                self.show_error(e);
+                // the file may be gone; drop it from the list (as the preview does)
+                self.patches.refresh();
+            }
+        }
     }
 
     /// Full commit info of a log entry: revision, author, date, the
@@ -445,7 +558,15 @@ impl App {
                         self.commit_confirm_message(message, paths)
                     }
                     ConfirmAction::Revert(paths) => {
-                        format!("{} ({})", MSG.revert_confirm, join_paths_capped(paths))
+                        let targets: Vec<(char, String)> = paths
+                            .iter()
+                            .map(|p| (self.status.tree.status_char(p), p.clone()))
+                            .collect();
+                        format!(
+                            "{}\n\nFiles:\n{}",
+                            MSG.revert_confirm,
+                            file_list_lines(&targets)
+                        )
                     }
                     ConfirmAction::Update => format!(
                         "{}\nWorking copy: {}",
@@ -479,6 +600,12 @@ impl App {
                 self.svn.status();
                 self.pending += 1;
             }
+            InternalEvent::RefreshDiff => match self.open_diff_source() {
+                // a patch is a file on disk: re-read it, like the preview
+                Some(DiffSource::Patch(path)) => self.reload_patch_preview(&path),
+                Some(source) => self.request_diff_reload(source),
+                None => {}
+            },
             InternalEvent::AddFiles(paths) => {
                 if !paths.is_empty() {
                     // remembered so a failed add can un-stage its paths
@@ -511,7 +638,7 @@ impl App {
                 ) {
                     let id = self.next_req_id;
                     self.next_req_id += 1;
-                    self.pending_fullscreen = Some((id, PendingFullscreen::File(path.clone())));
+                    self.pending_fullscreen = Some((id, DiffSource::File(path.clone())));
                     self.svn.diff(&path, Some(id));
                     self.pending += 1;
                 }
@@ -536,8 +663,7 @@ impl App {
                 }
                 let id = self.next_req_id;
                 self.next_req_id += 1;
-                self.pending_fullscreen =
-                    Some((id, PendingFullscreen::Revision(rev, path.clone())));
+                self.pending_fullscreen = Some((id, DiffSource::Revision(rev, path.clone())));
                 self.svn.revision_diff(rev, path.as_deref(), Some(id));
                 self.pending += 1;
             }
@@ -549,7 +675,7 @@ impl App {
                 if let (Some(&from), Some(&to)) = (revs.iter().min(), revs.iter().max()) {
                     let id = self.next_req_id;
                     self.next_req_id += 1;
-                    self.pending_fullscreen = Some((id, PendingFullscreen::Range(from, to)));
+                    self.pending_fullscreen = Some((id, DiffSource::Range(from, to)));
                     self.svn.range_diff(from, to, Some(id));
                     self.pending += 1;
                 }
@@ -576,30 +702,18 @@ impl App {
             InternalEvent::PreviewPatch(path) => {
                 // a patch file IS a unified diff: reuse the diff popup
                 // (syntax highlighting + search) with the name as header
-                match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() > MAX_PATCH_PREVIEW_BYTES => {
-                        self.show_error(format!(
-                            "{} is too large to preview ({})",
-                            patch_name(&path),
-                            patches::human_size(meta.len())
-                        ));
+                match read_patch_content(&path) {
+                    Ok(content) => {
+                        let name = patch_name(&path);
+                        let header = patch_header(&path, &content);
+                        let title = format!("Patch: {name}");
+                        self.show_diff_popup(DiffSource::Patch(path), title, &content, header);
                     }
-                    _ => match std::fs::read_to_string(&path) {
-                        Ok(content) => {
-                            let name = patch_name(&path);
-                            let header = vec![format!(
-                                "{} ({})",
-                                name,
-                                patches::human_size(content.len() as u64)
-                            )];
-                            self.show_diff_popup(format!("Patch: {name}"), &content, header);
-                        }
-                        Err(e) => {
-                            self.show_error(format!("cannot read {}: {e}", path.display()));
-                            // the file may be gone; drop it from the list
-                            self.patches.refresh();
-                        }
-                    },
+                    Err(e) => {
+                        self.show_error(e);
+                        // the file may be gone; drop it from the list
+                        self.patches.refresh();
+                    }
                 }
             }
         }
@@ -657,16 +771,10 @@ impl App {
         };
         let targets: Vec<(char, String)> = self.status.tree.expanded_commit_targets(&base);
         let what = format!("{} ({} files)", MSG.commit_staged, targets.len());
-        const MAX_LISTED: usize = 8;
         let mut out = format!("{what}\nTarget branch: {branch}\n");
         if !targets.is_empty() {
             out.push_str("\nFiles:\n");
-            for (status, path) in targets.iter().take(MAX_LISTED) {
-                out.push_str(&format!("  {status} {path}\n"));
-            }
-            if targets.len() > MAX_LISTED {
-                out.push_str(&format!("  … and {} more\n", targets.len() - MAX_LISTED));
-            }
+            out.push_str(&file_list_lines(&targets));
         }
         out.push_str(&format!("\n\"{}\"", message.trim()));
         out
@@ -851,9 +959,15 @@ impl App {
                     // move; only a fullscreen diff clones before installing
                     // the pane copy.
                     let fullscreen = self.take_pending_fullscreen(req);
-                    if let Some(PendingFullscreen::File(p)) = fullscreen {
+                    if let Some((DiffSource::File(p), reload)) = fullscreen {
                         self.status.apply_diff(&path, prepared.clone());
-                        self.show_diff_popup_prepared(p, prepared, Vec::new());
+                        self.deliver_diff(
+                            reload,
+                            DiffSource::File(p.clone()),
+                            p,
+                            prepared,
+                            Vec::new(),
+                        );
                     } else {
                         self.status.apply_diff(&path, prepared);
                     }
@@ -1022,10 +1136,12 @@ impl App {
                 result,
             } => match result {
                 Ok(prepared) => {
-                    if let Some(PendingFullscreen::Range(f, t)) = self.take_pending_fullscreen(req)
+                    if let Some((DiffSource::Range(f, t), reload)) =
+                        self.take_pending_fullscreen(req)
                     {
                         let header = diff_view::range_header(f, t, &self.log.entries);
-                        self.show_diff_popup_prepared(format!("Diff r{f}..r{t}"), prepared, header);
+                        let title = format!("Diff r{f}..r{t}");
+                        self.deliver_diff(reload, DiffSource::Range(f, t), title, prepared, header);
                     }
                 }
                 Err(e) => {
@@ -1039,7 +1155,7 @@ impl App {
                 result,
             } => match result {
                 Ok(prepared) => {
-                    if let Some(PendingFullscreen::Revision(r, path)) =
+                    if let Some((DiffSource::Revision(r, path), reload)) =
                         self.take_pending_fullscreen(req)
                     {
                         // commit info: for file-scoped diffs prefer the open
@@ -1061,13 +1177,19 @@ impl App {
                             Some(p) => format!("Diff r{r}: {p}"),
                             None => format!("Diff r{r}"),
                         };
-                        self.show_diff_popup_prepared(title, prepared, header);
+                        self.deliver_diff(
+                            reload,
+                            DiffSource::Revision(r, path),
+                            title,
+                            prepared,
+                            header,
+                        );
                     }
                 }
                 Err(e) => {
                     // name the file for file-scoped diffs (file history)
                     let target = match self.take_pending_fullscreen(req) {
-                        Some(PendingFullscreen::Revision(_, Some(p))) => format!(" -- {p}"),
+                        Some((DiffSource::Revision(_, Some(p)), _)) => format!(" -- {p}"),
                         _ => String::new(),
                     };
                     self.show_error(format!("svn diff -c {revision}{target}: {e}"));
@@ -1620,6 +1742,126 @@ mod tests {
         let _ = rx;
     }
 
+    /// F5 in the fullscreen diff re-runs its request; the result replaces
+    /// the open popup in place (scroll kept, no second popup).
+    #[test]
+    fn f5_reloads_fullscreen_diff_in_place() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "three")]),
+        ));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3, None));
+        app.handle_queue_events();
+        let first = match recv(&rx) {
+            AsyncSvnNotification::RevisionDiff { req, .. } => req,
+            _ => panic!("expected revision diff request"),
+        };
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: first,
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
+        });
+        if let Some(Popup::Diff(d)) = app.popups.last() {
+            d.view.tv.scroll.set(2);
+        }
+        // F5: a fresh request under a new token
+        app.queue.push(InternalEvent::RefreshDiff);
+        app.handle_queue_events();
+        let reload = match recv(&rx) {
+            AsyncSvnNotification::RevisionDiff { req, .. } => req,
+            _ => panic!("expected revision diff request"),
+        };
+        assert!(reload.is_some() && reload != first);
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: reload,
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+c\n"),
+        });
+        assert_eq!(app.popups.len(), 1, "reload must not stack a popup");
+        let Some(Popup::Diff(d)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        assert!(d.view.parsed.lines.iter().any(|l| l.content == "c"));
+        assert!(!d.view.parsed.lines.iter().any(|l| l.content == "b"));
+        assert_eq!(d.view.tv.scroll.get(), 2);
+        assert_eq!(d.view.header(), &["r3 | alice | 2026-01-01", "three"]);
+        assert!(app.pending_fullscreen.is_none());
+        assert!(app.reload_token.is_none());
+    }
+
+    /// A reload whose popup was closed meanwhile is dropped, not reopened.
+    #[test]
+    fn f5_reload_result_is_dropped_after_close() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Log(
+            0,
+            Ok(vec![log_entry(3, "three")]),
+        ));
+        app.queue.push(InternalEvent::RequestRevisionDiff(3, None));
+        app.handle_queue_events();
+        let first = match recv(&rx) {
+            AsyncSvnNotification::RevisionDiff { req, .. } => req,
+            _ => panic!("expected revision diff request"),
+        };
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: first,
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+b\n"),
+        });
+        app.queue.push(InternalEvent::RefreshDiff);
+        app.handle_queue_events();
+        let reload = match recv(&rx) {
+            AsyncSvnNotification::RevisionDiff { req, .. } => req,
+            _ => panic!("expected revision diff request"),
+        };
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::RevisionDiff {
+            revision: 3,
+            req: reload,
+            result: diff_ok("Index: x\n===\n@@ -1 +1 @@\n-a\n+c\n"),
+        });
+        assert!(app.popups.is_empty());
+        assert!(app.pending_fullscreen.is_none());
+    }
+
+    /// F5 on a patch preview re-reads the file from disk.
+    #[test]
+    fn f5_rereads_patch_preview() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let dir = patch_test_dir("reload");
+        std::fs::create_dir_all(&dir).unwrap();
+        let patch_path = dir.join("a.patch");
+        std::fs::write(&patch_path, "Index: f\n===\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+        app.patches.set_dir(dir.clone());
+        assert_eq!(app.patches.entries.len(), 1);
+        app.queue
+            .push(InternalEvent::PreviewPatch(patch_path.clone()));
+        app.handle_queue_events();
+        // edited on disk after the preview opened
+        std::fs::write(&patch_path, "Index: f\n===\n@@ -1 +1 @@\n-a\n+z\n").unwrap();
+        app.queue.push(InternalEvent::RefreshDiff);
+        app.handle_queue_events();
+        assert_eq!(app.popups.len(), 1);
+        let Some(Popup::Diff(d)) = app.popups.last() else {
+            panic!("expected diff popup");
+        };
+        assert!(d.view.parsed.lines.iter().any(|l| l.content == "z"));
+        // the file vanishes: F5 reports it and drops it from the patch list
+        std::fs::remove_file(&patch_path).unwrap();
+        app.queue.push(InternalEvent::RefreshDiff);
+        app.handle_queue_events();
+        let Some(Popup::Msg(m)) = app.popups.last() else {
+            panic!("expected error popup");
+        };
+        assert!(m.is_error);
+        assert!(app.patches.entries.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn revision_diff_attaches_commit_header() {
         let Some(repo) = TestRepo::new() else { return };
@@ -2088,14 +2330,14 @@ mod tests {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, _rx) = app_with(&repo);
         // a failed fullscreen diff clears the pending request
-        app.pending_fullscreen = Some((1, PendingFullscreen::File("a.txt".into())));
+        app.pending_fullscreen = Some((1, DiffSource::File("a.txt".into())));
         app.handle_async(AsyncSvnNotification::Diff {
             path: "a.txt".into(),
             req: Some(1),
             result: Err("boom".into()),
         });
         assert!(app.pending_fullscreen.is_none());
-        app.pending_fullscreen = Some((1, PendingFullscreen::Revision(3, None)));
+        app.pending_fullscreen = Some((1, DiffSource::Revision(3, None)));
         app.handle_async(AsyncSvnNotification::RevisionDiff {
             revision: 3,
             req: Some(1),
@@ -3726,18 +3968,39 @@ mod tests {
         assert!(p.message.contains("dir/f07.txt"), "{}", p.message);
         assert!(!p.message.contains("dir/f08.txt"), "{}", p.message);
         assert!(p.message.contains("… and 2 more"), "{}", p.message);
-        // a short list is shown in full
+        // a short list is shown in full, one file per line like the commit
+        // confirmation (not joined into a single line)
         app.popups.clear();
         app.queue
             .push(InternalEvent::Confirm(ConfirmAction::Revert(vec![
                 "a.txt".into(),
+                "b.txt".into(),
             ])));
         app.handle_queue_events();
         let Some(Popup::Confirm(p2)) = app.popups.last() else {
             panic!("expected confirm popup");
         };
-        assert!(p2.message.contains("(a.txt)"), "{}", p2.message);
+        let lines: Vec<&str> = p2.message.lines().collect();
+        assert!(lines.contains(&"Files:"), "{}", p2.message);
+        assert!(lines.contains(&"    a.txt"), "{}", p2.message);
+        assert!(lines.contains(&"    b.txt"), "{}", p2.message);
         assert!(!p2.message.contains("more"), "{}", p2.message);
+    }
+
+    /// On a short terminal the revert confirmation grows to show every
+    /// listed file and the "more" tail, instead of clipping the list.
+    #[test]
+    fn revert_confirm_fits_short_terminal() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        let paths: Vec<String> = (0..8).map(|i| format!("dir/file{i}.txt")).collect();
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Revert(paths)));
+        app.handle_queue_events();
+        let t = test_support::render(80, 24, |f| app.draw(f).unwrap());
+        let s = test_support::dump(&t);
+        assert!(s.contains("dir/file7.txt"), "{s}");
+        assert!(s.contains("[y] yes"), "{s}");
     }
 
     #[test]

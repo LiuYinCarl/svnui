@@ -272,6 +272,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
         KeyGroup {
             title: "Popups",
             bindings: vec![
+                KeyBinding::new("F5 / R", "Diff popup: reload the diff"),
                 KeyBinding::new("/", "Diff / blame popup: search text (live)"),
                 KeyBinding::new("n / N", "Diff / blame search: next / previous match"),
                 KeyBinding::new(
