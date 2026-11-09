@@ -649,6 +649,8 @@ impl StatusTreeComponent {
             self.ctx
                 .queue
                 .push(InternalEvent::Confirm(ConfirmAction::Update));
+        } else if key_match(k, KeyAction::SwitchBranch) {
+            self.ctx.queue.push(InternalEvent::OpenSwitch);
         } else if key_match(k, KeyAction::Filter) {
             self.ctx.queue.push(InternalEvent::OpenStatusFilter);
         } else if key_match(k, KeyAction::ToggleFlatView) {
@@ -1368,6 +1370,18 @@ mod interaction_tests {
         // 'x' on non-conflicted file is a no-op
         let (mut c2, q2) = comp_with(vec![entry('M', "m.txt")]);
         c2.event(&key(KeyCode::Char('x'))).unwrap();
+        assert!(q2.pop().is_none());
+        // 's' opens the branch picker (no selection needed)
+        c2.event(&key(KeyCode::Char('s'))).unwrap();
+        assert!(matches!(q2.pop(), Some(InternalEvent::OpenSwitch)));
+        // Ctrl+s is not the switch key
+        c2.event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ))
+        .unwrap();
         assert!(q2.pop().is_none());
     }
 

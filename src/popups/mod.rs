@@ -6,6 +6,7 @@ pub mod confirm;
 pub mod diff;
 pub mod msg;
 pub mod output;
+pub mod switch;
 
 use super::components::{Context, DrawableComponent, EventState};
 use crate::ui;
@@ -17,6 +18,7 @@ pub use confirm::ConfirmPopup;
 pub use diff::DiffPopup;
 pub use msg::MsgPopup;
 pub use output::OutputPopup;
+pub use switch::SwitchPopup;
 
 /// Confirm popup: 60% wide and 40% high, grown to fit its message. A file
 /// list would otherwise be clipped on short terminals (the footer and
@@ -48,6 +50,7 @@ pub enum Popup {
     FileFinder(super::components::file_finder::FileFinderPopup),
     LogSearch(super::components::log_search::LogSearchPopup),
     StatusFilter(super::components::status_filter::StatusFilterPopup),
+    Switch(SwitchPopup),
 }
 
 impl Popup {
@@ -64,6 +67,7 @@ impl Popup {
             Popup::FileFinder(_) => ui::popup_area(area, 70, 60),
             Popup::LogSearch(_) => ui::popup_area(area, 60, 20),
             Popup::StatusFilter(_) => ui::popup_area(area, 60, 20),
+            Popup::Switch(_) => ui::popup_area(area, 65, 50),
         }
     }
 }
@@ -81,6 +85,7 @@ impl DrawableComponent for Popup {
             Popup::FileFinder(p) => p.draw(f, area),
             Popup::LogSearch(p) => p.draw(f, area),
             Popup::StatusFilter(p) => p.draw(f, area),
+            Popup::Switch(p) => p.draw(f, area),
         }
     }
 
@@ -96,6 +101,7 @@ impl DrawableComponent for Popup {
             Popup::FileFinder(p) => p.event(ev),
             Popup::LogSearch(p) => p.event(ev),
             Popup::StatusFilter(p) => p.event(ev),
+            Popup::Switch(p) => p.event(ev),
         }
     }
 }
@@ -133,6 +139,9 @@ impl Popup {
             ctx, initial,
         ))
     }
+    pub fn switch(ctx: &Context, current_branch: &str) -> Self {
+        Popup::Switch(SwitchPopup::new(ctx, current_branch))
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +177,7 @@ mod tests {
             Popup::file_finder(&c),
             Popup::log_search(&c, ""),
             Popup::status_filter(&c, ""),
+            Popup::switch(&c, "trunk"),
         ];
         for p in &popups {
             let r = p.rect(area);
@@ -291,6 +301,17 @@ mod tests {
         assert!(ts::dump(&t10).contains("Filter status files"));
         sf.event(&ts::key(crossterm::event::KeyCode::Enter))
             .unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(crate::queue::InternalEvent::ClosePopup)
+        ));
+
+        let mut sw = Popup::switch(&c, "trunk");
+        let t11 = ts::render(60, 12, |f| {
+            sw.draw(f, Rect::new(0, 0, 60, 12)).unwrap();
+        });
+        assert!(ts::dump(&t11).contains("Switch working copy"));
+        sw.event(&ts::key(crossterm::event::KeyCode::Esc)).unwrap();
         assert!(matches!(
             q.pop(),
             Some(crate::queue::InternalEvent::ClosePopup)

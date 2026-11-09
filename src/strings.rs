@@ -13,6 +13,7 @@ pub struct Title {
     pub file_finder: &'static str,
     pub log_search: &'static str,
     pub status_filter: &'static str,
+    pub switch: &'static str,
 }
 
 pub const TITLE: Title = Title {
@@ -28,6 +29,7 @@ pub const TITLE: Title = Title {
     file_finder: "Find file",
     log_search: "Search commits",
     status_filter: "Filter status files",
+    switch: "Switch working copy",
 };
 
 pub struct Msg {
@@ -44,11 +46,13 @@ pub struct Msg {
     pub revert_confirm: &'static str,
     pub update_confirm: &'static str,
     pub resolve_confirm: &'static str,
+    pub switch_confirm: &'static str,
     pub update_to_rev_confirm: &'static str,
     pub add_done: &'static str,
     pub remove_done: &'static str,
     pub revert_done: &'static str,
     pub resolve_done: &'static str,
+    pub switch_done: &'static str,
     pub empty_patches: &'static str,
     pub patch_saved: &'static str,
     pub patch_nothing_to_save: &'static str,
@@ -72,11 +76,13 @@ pub const MSG: Msg = Msg {
     revert_confirm: "Revert local changes? (discards modifications)",
     update_confirm: "Run svn update?",
     resolve_confirm: "Resolve conflict using the working copy version?",
+    switch_confirm: "Switch the working copy? Local changes are kept; conflicts are postponed.",
     update_to_rev_confirm: "Update working copy to selected revision?",
     add_done: "Added to version control",
     remove_done: "Scheduled for deletion",
     revert_done: "Reverted",
     resolve_done: "Conflict resolved",
+    switch_done: "Working copy switched",
     empty_patches: "No patches yet — press P to save the working-copy changes as a patch file",
     patch_saved: "Saved patch",
     patch_nothing_to_save: "No local changes — nothing to save as a patch",

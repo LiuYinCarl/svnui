@@ -58,6 +58,8 @@ pub enum InternalEvent {
     SwitchTab(Tab),
     /// Refresh status from the working copy
     RefreshStatus,
+    /// Open the branch/target picker for `svn switch` (status tab)
+    OpenSwitch,
     /// Re-run the request behind the open fullscreen diff (F5 in the popup)
     RefreshDiff,
     /// Run svn add on the given paths
@@ -114,6 +116,8 @@ pub enum ConfirmAction {
     Resolve(String),
     /// Update working copy to a revision
     UpdateToRevision(u64),
+    /// Switch the working copy to another branch/target (`svn switch`)
+    Switch(String),
     /// Apply a patch file to the working copy (svn patch)
     ApplyPatch(PathBuf),
     /// Delete a patch file from the patch directory

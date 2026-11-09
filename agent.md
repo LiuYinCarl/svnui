@@ -175,6 +175,13 @@ cargo fmt --all --check     # 格式门禁
   解析器重置行号计数，属性段不编文件行号。
 - `svn info` 的 `Revision` 是工作副本根目录的 BASE 修订（SVN 是混合修订工作副本）；
   分支名取 `Relative URL`（去掉 `^/`）。
+- `svn switch` 的目标必须与工作副本 URL 共享祖先（通常就是同一父目录下的兄弟），
+  否则报 E195012；候选目标用 `svn list ^/` 再枚举 `^/branches`、`^/tags`（caret 表示法
+  解析到仓库根，任意 wc 子目录都可用；列不存在的目录报 W160013 + E200009，按"没有
+  这个目录"忽略而不是整体失败）。切换显式带 `--accept postpone`（非交互默认值，写明
+  以免被误解为会弹提示阻塞）。切换后分支/URL 已变，必须重新 `svn info`——走非致命的
+  `RefreshInfo`，不能复用 `check_info`（那里失败会置 fatal_error，把切换后的瞬时
+  网络错误变成启动级致命错误）。
 - `svn list -R` 必须带 `.@HEAD` peg，否则按 wc 根目录的 BASE 修订列举。
 - 文件名含 `@`（如 systemd 的 `foo@.service`）：log/blame/info/add/revert/resolve/commit
   都必须给路径追加空 peg（`path@`，见 `Svn::peg`），否则报 E205000/E200009；

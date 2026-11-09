@@ -19,8 +19,7 @@ pub enum PaneFocus {
 }
 
 /// Status-bar shortcut hints shown while the status tab is active.
-pub const HINTS: &str =
-    "spc stage  c commit  r revert  u update  b blame  / filter  f flat  P patch  F5 refresh";
+pub const HINTS: &str = "spc stage  c commit  r revert  u update  s switch  b blame  / filter  f flat  P patch  F5 refresh";
 
 pub struct StatusTab {
     pub tree: StatusTreeComponent,

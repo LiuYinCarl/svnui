@@ -91,6 +91,15 @@ pub enum AsyncSvnNotification {
     Resolve(Result<String, String>),
     /// Working copy updated to a specific revision (svn update -r N)
     UpdateToRevision(Result<String, String>),
+    /// Switch targets discovered in the repository (`svn list ^/` plus
+    /// `^/branches` and `^/tags`) for the switch popup
+    SwitchTargets(Result<Vec<String>, String>),
+    /// `svn switch` result (the target the working copy moved to)
+    Switch(Result<String, String>),
+    /// Non-fatal `svn info` re-read after a switch: the branch/URL in the
+    /// status bar changed, but a transient failure must not turn into the
+    /// fatal startup error `check_info` reports
+    RefreshInfo(Result<SvnInfo, String>),
     /// Full-history search results (`svn log --search`); `pattern` is the
     /// search term the request was issued with (correlation: stale results
     /// for an older pattern must not overwrite a newer search)
@@ -677,6 +686,82 @@ impl Svn {
         );
     }
 
+    /// Switch targets for the switch popup (`s` on the status tab).
+    ///
+    /// `^/` is caret notation for the repository root: svn resolves it
+    /// against the working copy, so this works from any wc subdirectory
+    /// and on any checkout (trunk, branch, tag). `^/trunk` and the
+    /// directories under `^/branches` and `^/tags` are the targets a
+    /// working copy can be switched to; a repository without those
+    /// directories simply yields a shorter list (the popup keeps its
+    /// free-form target input).
+    pub fn switch_targets(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["list", "^/"]).map(|root| {
+                    let top = parser::parse_ls_dirs(&root);
+                    let mut targets = Vec::new();
+                    if top.iter().any(|n| n == "trunk") {
+                        targets.push("^/trunk".to_string());
+                    }
+                    for group in ["branches", "tags"] {
+                        if !top.iter().any(|n| n == group) {
+                            continue;
+                        }
+                        // a missing subdirectory (or one svn cannot list)
+                        // must not sink the whole list: keep what we have
+                        let sub = Self::run_in(&cwd, &["list", &format!("^/{group}")]);
+                        if let Ok(out) = sub {
+                            targets.extend(
+                                parser::parse_ls_dirs(&out)
+                                    .iter()
+                                    .map(|name| format!("^/{group}/{name}")),
+                            );
+                        }
+                    }
+                    targets
+                });
+                AsyncSvnNotification::SwitchTargets(result)
+            },
+            |e| AsyncSvnNotification::SwitchTargets(Err(e)),
+        );
+    }
+
+    /// `svn switch <target>`: relocate the working copy to another
+    /// branch/tag. Local modifications are kept; conflicts are postponed
+    /// explicitly (`--accept postpone` is svn's non-interactive default,
+    /// spelled out so the behaviour is documented and never blocks on a
+    /// prompt). The target must share ancestry with the working copy
+    /// (svn reports E195012 otherwise) — the app only offers siblings of
+    /// the current URL, and a free-form target that is unrelated fails
+    /// with that message in the error popup.
+    pub fn switch(&self, target: &str) {
+        let cwd = self.cwd.clone();
+        let target = target.to_string();
+        self.spawn_mutating(
+            move || {
+                let result = Self::run_in(&cwd, &["switch", "--accept", "postpone", "--", &target])
+                    .map(|_| target.clone());
+                AsyncSvnNotification::Switch(result)
+            },
+            |e| AsyncSvnNotification::Switch(Err(e)),
+        );
+    }
+
+    /// Re-read `svn info` without the startup failure path (see
+    /// `AsyncSvnNotification::RefreshInfo`).
+    pub fn refresh_info(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["info"]).map(|text| parser::parse_info(&text));
+                AsyncSvnNotification::RefreshInfo(result)
+            },
+            |e| AsyncSvnNotification::RefreshInfo(Err(e)),
+        );
+    }
+
     /// `svn diff` over the whole working copy (for saving as a patch file).
     /// An empty result means there are no local (versioned) changes.
     pub fn create_patch(&self) {
@@ -1044,6 +1129,94 @@ mod tests {
         c.resolve("Cargo.toml");
         match recv(&rx) {
             AsyncSvnNotification::Resolve(Ok(path)) => assert_eq!(path, "Cargo.toml"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The switch flow against a real repository: targets come from the
+    /// repo layout, the switch moves the checkout, and the branch shown by
+    /// `svn info` follows. A trunk checkout is required — svn only allows
+    /// switching between URLs with common ancestry (E195012 otherwise).
+    #[test]
+    fn switch_targets_and_switch_on_a_real_repo() {
+        let Some(repo) = TestRepo::new() else { return };
+        // standard layout: trunk, a branch copied from it (ancestry!), a tag
+        repo.svn(&["mkdir", "^/trunk", "^/branches", "^/tags", "-m", "layout"]);
+        repo.svn(&["copy", "-m", "branch", "^/trunk", "^/branches/feat-a"]);
+        repo.svn(&["copy", "-m", "tag", "^/trunk", "^/tags/v1.0"]);
+
+        // a checkout of trunk: the working copy a switch applies to
+        let root = repo.repo.parent().unwrap();
+        let trunk_wc = root.join("trunk-wc");
+        let url = format!("file://{}/trunk", repo.repo.display());
+        test_support::svn(root, &["co", &url, trunk_wc.to_str().unwrap()]);
+
+        let (tx, rx) = unbounded();
+        let c = Svn::new(trunk_wc.clone(), tx);
+        c.switch_targets();
+        match recv(&rx) {
+            AsyncSvnNotification::SwitchTargets(Ok(targets)) => {
+                assert_eq!(targets, vec!["^/trunk", "^/branches/feat-a", "^/tags/v1.0"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        c.switch("^/branches/feat-a");
+        match recv(&rx) {
+            AsyncSvnNotification::Switch(Ok(target)) => assert_eq!(target, "^/branches/feat-a"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            test_support::svn(&trunk_wc, &["info", "--show-item", "relative-url"]).trim(),
+            "^/branches/feat-a"
+        );
+
+        // the branch label in the status bar is refreshed from `svn info`
+        c.refresh_info();
+        match recv(&rx) {
+            AsyncSvnNotification::RefreshInfo(Ok(info)) => {
+                assert_eq!(info.branch, "branches/feat-a");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // switching to an unrelated URL is rejected by svn, not silently
+        // accepted: the error reaches the caller as-is
+        c.switch("^/tags");
+        match recv(&rx) {
+            AsyncSvnNotification::Switch(Err(e)) => {
+                assert!(
+                    e.contains("E195012") || e.contains("common ancestry"),
+                    "{e}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A repository without trunk/branches/tags still answers the target
+    /// query (an empty list), and a missing `branches` directory does not
+    /// sink the whole request.
+    #[test]
+    fn switch_targets_without_a_standard_layout() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.switch_targets();
+        match recv(&rx) {
+            AsyncSvnNotification::SwitchTargets(Ok(targets)) => {
+                assert!(targets.is_empty(), "{targets:?}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // only `branches`, no trunk: the branches are still listed
+        repo.svn(&["mkdir", "^/branches", "^/branches/feat-b", "-m", "branches"]);
+        c.switch_targets();
+        match recv(&rx) {
+            AsyncSvnNotification::SwitchTargets(Ok(targets)) => {
+                assert_eq!(targets, vec!["^/branches/feat-b"]);
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

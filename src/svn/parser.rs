@@ -4,6 +4,21 @@ use super::models::{
     BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, PreparedDiff, StatusEntry, SvnInfo,
 };
 
+/// Directory names from `svn list` output.
+///
+/// `svn list` prints one entry per line, directories with a trailing `/`
+/// (`trunk/`, `feat-a/`); files carry no suffix and are not valid switch
+/// targets. CRLF line endings and blank lines are tolerated.
+pub fn parse_ls_dirs(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter_map(|l| l.strip_suffix('/'))
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parse `svn --version --quiet` output ("1.14.5" or "1.14.5 (r1876290)")
 /// into (major, minor, patch).
 pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
@@ -601,6 +616,14 @@ mod tests {
     /// A root that matches nothing on disk (is_dir always false).
     fn no_root() -> &'static Path {
         Path::new("/svnui-test-no-such-dir")
+    }
+
+    #[test]
+    fn parse_ls_dirs_keeps_directories_only() {
+        let out = "trunk/\r\nbranches/\nREADME.md\n\nfeat a/\n";
+        assert_eq!(parse_ls_dirs(out), vec!["trunk", "branches", "feat a"]);
+        assert!(parse_ls_dirs("").is_empty());
+        assert!(parse_ls_dirs("file.txt\n").is_empty());
     }
 
     #[test]

@@ -573,6 +573,15 @@ impl App {
                         MSG.update_confirm,
                         self.working_copy_label()
                     ),
+                    ConfirmAction::Switch(target) => {
+                        let current = self.svn_info.as_ref().map(|i| i.branch_label().to_string());
+                        match current {
+                            Some(c) if !c.is_empty() => {
+                                format!("{}\nCurrent: {c}\nTarget: {target}", MSG.switch_confirm)
+                            }
+                            _ => format!("{}\nTarget: {target}", MSG.switch_confirm),
+                        }
+                    }
                     ConfirmAction::Resolve(path) => {
                         format!("{} ({path})", MSG.resolve_confirm)
                     }
@@ -598,6 +607,17 @@ impl App {
             }
             InternalEvent::RefreshStatus => {
                 self.svn.status();
+                self.pending += 1;
+            }
+            InternalEvent::OpenSwitch => {
+                let ctx = self.ctx.clone();
+                let current = self
+                    .svn_info
+                    .as_ref()
+                    .map(|i| i.branch.clone())
+                    .unwrap_or_default();
+                self.push_popup(Popup::switch(&ctx, &current));
+                self.svn.switch_targets();
                 self.pending += 1;
             }
             InternalEvent::RefreshDiff => match self.open_diff_source() {
@@ -812,6 +832,10 @@ impl App {
             }
             ConfirmAction::Update => {
                 self.svn.update();
+                self.pending += 1;
+            }
+            ConfirmAction::Switch(target) => {
+                self.svn.switch(&target);
                 self.pending += 1;
             }
             ConfirmAction::Resolve(path) => {
@@ -1230,6 +1254,35 @@ impl App {
                     self.refresh_after_op();
                 }
             },
+            AsyncSvnNotification::SwitchTargets(result) => {
+                for popup in self.popups.iter_mut().rev() {
+                    if let Popup::Switch(p) = popup {
+                        p.update(result);
+                        break;
+                    }
+                }
+            }
+            AsyncSvnNotification::Switch(result) => match result {
+                Ok(target) => {
+                    self.show_info(format!("{}: {target}", MSG.switch_done));
+                    // branch, URL and history all changed: reload svn info
+                    // (status-bar label), status, and the log even when the
+                    // log tab is not visible — it would otherwise show the
+                    // previous branch's revisions when opened
+                    self.svn.refresh_info();
+                    self.svn.status();
+                    self.svn.log(50);
+                    self.pending += 3;
+                }
+                Err(e) => self.show_error(format!("svn switch: {e}")),
+            },
+            AsyncSvnNotification::RefreshInfo(result) => {
+                // non-fatal: the switch already reported success, and a
+                // transient `svn info` failure must not kill the app
+                if let Ok(info) = result {
+                    self.svn_info = Some(info);
+                }
+            }
             AsyncSvnNotification::Commit(result) => match result {
                 Ok(out) => {
                     self.status.clear_staged();
@@ -2154,12 +2207,13 @@ mod tests {
         assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
         app.popups.clear();
 
-        // revert / update / resolve / update-to-rev confirmations
+        // revert / update / resolve / update-to-rev / switch confirmations
         for action in [
             ConfirmAction::Revert(vec!["a.txt".into()]),
             ConfirmAction::Update,
             ConfirmAction::Resolve("a.txt".into()),
             ConfirmAction::UpdateToRevision(4),
+            ConfirmAction::Switch("^/branches/x".into()),
         ] {
             app.queue.push(InternalEvent::Confirm(action.clone()));
             app.handle_queue_events();
@@ -2425,6 +2479,86 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(s3.contains("popup text"), "{s3}");
+    }
+
+    #[test]
+    fn switch_flow_opens_picker_loads_targets_and_switches() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        // the branch label in the confirmation comes from `svn info`
+        app.svn_info = Some(crate::svn::parser::parse_info(
+            "URL: file:///repo/trunk\nRelative URL: ^/trunk\n",
+        ));
+
+        app.queue.push(InternalEvent::OpenSwitch);
+        app.handle_queue_events();
+        assert!(matches!(app.popups.last(), Some(Popup::Switch(_))));
+        // opening the picker asked svn for the repository's targets
+        assert!(matches!(recv(&rx), AsyncSvnNotification::SwitchTargets(_)));
+
+        // targets arrive: the open popup is filled in place
+        app.handle_async(AsyncSvnNotification::SwitchTargets(Ok(vec![
+            "^/trunk".into(),
+            "^/branches/x".into(),
+        ])));
+        match app.popups.last() {
+            Some(Popup::Switch(p)) => {
+                assert!(!p.pending);
+                assert_eq!(p.target_count(), 2);
+            }
+            _ => panic!("expected the switch popup"),
+        }
+
+        // the popup's Enter closes it and asks for confirmation; the
+        // message names the current and the new branch
+        app.queue.push(InternalEvent::ClosePopup);
+        app.queue.push(InternalEvent::Confirm(ConfirmAction::Switch(
+            "^/branches/x".into(),
+        )));
+        app.handle_queue_events();
+        match app.popups.last() {
+            Some(Popup::Confirm(c)) => {
+                assert!(c.message.contains("Current: trunk"), "{}", c.message);
+                assert!(c.message.contains("Target: ^/branches/x"), "{}", c.message);
+            }
+            _ => panic!("expected a confirm popup"),
+        }
+        app.popups.clear();
+
+        // confirming runs svn switch
+        app.perform_confirmed(ConfirmAction::Switch("^/branches/x".into()));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Switch(_)));
+
+        // success: info popup + status, log and branch-info refresh
+        app.handle_async(AsyncSvnNotification::Switch(Ok("^/branches/x".into())));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(m)) if !m.is_error));
+        for _ in 0..3 {
+            let m = recv(&rx);
+            assert!(
+                matches!(
+                    m,
+                    AsyncSvnNotification::Status(..)
+                        | AsyncSvnNotification::Log(..)
+                        | AsyncSvnNotification::RefreshInfo(_)
+                ),
+                "unexpected refresh: {m:?}"
+            );
+        }
+
+        // failure: error popup and no refresh
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::Switch(Err("boom".into())));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(m)) if m.is_error));
+
+        // the reloaded info replaces the stale branch label; a failed
+        // reload is silent (the switch itself already succeeded)
+        app.handle_async(AsyncSvnNotification::RefreshInfo(Ok(
+            crate::svn::parser::parse_info("Relative URL: ^/branches/x\n"),
+        )));
+        assert_eq!(app.svn_info.as_ref().unwrap().branch, "branches/x");
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::RefreshInfo(Err("gone".into())));
+        assert!(app.popups.is_empty());
     }
 
     #[test]

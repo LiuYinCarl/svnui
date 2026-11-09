@@ -51,6 +51,8 @@ pub enum KeyAction {
     Filter,
     /// Status tab: toggle the flat view — only M/A/D files, compact paths (`f`)
     ToggleFlatView,
+    /// Status tab: open the branch/target picker for `svn switch` (`s`)
+    SwitchBranch,
     Refresh,
     SwitchTabStatus,
     SwitchTabLog,
@@ -119,6 +121,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::Blame => is_key(ev, KeyCode::Char('b')),
         KeyAction::Filter => is_key(ev, KeyCode::Char('/')),
         KeyAction::ToggleFlatView => is_key(ev, KeyCode::Char('f')),
+        KeyAction::SwitchBranch => is_key(ev, KeyCode::Char('s')),
         KeyAction::Refresh => is_key(ev, KeyCode::F(5)) || is_key(ev, KeyCode::Char('R')),
         KeyAction::SwitchTabStatus => is_key(ev, KeyCode::Char('1')),
         KeyAction::SwitchTabLog => is_key(ev, KeyCode::Char('2')),
@@ -240,6 +243,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("Enter / Ctrl+s", "Commit (in commit input)"),
                 KeyBinding::new("Tab", "Commit input: pick a recent message"),
                 KeyBinding::new("u", "Update working copy (svn update)"),
+                KeyBinding::new("s", "Switch working copy to another branch (svn switch)"),
             ],
         },
         KeyGroup {
