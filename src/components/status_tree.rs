@@ -1374,6 +1374,10 @@ mod interaction_tests {
         // 's' opens the branch picker (no selection needed)
         c2.event(&key(KeyCode::Char('s'))).unwrap();
         assert!(matches!(q2.pop(), Some(InternalEvent::OpenSwitch)));
+        // 'C' is the app-level cleanup key: the tree must leave it alone
+        // so `App::handle_input` sees it
+        c2.event(&key(KeyCode::Char('C'))).unwrap();
+        assert!(q2.pop().is_none(), "cleanup is an app-level key");
         // Ctrl+s is not the switch key
         c2.event(&crossterm::event::Event::Key(
             crossterm::event::KeyEvent::new(

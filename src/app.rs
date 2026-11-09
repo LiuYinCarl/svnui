@@ -47,6 +47,16 @@ fn file_list_lines(targets: &[(char, String)]) -> String {
     out
 }
 
+/// Extra hint for svn errors that ask the user to clean the working copy.
+///
+/// svn reports E155004 ("locked; try performing 'svn cleanup'") for a lock
+/// left by an interrupted operation and E155037 ("previous operation has
+/// not finished") — the two cases `C` repairs. The hint is a single funnel
+/// in `show_error`, so every svn error path gets it for free.
+fn svn_error_hint(msg: &str) -> Option<&'static str> {
+    (msg.contains("E155004") || msg.contains("E155037")).then_some(crate::strings::MSG.cleanup_hint)
+}
+
 /// Display name of a patch file path.
 fn patch_name(path: &std::path::Path) -> String {
     path.file_name()
@@ -243,6 +253,10 @@ impl App {
     }
 
     fn show_error(&mut self, msg: String) {
+        let msg = match svn_error_hint(&msg) {
+            Some(hint) => format!("{msg}\n{hint}"),
+            None => msg,
+        };
         let ctx = self.ctx.clone();
         self.push_popup(Popup::msg(&ctx, msg, true));
     }
@@ -401,6 +415,13 @@ impl App {
         } else if key_match(k, KeyAction::SavePatch) {
             self.svn.create_patch();
             self.pending += 1;
+        } else if key_match(k, KeyAction::CleanupWc) {
+            // working-copy repair, not tied to the status view: a lock left
+            // by an interrupted operation surfaces on whichever tab issued
+            // it. Routed through the queue so the confirmation message is
+            // built in the same place as every other confirmation.
+            self.queue
+                .push(InternalEvent::Confirm(ConfirmAction::Cleanup));
         } else if key_match(k, KeyAction::RepoInfo) {
             self.svn.repo_info();
             self.pending += 1;
@@ -571,6 +592,11 @@ impl App {
                     ConfirmAction::Update => format!(
                         "{}\nWorking copy: {}",
                         MSG.update_confirm,
+                        self.working_copy_label()
+                    ),
+                    ConfirmAction::Cleanup => format!(
+                        "{}\nWorking copy: {}",
+                        MSG.cleanup_confirm,
                         self.working_copy_label()
                     ),
                     ConfirmAction::Switch(target) => {
@@ -832,6 +858,15 @@ impl App {
             }
             ConfirmAction::Update => {
                 self.svn.update();
+                self.pending += 1;
+            }
+            ConfirmAction::Cleanup => {
+                // repair the whole working copy, not just the start
+                // directory: the confirmation names the wc root, and a
+                // lock left in a sibling subtree must go too (no info yet →
+                // fall back to the start directory)
+                let root = self.svn_info.as_ref().map(|i| i.wc_root.as_str());
+                self.svn.cleanup(root);
                 self.pending += 1;
             }
             ConfirmAction::Switch(target) => {
@@ -1241,6 +1276,18 @@ impl App {
                 }
                 Err(e) => {
                     self.show_error(format!("svn update: {e}"));
+                    self.refresh_after_op();
+                }
+            },
+            AsyncSvnNotification::Cleanup(result) => match result {
+                Ok(()) => {
+                    self.show_info(MSG.cleanup_done.to_string());
+                    self.refresh_after_op();
+                }
+                Err(e) => {
+                    self.show_error(format!("svn cleanup: {e}"));
+                    // a failed cleanup may still have unlocked part of the
+                    // working copy: show what the tree looks like now
                     self.refresh_after_op();
                 }
             },
@@ -2153,7 +2200,7 @@ mod tests {
         app.perform_confirmed(ConfirmAction::Revert(vec!["docs/readme.md".into()]));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Revert(_)));
 
-        // update + update to revision + resolve
+        // update + update to revision + resolve + cleanup
         app.perform_confirmed(ConfirmAction::Update);
         assert!(matches!(recv(&rx), AsyncSvnNotification::Update(_)));
         app.perform_confirmed(ConfirmAction::UpdateToRevision(1));
@@ -2163,6 +2210,8 @@ mod tests {
         ));
         app.perform_confirmed(ConfirmAction::Resolve("Cargo.toml".into()));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Resolve(_)));
+        app.perform_confirmed(ConfirmAction::Cleanup);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Cleanup(_)));
 
         // commit with explicit paths
         app.perform_confirmed(ConfirmAction::Commit {
@@ -2214,6 +2263,7 @@ mod tests {
             ConfirmAction::Resolve("a.txt".into()),
             ConfirmAction::UpdateToRevision(4),
             ConfirmAction::Switch("^/branches/x".into()),
+            ConfirmAction::Cleanup,
         ] {
             app.queue.push(InternalEvent::Confirm(action.clone()));
             app.handle_queue_events();
@@ -2559,6 +2609,73 @@ mod tests {
         app.popups.clear();
         app.handle_async(AsyncSvnNotification::RefreshInfo(Err("gone".into())));
         assert!(app.popups.is_empty());
+    }
+
+    #[test]
+    fn cleanup_flow_confirms_cleans_and_refreshes() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        let root = repo.wc.to_str().unwrap().to_string();
+        app.svn_info = Some(crate::svn::parser::parse_info(&format!(
+            "URL: file:///repo\nWorking Copy Root Path: {root}\n"
+        )));
+
+        // the confirmation names the working copy it is about to clean
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Cleanup));
+        app.handle_queue_events();
+        match app.popups.last() {
+            Some(Popup::Confirm(c)) => {
+                assert!(c.message.contains("svn cleanup"), "{}", c.message);
+                assert!(c.message.contains(&root), "{}", c.message);
+            }
+            _ => panic!("expected a confirm popup"),
+        }
+        app.popups.clear();
+
+        // confirming cleans the working-copy root, not just the start dir
+        app.perform_confirmed(ConfirmAction::Cleanup);
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Cleanup(Ok(()))));
+
+        // success: info popup + status refresh (no output popup: svn
+        // prints nothing on success)
+        app.handle_async(AsyncSvnNotification::Cleanup(Ok(())));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(m)) if !m.is_error));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
+
+        // failure: error popup and a refresh anyway (a partial cleanup
+        // may have unlocked part of the working copy)
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::Cleanup(Err(
+            "svn: E155004: Working copy locked".into(),
+        )));
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(m)) if m.is_error));
+        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
+    }
+
+    #[test]
+    fn lock_errors_point_at_the_cleanup_key() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+
+        app.show_error("svn commit: svn: E155004: Working copy locked".into());
+        match app.popups.last() {
+            Some(Popup::Msg(m)) => {
+                assert!(m.is_error);
+                assert!(m.message.contains(crate::strings::MSG.cleanup_hint));
+            }
+            _ => panic!("expected an error popup"),
+        }
+
+        // unrelated errors are left alone
+        app.popups.clear();
+        app.show_error("cannot delete patch: permission denied".into());
+        match app.popups.last() {
+            Some(Popup::Msg(m)) => {
+                assert!(!m.message.contains(crate::strings::MSG.cleanup_hint));
+            }
+            _ => panic!("expected an error popup"),
+        }
     }
 
     #[test]
@@ -3301,6 +3418,31 @@ mod tests {
         // it right after handle_input
         app.handle_queue_events();
         assert!(matches!(app.popups.last(), Some(Popup::FileFinder(_))));
+    }
+
+    #[test]
+    fn cleanup_key_is_global() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        // available from every tab, not just the status view: a lock left
+        // by an interrupted operation surfaces wherever the failing
+        // command was issued
+        for tab in [Tab::Status, Tab::Log, Tab::Patches] {
+            app.active_tab = tab;
+            app.popups.clear();
+            app.handle_input(&ts_key(KeyCode::Char('C'))).unwrap();
+            app.handle_queue_events();
+            assert!(
+                matches!(app.popups.last(), Some(Popup::Confirm(_))),
+                "cleanup confirmation on {tab:?}"
+            );
+        }
+        // ...but the ignore editor is a text input: 'C' types there
+        app.active_tab = Tab::Ignore;
+        app.popups.clear();
+        app.handle_input(&ts_key(KeyCode::Char('C'))).unwrap();
+        app.handle_queue_events();
+        assert!(app.popups.is_empty());
     }
 
     #[test]

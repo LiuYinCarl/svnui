@@ -89,6 +89,8 @@ pub enum AsyncSvnNotification {
     Remove(Result<Vec<String>, String>),
     Revert(Result<Vec<String>, String>),
     Resolve(Result<String, String>),
+    /// `svn cleanup`: no text on success (svn prints nothing)
+    Cleanup(Result<(), String>),
     /// Working copy updated to a specific revision (svn update -r N)
     UpdateToRevision(Result<String, String>),
     /// Switch targets discovered in the repository (`svn list ^/` plus
@@ -126,14 +128,14 @@ pub struct Svn {
     cwd: PathBuf,
     tx: Sender<AsyncSvnNotification>,
     /// FIFO queue feeding a single dedicated mutation worker thread.
-    /// Working-copy mutations (`add`, `commit`, `revert`, `resolve`,
-    /// `update`, `apply_patch`) must run one at a time AND in issue
-    /// order — e.g. an auto-staging `svn add` must finish before the
-    /// following `svn commit`, or svn fails with E155004/E155010 for a
-    /// legitimate action sequence. A mutex alone would not be enough:
-    /// it serializes execution but lets later-issued ops win the lock.
-    /// Read-only ops (status/log/diff/blame/list) bypass this queue and
-    /// each run on their own thread.
+    /// Working copy mutations (`add`, `commit`, `revert`, `resolve`,
+    /// `update`, `switch`, `cleanup`, `apply_patch`) must run one at a time
+    /// AND in issue order — e.g. an auto-staging `svn add` must finish
+    /// before the following `svn commit`, or svn fails with
+    /// E155004/E155010 for a legitimate action sequence. A mutex alone
+    /// would not be enough: it serializes execution but lets later-issued
+    /// ops win the lock. Read-only ops (status/log/diff/blame/list) bypass
+    /// this queue and each run on their own thread.
     mutation_queue: Sender<MutationJob>,
     /// Request sequence counter shared by every clone of this client. Ids
     /// are handed out at issue time on the calling thread, so they are
@@ -675,6 +677,43 @@ impl Svn {
         );
     }
 
+    /// `svn cleanup`: remove the write locks an interrupted operation left
+    /// behind (svn's E155004/E155037 recovery path).
+    ///
+    /// `root` is the working-copy root (`svn info`'s "Working Copy Root
+    /// Path"), so the repair covers the whole working copy even when the
+    /// app was started in a subdirectory — a stale lock in a sibling
+    /// subtree is exactly what the user is trying to clear. Without a root
+    /// (info not loaded yet) it falls back to the app's directory, like
+    /// every other command.
+    ///
+    /// Deliberately no `--remove-unversioned` / `--remove-ignored` /
+    /// `--vacuum-pristines`: those delete files and pristines, while the
+    /// repair the app needs is lock removal only. It is a mutation, so it
+    /// runs on the mutation worker and can never interleave with svnui's own
+    /// add/commit/update (svn warns that cleaning while another client
+    /// writes can corrupt the working copy).
+    pub fn cleanup(&self, root: Option<&str>) {
+        let cwd = self.cwd.clone();
+        // an empty root (old svn without "Working Copy Root Path") means
+        // "no target", not "target the empty path"
+        let root = root.filter(|r| !r.is_empty()).map(str::to_string);
+        self.spawn_mutating(
+            move || {
+                // no output on success (verified on svn 1.14.5), so the
+                // notification carries no text; the peg keeps a root path
+                // whose trailing `@`-suffix looks like a revision intact
+                let result = match &root {
+                    Some(root) => Self::run_in(&cwd, &["cleanup", "--", &Self::peg(root)]),
+                    None => Self::run_in(&cwd, &["cleanup"]),
+                }
+                .map(|_| ());
+                AsyncSvnNotification::Cleanup(result)
+            },
+            |e| AsyncSvnNotification::Cleanup(Err(e)),
+        );
+    }
+
     pub fn update_to_revision(&self, revision: u64) {
         let cwd = self.cwd.clone();
         self.spawn_mutating(
@@ -1129,6 +1168,20 @@ mod tests {
         c.resolve("Cargo.toml");
         match recv(&rx) {
             AsyncSvnNotification::Resolve(Ok(path)) => assert_eq!(path, "Cargo.toml"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // cleanup succeeds on a healthy working copy (and prints nothing,
+        // hence the empty payload); the wc-root target form and the
+        // no-target fallback both work
+        c.cleanup(Some(repo.wc.to_str().unwrap()));
+        match recv(&rx) {
+            AsyncSvnNotification::Cleanup(Ok(())) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        c.cleanup(None);
+        match recv(&rx) {
+            AsyncSvnNotification::Cleanup(Ok(())) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }

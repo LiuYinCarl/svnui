@@ -56,6 +56,7 @@ Covers the most common daily SVN operations:
 | **Update** | `svn update` and update-to-revision (`svn update -r N`), both confirmed; the confirmation shows the working-copy path being updated |
 | **Switch branch** | `s` opens a branch picker: it lists the repository's switch targets asynchronously (`^/trunk`, `^/branches/*`, `^/tags/*`, from `svn list`), and any URL or `^/path` can be typed instead; `↑/↓` picks from the list and `Enter` confirms an `svn switch` (local changes are kept, conflicts are postponed). The status and branch info refresh afterwards |
 | **Conflict resolution** | `svn resolve --accept=working` (with confirmation) |
+| **Clean up** | `C` runs `svn cleanup` (confirmed, and warns to make sure no other SVN client is writing): it removes write locks left by an interrupted operation and repairs the E155004/E155037 locked state. The target is the working-copy root, so a checkout started in a subdirectory is repaired as a whole; the status refreshes afterwards. svn errors E155004/E155037 get a hint to press `C` (a global key) |
 | **Patch management** | `P` saves working-copy changes as a timestamped patch file (an `svn diff` snapshot; the working copy is not reverted); `3` opens the patches tab (newest first) where `Enter`/`p` previews (reusing the diff popup), `a` applies (`svn patch`, confirmed) and `d` deletes (confirmed). Patches live in the platform data dir; override with `SVNUI_PATCH_DIR` |
 | **Filtering** | `/` filters files by path (status tab, popup input, live filtering; Esc clears an active filter) / searches commits (log tab). A `.svnignore` file at the working-copy root (.gitignore syntax) additionally hides matching files/dirs from the status tree; while active the status title shows a `[N hidden by .svnignore]` hint. `4` opens a built-in editor with live syntax checking (`Ctrl+s` saves and applies immediately) |
 | **Repo info** | `i` opens a repository overview popup: working-copy info (path/URL/branch/revision/last change), remote HEAD comparison (how many revisions behind, last commit), and a change summary (per-status counts + commit-set size), all color-coded |
@@ -97,6 +98,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | `Tab` | Commit input: list recent messages, select to fill |
 | `u` | `svn update` |
 | `s` | Switch the working copy to another branch/tag (`svn switch`, status tab) |
+| `C` | Clean up the working copy (`svn cleanup`: remove stale write locks, global) |
 | `d` | Fullscreen diff |
 | `f` | Flat view: M/A/D files only, directory names abbreviated (`a/b/c/file`), middle path segments elided when too long; press again for the tree |
 | `b` | Blame file (status tab / file-history popup) |

@@ -112,6 +112,8 @@ pub enum ConfirmAction {
     Revert(Vec<String>),
     /// Update the working copy
     Update,
+    /// Run `svn cleanup` on the working copy (remove stale write locks)
+    Cleanup,
     /// Resolve conflict on a path
     Resolve(String),
     /// Update working copy to a revision

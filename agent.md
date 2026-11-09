@@ -183,6 +183,15 @@ cargo fmt --all --check     # 格式门禁
   `RefreshInfo`，不能复用 `check_info`（那里失败会置 fatal_error，把切换后的瞬时
   网络错误变成启动级致命错误）。
 - `svn list -R` 必须带 `.@HEAD` peg，否则按 wc 根目录的 BASE 修订列举。
+- `svn cleanup` 成功时**不输出任何内容**（验证于 svn 1.14.5）：结果通知不带文本，成功用
+  消息弹窗而不是输出弹窗。只做"删写锁"修复，**绝不能**加 `--remove-unversioned` /
+  `--remove-ignored` / `--vacuum-pristines`（那些会删文件与 pristine）。target 用 `svn info`
+  的 Working Copy Root Path（同样带空 peg）：从子目录启动也能修整个 wc，也与确认弹窗
+  显示的路径一致；拿不到 info 时退回不带 target 的 cwd。它是写操作，必须走
+  `spawn_mutating`（与 add/commit/update/switch 串行），不能和自身进程互相踩锁。
+  svn 的 E155004/E155037（"locked; try performing 'svn cleanup'"）在 `App::show_error`
+  统一追加"按 `C` 清理"提示——所有 svn 错误路径都过这一个漏斗。`C` 是**全局键**
+  （不是状态页键）：锁是在哪个标签页的操作上冒出来的无法预料，弹窗/文本输入会先消费按键。
 - 文件名含 `@`（如 systemd 的 `foo@.service`）：log/blame/info/add/revert/resolve/commit
   都必须给路径追加空 peg（`path@`，见 `Svn::peg`），否则报 E205000/E200009；
   **`svn diff` 例外**——它根本不接受带 peg 的 wc 目标（E155010），但不带 peg 时会把

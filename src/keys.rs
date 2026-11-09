@@ -46,6 +46,9 @@ pub enum KeyAction {
     ResolveConflict,
     Commit,
     UpdateWc,
+    /// Run `svn cleanup` — remove write locks left by an interrupted
+    /// operation (`C`, app-level: the repair is working-copy-wide)
+    CleanupWc,
     DiffFull,
     Blame,
     Filter,
@@ -117,6 +120,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::ResolveConflict => is_key(ev, KeyCode::Char('x')),
         KeyAction::Commit => is_key(ev, KeyCode::Char('c')),
         KeyAction::UpdateWc => is_key(ev, KeyCode::Char('u')),
+        KeyAction::CleanupWc => is_key(ev, KeyCode::Char('C')),
         KeyAction::DiffFull => is_key(ev, KeyCode::Char('d')),
         KeyAction::Blame => is_key(ev, KeyCode::Char('b')),
         KeyAction::Filter => is_key(ev, KeyCode::Char('/')),
@@ -216,6 +220,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 ),
                 KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
                 KeyBinding::new("P", "Save working-copy changes as a patch file (no revert)"),
+                KeyBinding::new(
+                    "C",
+                    "Clean up the working copy (svn cleanup: remove stale locks)",
+                ),
                 KeyBinding::new("F5 / R", "Refresh status / log / patch list"),
                 KeyBinding::new("i", "Show repository / working-copy info (svn info)"),
                 KeyBinding::new("?", "Show this help"),
@@ -350,6 +358,13 @@ mod tests {
         ));
         assert!(key_match(&key(KeyCode::Char('c')), KeyAction::Commit));
         assert!(key_match(&key(KeyCode::Char('u')), KeyAction::UpdateWc));
+        assert!(key_match(&key(KeyCode::Char('C')), KeyAction::CleanupWc));
+        // 'c' stays commit, Ctrl+C is not cleanup
+        assert!(!key_match(&key(KeyCode::Char('c')), KeyAction::CleanupWc));
+        assert!(!key_match(
+            &KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+            KeyAction::CleanupWc
+        ));
         assert!(key_match(&key(KeyCode::Char('d')), KeyAction::DiffFull));
         assert!(key_match(&key(KeyCode::Char('b')), KeyAction::Blame));
         assert!(key_match(&key(KeyCode::Char('/')), KeyAction::Filter));
