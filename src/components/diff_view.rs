@@ -10,7 +10,7 @@ use crate::ui::{self, style::Theme};
 use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 
@@ -83,6 +83,11 @@ pub struct DiffView {
     /// line number in the diff. Rendering and the h-scroll clamp both
     /// derive the gutter width from this, so they can never disagree.
     num_w: usize,
+    /// The complete diff, parked while [`DiffView::ws_filter`] hides part
+    /// of it, so toggling the filter back is a move instead of a re-parse.
+    full: Option<ParsedDiff>,
+    /// Show only whitespace-only changes (`w`).
+    pub ws_filter: bool,
 }
 
 /// Column width of one line-number field: at least 3, widened to fit the
@@ -110,6 +115,8 @@ impl DiffView {
             header: Vec::new(),
             search_enabled: false,
             num_w: 3,
+            full: None,
+            ws_filter: false,
         }
     }
 
@@ -152,26 +159,45 @@ impl DiffView {
         self.title = title;
         self.pending = false;
         self.tv.reset();
+        self.full = None;
         self.parsed = prepared.parsed;
         self.empty_reason = prepared.empty_reason;
-        // Tabs are control characters: the terminal buffer would drop them.
-        // They are expanded to spaces at the 4-column stop instead of being
-        // marked with a glyph — an arrow on every indented line is visual
-        // noise, and this is how a browser renders a diff. Headers keep
-        // their raw text (file headers legitimately contain '\t' before
-        // "(revision N)").
-        for dl in &mut self.parsed.lines {
-            if is_content_line(dl.kind) && dl.content.contains('\t') {
-                dl.content = ui::expand_tabs(&dl.content);
-            }
+        prepare_content(&mut self.parsed.lines);
+        if self.ws_filter {
+            self.apply_ws_filter();
         }
-        // Expansion makes a whitespace-only edit (spaces added, removed or
-        // moved) render as two identical +/- lines, so the differing run of
-        // such a pair is marked with '·' on both sides — visible exactly
-        // where the change happened, and nowhere else.
-        mark_whitespace_only(&mut self.parsed.lines);
         self.num_w = line_number_width(&self.parsed);
         self.tv.max_width.set(self.compute_max_width());
+    }
+
+    /// Show only whitespace-only changes, or the whole diff again (`w`).
+    ///
+    /// Filtering rebuilds the displayed line list instead of hiding rows at
+    /// draw time, so scrolling, search and the `[`/`]` file jumps keep
+    /// working on plain line indices; the full diff is parked for the way
+    /// back. Offsets and any active search are dropped either way — they
+    /// refer to a line set that no longer exists.
+    pub fn toggle_ws_filter(&mut self) {
+        if self.ws_filter {
+            if let Some(full) = self.full.take() {
+                self.parsed = full;
+                self.ws_filter = false;
+            }
+        } else {
+            self.apply_ws_filter();
+            self.ws_filter = true;
+        }
+        // a different line set is displayed: offsets and search no longer apply
+        self.tv.reset();
+        self.num_w = line_number_width(&self.parsed);
+        self.tv.max_width.set(self.compute_max_width());
+    }
+
+    /// Park the full diff and display only its whitespace-only changes.
+    fn apply_ws_filter(&mut self) {
+        let full = std::mem::take(&mut self.parsed);
+        self.parsed = filter_ws_only(&full);
+        self.full = Some(full);
     }
 
     /// Display width of the widest rendered line, including the
@@ -203,6 +229,10 @@ impl DiffView {
             }
             if key_match(k, KeyAction::PrevDiffFile) {
                 self.jump_file(false);
+                return EventState::consumed();
+            }
+            if key_match(k, KeyAction::ToggleWhitespace) {
+                self.toggle_ws_filter();
                 return EventState::consumed();
             }
         }
@@ -274,13 +304,74 @@ fn is_content_line(kind: DiffLineKind) -> bool {
     )
 }
 
-/// Mark whitespace-only edits with '·' (see [`ws_only_marks`]).
+/// Prepare content lines for display: expand tabs, then make
+/// whitespace-only edits visible.
+///
+/// Tabs are control characters the terminal buffer would drop. They are
+/// expanded to spaces at the 4-column stop instead of being marked with a
+/// glyph — an arrow on every indented line is visual noise, and this is how
+/// a browser renders a diff. Headers keep their raw text (file headers
+/// legitimately contain '\t' before "(revision N)").
+///
+/// Expansion alone would make a whitespace-only edit render as two
+/// identical +/- lines, so such pairs get their differing run marked:
+/// spaces become '·', and cells produced by a tab keep their blanks with a
+/// background tint ([`DiffLine::ws_only`]) — that is what tells a tab apart
+/// from spaces.
+fn prepare_content(lines: &mut [DiffLine]) {
+    let marks = ws_only_ranges(lines);
+    for (i, dl) in lines.iter_mut().enumerate() {
+        if !is_content_line(dl.kind) {
+            continue;
+        }
+        let mark = marks[i];
+        if mark.is_none() && !dl.content.contains('\t') {
+            continue;
+        }
+        prepare_line(dl, mark);
+    }
+}
+
+/// Expand the tabs of one content line and apply its whitespace-only mark
+/// (raw char range of the differing run, if any).
+fn prepare_line(dl: &mut DiffLine, mark: Option<(usize, usize)>) {
+    let ui::ExpandedTabs { text, map, tabs } = ui::expand_tabs_spans(&dl.content);
+    let mut chars: Vec<char> = text.chars().collect();
+    if let Some((start, end)) = mark.map(|(a, b)| (map[a], map[b])) {
+        // every blank of the differing run becomes visible; tab cells are
+        // reset below and tinted instead, so the two stay distinguishable
+        for ch in &mut chars[start..end] {
+            if *ch == ' ' {
+                *ch = '·';
+            }
+        }
+        let mut tinted = Vec::new();
+        for (tab_start, tab_end) in tabs {
+            let (s, e) = (tab_start.max(start), tab_end.min(end));
+            if s < e {
+                chars[s..e].fill(' ');
+                tinted.push((byte_offset(&chars, s), byte_offset(&chars, e)));
+            }
+        }
+        dl.ws_only = Some(tinted);
+    }
+    dl.content = chars.into_iter().collect();
+}
+
+/// Byte offset of char index `idx` in `chars`.
+fn byte_offset(chars: &[char], idx: usize) -> usize {
+    chars[..idx].iter().map(|c| c.len_utf8()).sum()
+}
+
+/// Raw char ranges of the differing run for every line that belongs to a
+/// whitespace-only change; `None` elsewhere.
 ///
 /// A unified diff groups removed lines before added lines inside a hunk, so
 /// each removed block is paired position-by-position with the added block
 /// that follows it — the shape a normal "one line edited" hunk has. Pairs
 /// with different lengths (a pure insertion/deletion) stay unmarked.
-fn mark_whitespace_only(lines: &mut [DiffLine]) {
+fn ws_only_ranges(lines: &[DiffLine]) -> Vec<Option<(usize, usize)>> {
+    let mut marks = vec![None; lines.len()];
     let mut i = 0;
     while i < lines.len() {
         if lines[i].kind != DiffLineKind::Removed {
@@ -298,22 +389,24 @@ fn mark_whitespace_only(lines: &mut [DiffLine]) {
         let pairs = (added_start - removed_start).min(i - added_start);
         for k in 0..pairs {
             let (r, a) = (removed_start + k, added_start + k);
-            if let Some((removed, added)) = ws_only_marks(&lines[r].content, &lines[a].content) {
-                lines[r].content = removed;
-                lines[a].content = added;
+            if let Some((removed, added)) = ws_only_difference(&lines[r].content, &lines[a].content)
+            {
+                marks[r] = Some(removed);
+                marks[a] = Some(added);
             }
         }
     }
+    marks
 }
 
-/// Rewrite a whitespace-only change so its differing run is visible.
+/// Differing raw char ranges of two lines whose only change is whitespace.
 ///
-/// `None` when the two lines carry different text (the change is already
-/// visible) or render identically (a tab expanded onto the same spaces).
-/// Otherwise the common prefix/suffix are kept and every space of the
-/// differing run becomes '·', on both sides: `a b` → `a··b` for an added
-/// space, `  foo` → `··foo` for a re-indented line.
-fn ws_only_marks(removed: &str, added: &str) -> Option<(String, String)> {
+/// `None` when the lines carry different text (the change is already
+/// visible) or are identical. Otherwise the common prefix and suffix are
+/// kept and the ranges in between are returned, one per side: `a b` vs
+/// `a  b` yields an empty range and the single added blank, so the marker
+/// points at what changed instead of at the whole line.
+fn ws_only_difference(removed: &str, added: &str) -> Option<((usize, usize), (usize, usize))> {
     if removed == added {
         return None;
     }
@@ -334,23 +427,79 @@ fn ws_only_marks(removed: &str, added: &str) -> Option<(String, String)> {
     {
         tail += 1;
     }
-    let mark = |chars: &[char], from: usize, to: usize| -> String {
-        chars
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if (from..to).contains(&i) && *c == ' ' {
-                    '·'
-                } else {
-                    *c
-                }
-            })
-            .collect()
-    };
-    Some((
-        mark(&r, head, r.len() - tail),
-        mark(&a, head, a.len() - tail),
-    ))
+    Some(((head, r.len() - tail), (head, a.len() - tail)))
+}
+
+/// Keep only the lines that belong to a whitespace-only change, plus the
+/// file and hunk headers that locate them (a bare +/- pair in a multi-file
+/// diff would not say which file it came from).
+fn filter_ws_only(full: &ParsedDiff) -> ParsedDiff {
+    let mut lines = Vec::new();
+    let mut section: Option<&DiffLine> = None;
+    let mut hunk: Option<&DiffLine> = None;
+    let (mut section_done, mut hunk_done) = (true, true);
+    for dl in &full.lines {
+        if is_file_boundary(dl) {
+            section = Some(dl);
+            section_done = false;
+            hunk = None;
+            hunk_done = true;
+        } else if dl.kind == DiffLineKind::Hunk {
+            hunk = Some(dl);
+            hunk_done = false;
+        } else if dl.ws_only.is_some() {
+            if !section_done {
+                lines.extend(section.cloned());
+                section_done = true;
+            }
+            if !hunk_done {
+                lines.extend(hunk.cloned());
+                hunk_done = true;
+            }
+            lines.push(dl.clone());
+        }
+    }
+    ParsedDiff { lines }
+}
+
+/// Split content spans at `ranges` boundaries and tint the pieces inside
+/// them. Search highlighting already split the content; the tint cuts it
+/// again, so both can coexist on one line.
+fn tint_spans(
+    spans: Vec<Span<'static>>,
+    ranges: &[(usize, usize)],
+    bg: Color,
+) -> Vec<Span<'static>> {
+    if ranges.is_empty() {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len() + ranges.len());
+    let mut pos = 0;
+    for span in spans {
+        let text = span.content.into_owned();
+        let end = pos + text.len();
+        // the span's own bounds plus every range boundary that falls
+        // strictly inside it (the `pos` start must survive the filter)
+        let mut cuts = vec![pos, end];
+        cuts.extend(
+            ranges
+                .iter()
+                .flat_map(|(s, e)| [*s, *e])
+                .filter(|c| *c > pos && *c < end),
+        );
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut style = span.style;
+            if ranges.iter().any(|(s, e)| *s <= a && b <= *e) {
+                style = style.bg(bg);
+            }
+            out.push(Span::styled(text[a - pos..b - pos].to_string(), style));
+        }
+        pos = end;
+    }
+    out
 }
 
 /// Build a single styled diff line with line numbers.
@@ -385,6 +534,10 @@ pub fn diff_line(
         theme.search_hit,
         theme.search_hit_current,
     );
+    let content = match &dl.ws_only {
+        Some(tabs) => tint_spans(content, tabs, theme.ws_tab_bg),
+        None => content,
+    };
     if !need_numbers {
         return Line::from(content);
     }
@@ -412,11 +565,14 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     } else {
         theme.border_unfocused
     };
-    let title = if view.pending {
+    let mut title = if view.pending {
         format!("{}  {}", view.title, crate::strings::MSG.loading_suffix)
     } else {
         view.title.clone()
     };
+    if view.ws_filter {
+        title.push_str("  [whitespace only]");
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
@@ -424,9 +580,15 @@ pub fn draw_diff_block(f: &mut Frame, area: Rect, view: &DiffView, theme: &Theme
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if let Some(reason) = &view.empty_reason {
+    // nothing to draw: an empty diff, or a whitespace-only filter that
+    // matched nothing (the title still says the filter is on)
+    let notice = view.empty_reason.as_deref().or_else(|| {
+        (view.ws_filter && view.parsed.lines.is_empty())
+            .then_some(crate::strings::MSG.no_ws_changes)
+    });
+    if let Some(notice) = notice {
         f.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(Span::styled(reason.clone(), theme.dim))),
+            ratatui::widgets::Paragraph::new(Line::from(Span::styled(notice, theme.dim))),
             inner,
         );
         return;
@@ -497,6 +659,11 @@ mod tests {
     use crate::test_support as ts;
     use crate::ui::style::Theme;
     use crossterm::event::KeyCode;
+
+    /// First line of `kind` in a view.
+    fn line(v: &DiffView, kind: DiffLineKind) -> &DiffLine {
+        v.parsed.lines.iter().find(|l| l.kind == kind).unwrap()
+    }
 
     /// Content of the first line of `kind` in a view.
     fn line_content(v: &DiffView, kind: DiffLineKind) -> &str {
@@ -731,14 +898,114 @@ Index: Cargo.toml
     }
 
     #[test]
-    fn tab_vs_spaces_renders_identically_and_stays_unmarked() {
-        // a tab expanded onto the same spaces leaves nothing to point at —
-        // the same trade-off a browser diff makes when it renders tabs as
-        // blanks; the lines must at least stay readable
+    fn tint_spans_splits_and_tints() {
+        let spans = vec![Span::styled("    foo".to_string(), Style::default())];
+        let out = tint_spans(spans, &[(0, 4)], Color::Red);
+        let got: Vec<(String, Option<Color>)> = out
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.bg))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("    ".to_string(), Some(Color::Red)),
+                ("foo".to_string(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_vs_spaces_is_tinted_against_dotted_spaces() {
+        // both sides expand to the same blanks, so the tab cells carry a
+        // background while the spaces carry '·': the change stays visible
+        // and a tab never reads as four spaces
         let mut v = DiffView::new("t");
         v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-\tfoo\n+    foo\n");
-        assert_eq!(line_content(&v, DiffLineKind::Removed), "    foo");
-        assert_eq!(line_content(&v, DiffLineKind::Added), "    foo");
+        let removed = line(&v, DiffLineKind::Removed);
+        let added = line(&v, DiffLineKind::Added);
+        // the removed side's tab cells are blanks with a tint
+        assert_eq!(removed.content, "    foo");
+        assert_eq!(removed.ws_only.as_deref(), Some(&[(0, 4)][..]));
+        // the added side has plain spaces, marked with dots
+        assert_eq!(added.content, "····foo");
+        assert_eq!(added.ws_only.as_deref(), Some(&[][..]));
+
+        // rendered: the tab cells get the background, the dots do not
+        let t = ts::render(40, 8, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 40, 8), &v, &Theme::default());
+        });
+        let buf = t.backend().buffer();
+        let bg = Theme::default().ws_tab_bg;
+        // row 3 = removed line (gutter is 9 columns wide), row 4 = added
+        for x in 10..14 {
+            assert_eq!(buf[(x, 3)].bg, bg, "tab cell {x} of the removed line");
+        }
+        assert_ne!(buf[(14, 3)].bg, bg, "text after the tab is not tinted");
+        assert_ne!(buf[(10, 4)].bg, bg, "dotted spaces are not tinted");
+        assert_eq!(buf[(10, 4)].symbol(), "·");
+    }
+
+    #[test]
+    fn whitespace_filter_keeps_only_whitespace_changes_with_context() {
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: a.txt\n@@ -1,2 +1,2 @@\n-a b\n+a  b\n ctx\nIndex: b.txt\n@@ -1 +1 @@\n-x\n+y\n",
+        );
+        // unfiltered: everything
+        assert_eq!(v.parsed.lines.len(), 9);
+        v.toggle_ws_filter();
+        assert!(v.ws_filter);
+        // only the pair plus its file and hunk header survive
+        let kept: Vec<&str> = v.parsed.lines.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["Index: a.txt", "@@ -1,2 +1,2 @@", "a b", "a ·b"],
+            "{kept:?}"
+        );
+        // ...and toggling back restores the whole diff
+        v.toggle_ws_filter();
+        assert!(!v.ws_filter);
+        assert_eq!(v.parsed.lines.len(), 9);
+    }
+
+    #[test]
+    fn whitespace_filter_without_matches_says_so() {
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-a\n+b\n");
+        v.toggle_ws_filter();
+        assert!(v.parsed.lines.is_empty());
+        let t = ts::render(40, 8, |f| {
+            draw_diff_block(f, Rect::new(0, 0, 40, 8), &v, &Theme::default());
+        });
+        let dump = ts::dump(&t);
+        assert!(dump.contains("No whitespace-only changes"), "{dump}");
+        // the title says why the body is empty
+        assert!(dump.contains("[whitespace only]"), "{dump}");
+    }
+
+    #[test]
+    fn w_key_toggles_the_whitespace_filter() {
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1,2 +1,2 @@\n-a b\n+a  b\n ctx\n");
+        assert!(v.event(&ts::key(KeyCode::Char('w'))).consumed);
+        assert!(v.ws_filter);
+        assert!(v.event(&ts::key(KeyCode::Char('w'))).consumed);
+        assert!(!v.ws_filter);
+    }
+
+    #[test]
+    fn reload_keeps_the_filter_consistent() {
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-a b\n+a  b\n");
+        v.toggle_ws_filter();
+        assert_eq!(v.parsed.lines.len(), 4, "file + hunk header + the pair");
+        // a reload replaces both the displayed and the parked diff
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-c d\n+e f\n");
+        assert!(v.ws_filter);
+        assert!(v.parsed.lines.is_empty(), "no whitespace changes left");
+        v.toggle_ws_filter();
+        assert_eq!(v.parsed.lines.len(), 4);
     }
 
     #[test]

@@ -125,6 +125,13 @@ pub struct DiffLine {
     pub kind: DiffLineKind,
     /// Raw content (without the leading + / - / space)
     pub content: String,
+    /// Set by the diff view (never by the parser): `Some` when this line
+    /// belongs to a change that only touches whitespace. The payload holds
+    /// the byte ranges of cells produced by a *tab* inside the differing
+    /// run — they are rendered with a background tint, so a tab stays
+    /// distinguishable from the spaces that are marked with '·'. An empty
+    /// payload means "whitespace-only change, no tabs involved".
+    pub ws_only: Option<Vec<(usize, usize)>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

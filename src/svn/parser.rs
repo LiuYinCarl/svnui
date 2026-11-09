@@ -431,6 +431,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::Header,
                 content: line.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -447,6 +448,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::FileHeader,
                 content: line.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -459,6 +461,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::Hunk,
                 content: line.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -475,6 +478,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::Header,
                 content: line.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -486,6 +490,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::Hunk,
                 content: line.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -495,6 +500,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::Note,
                 content: line.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -506,6 +512,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: n,
                 kind: DiffLineKind::Added,
                 content: rest.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -517,6 +524,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
                 new: None,
                 kind: DiffLineKind::Removed,
                 content: rest.to_string(),
+                ws_only: None,
             });
             continue;
         }
@@ -531,6 +539,7 @@ pub fn parse_diff(output: &str) -> ParsedDiff {
             new: n,
             kind: DiffLineKind::Context,
             content: rest.to_string(),
+            ws_only: None,
         });
     }
     ParsedDiff { lines }
@@ -562,6 +571,7 @@ pub fn parse_new_file_content(content: &str) -> ParsedDiff {
             new: Some(n),
             kind: DiffLineKind::Added,
             content: line.to_string(),
+            ws_only: None,
         });
     }
     ParsedDiff { lines }

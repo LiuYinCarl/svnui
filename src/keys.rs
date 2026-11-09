@@ -96,6 +96,8 @@ pub enum KeyAction {
     NextDiffFile,
     /// Diff view: jump to the previous file's section (`[`)
     PrevDiffFile,
+    /// Diff view: show only whitespace-only changes (`w`)
+    ToggleWhitespace,
 }
 
 /// Central keybindings: every `KeyAction` maps to one or more keys.
@@ -184,6 +186,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         }
         KeyAction::NextDiffFile => is_key(ev, KeyCode::Char(']')),
         KeyAction::PrevDiffFile => is_key(ev, KeyCode::Char('[')),
+        KeyAction::ToggleWhitespace => is_key(ev, KeyCode::Char('w')),
     }
 }
 
@@ -295,6 +298,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "[ / ]",
                     "Diff view: previous / next file in a multi-file diff",
                 ),
+                KeyBinding::new("w", "Diff view: show only whitespace-only changes (toggle)"),
                 KeyBinding::new("Enter", "Blame popup: diff of the cursor line's revision"),
                 KeyBinding::new("Ctrl+b", "File finder: blame highlighted file"),
                 KeyBinding::new("b", "File history popup: blame the file"),
@@ -380,6 +384,10 @@ mod tests {
         assert!(!key_match(
             &KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
             KeyAction::ToggleFlatView
+        ));
+        assert!(key_match(
+            &key(KeyCode::Char('w')),
+            KeyAction::ToggleWhitespace
         ));
         assert!(key_match(&key(KeyCode::Char(']')), KeyAction::NextDiffFile));
         assert!(key_match(&key(KeyCode::Char('[')), KeyAction::PrevDiffFile));

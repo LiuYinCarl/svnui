@@ -37,6 +37,9 @@ pub mod palette {
     pub const ACCENT: Color = Color::Cyan;
     /// 搜索命中的背景色（非当前命中；当前命中直接用 `WARN`）。
     pub const HIT_BG: Color = Color::Indexed(94);
+    /// 纯空白改动里由 tab 产生的单元格底色：中性灰，与 `·`（空格）配对，
+    /// 让 tab 与空格在展开后仍可区分；不承载状态语义。
+    pub const WS_TAB_BG: Color = Color::Indexed(238);
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +87,9 @@ pub struct Theme {
     // incremental search (diff / blame popups)
     pub search_hit: Style,
     pub search_hit_current: Style,
+
+    // diff whitespace marks
+    pub ws_tab_bg: Color,
 
     // popups
     pub popup_border: Color,
@@ -166,6 +172,9 @@ impl Default for Theme {
                 .fg(Color::Black)
                 .bg(palette::WARN)
                 .add_modifier(Modifier::BOLD),
+
+            // diff whitespace marks
+            ws_tab_bg: palette::WS_TAB_BG,
 
             // popups
             popup_border: palette::ACCENT,
@@ -268,6 +277,8 @@ mod tests {
         // 结构色不承载状态语义：焦点/标识用强调色
         assert_eq!(t.border_focused, palette::ACCENT);
         assert_eq!(t.popup_border, palette::ACCENT);
+        // 空白标记底色是中性结构色，不承载状态语义
+        assert_eq!(t.ws_tab_bg, palette::WS_TAB_BG);
         assert_eq!(t.log_revision.fg, Some(palette::ACCENT));
         assert_eq!(t.log_author.fg, Some(palette::ACCENT));
         assert_eq!(t.info.fg, Some(palette::ACCENT));

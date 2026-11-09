@@ -65,6 +65,8 @@ pub struct Msg {
     pub delete_patch_confirm: &'static str,
     /// Status-tree title suffix while a `.svnignore` filter is active
     pub svnignore_hidden: &'static str,
+    /// Diff view: the whitespace-only filter matched nothing
+    pub no_ws_changes: &'static str,
 }
 
 pub const MSG: Msg = Msg {
@@ -97,4 +99,5 @@ pub const MSG: Msg = Msg {
     apply_patch_confirm: "Apply this patch to the working copy? (svn patch)",
     delete_patch_confirm: "Delete this patch file?",
     svnignore_hidden: "hidden by .svnignore",
+    no_ws_changes: "No whitespace-only changes in this diff",
 };

@@ -192,20 +192,53 @@ const TAB_STOP: usize = 4;
 /// Expand tabs to spaces at `TAB_STOP`-wide stops, counting display
 /// columns so CJK characters advance the column by two.
 pub fn expand_tabs(s: &str) -> String {
+    // callers that just want the text (blame, one line at a time) must not
+    // pay for the position map `expand_tabs_spans` builds
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    expand_tabs_spans(s).text
+}
+
+/// A tab-expanded string plus the bookkeeping needed to map the original
+/// text onto it (the diff view marks ranges of the *original* text and has
+/// to find them again after expansion).
+pub struct ExpandedTabs {
+    /// The text with every tab replaced by spaces up to the next stop.
+    pub text: String,
+    /// `map[i]` is the char index in `text` where original char `i` starts;
+    /// one extra entry holds the total char count, so a range `a..b` of the
+    /// original maps to `map[a]..map[b]`.
+    pub map: Vec<usize>,
+    /// Char ranges in `text` produced by tabs, in order.
+    pub tabs: Vec<(usize, usize)>,
+}
+
+/// Expand tabs, recording where the original characters and the tab cells
+/// ended up (see [`ExpandedTabs`]).
+pub fn expand_tabs_spans(s: &str) -> ExpandedTabs {
     use unicode_width::UnicodeWidthChar;
-    let mut out = String::with_capacity(s.len());
+    let mut text = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.chars().count() + 1);
+    let mut tabs = Vec::new();
     let mut col = 0usize;
+    let mut chars = 0usize;
     for ch in s.chars() {
+        map.push(chars);
         if ch == '\t' {
             let n = TAB_STOP - (col % TAB_STOP);
-            out.extend(std::iter::repeat_n(' ', n));
+            text.extend(std::iter::repeat_n(' ', n));
+            tabs.push((chars, chars + n));
+            chars += n;
             col += n;
         } else {
-            out.push(ch);
+            text.push(ch);
+            chars += 1;
             col += UnicodeWidthChar::width(ch).unwrap_or(0);
         }
     }
-    out
+    map.push(chars);
+    ExpandedTabs { text, map, tabs }
 }
 
 #[cfg(test)]
@@ -296,6 +329,26 @@ mod tests {
         assert_eq!(expand_tabs("ab\tc"), "ab  c");
         assert_eq!(expand_tabs("中\tc"), "中  c");
         assert_eq!(expand_tabs("no tabs"), "no tabs");
+    }
+
+    #[test]
+    fn expand_tabs_spans_map_original_ranges_onto_the_expansion() {
+        let e = expand_tabs_spans("a\tb");
+        assert_eq!(e.text, "a   b");
+        // original chars a,\t,b start at 0, 1, 4; end marker at 5
+        assert_eq!(e.map, vec![0, 1, 4, 5]);
+        assert_eq!(e.tabs, vec![(1, 4)]);
+        // a range covering only the tab maps onto its whole expansion
+        assert_eq!((e.map[1], e.map[2]), (1, 4));
+        // a tab at a CJK column still advances to the next stop
+        let e = expand_tabs_spans("中\tc");
+        assert_eq!(e.text, "中  c");
+        assert_eq!(e.tabs, vec![(1, 3)]);
+        assert_eq!(e.map, vec![0, 1, 3, 4]);
+        // no tabs: identity mapping
+        let e = expand_tabs_spans("abc");
+        assert!(e.tabs.is_empty());
+        assert_eq!(e.map, vec![0, 1, 2, 3]);
     }
 
     #[test]
