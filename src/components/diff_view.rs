@@ -154,20 +154,22 @@ impl DiffView {
         self.tv.reset();
         self.parsed = prepared.parsed;
         self.empty_reason = prepared.empty_reason;
-        // tabs would be dropped by the terminal buffer (control chars)
-        // and trailing blanks are invisible, so content lines get visible
-        // markers for both — a whitespace-only change must not render as
-        // two identical-looking +/- lines. Headers keep their raw text
-        // (file headers legitimately contain '\t' before "(revision N)").
+        // Tabs are control characters: the terminal buffer would drop them.
+        // They are expanded to spaces at the 4-column stop instead of being
+        // marked with a glyph — an arrow on every indented line is visual
+        // noise, and this is how a browser renders a diff. Headers keep
+        // their raw text (file headers legitimately contain '\t' before
+        // "(revision N)").
         for dl in &mut self.parsed.lines {
-            let is_content = matches!(
-                dl.kind,
-                DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
-            );
-            if is_content && (dl.content.contains('\t') || dl.content.ends_with(' ')) {
-                dl.content = ui::visualize_whitespace(&dl.content);
+            if is_content_line(dl.kind) && dl.content.contains('\t') {
+                dl.content = ui::expand_tabs(&dl.content);
             }
         }
+        // Expansion makes a whitespace-only edit (spaces added, removed or
+        // moved) render as two identical +/- lines, so the differing run of
+        // such a pair is marked with '·' on both sides — visible exactly
+        // where the change happened, and nowhere else.
+        mark_whitespace_only(&mut self.parsed.lines);
         self.num_w = line_number_width(&self.parsed);
         self.tv.max_width.set(self.compute_max_width());
     }
@@ -183,11 +185,10 @@ impl DiffView {
             .iter()
             .map(|dl| {
                 let w = UnicodeWidthStr::width(dl.content.as_str());
-                match dl.kind {
-                    DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed => {
-                        w + gutter
-                    }
-                    _ => w,
+                if is_content_line(dl.kind) {
+                    w + gutter
+                } else {
+                    w
                 }
             })
             .max()
@@ -263,6 +264,93 @@ fn is_file_boundary(dl: &DiffLine) -> bool {
         && (dl.content.starts_with("Index: ")
             || dl.content.starts_with("diff --git ")
             || dl.content.starts_with("Property changes on:"))
+}
+
+/// Whether a line carries the +/-/space marker and a line number.
+fn is_content_line(kind: DiffLineKind) -> bool {
+    matches!(
+        kind,
+        DiffLineKind::Context | DiffLineKind::Added | DiffLineKind::Removed
+    )
+}
+
+/// Mark whitespace-only edits with '·' (see [`ws_only_marks`]).
+///
+/// A unified diff groups removed lines before added lines inside a hunk, so
+/// each removed block is paired position-by-position with the added block
+/// that follows it — the shape a normal "one line edited" hunk has. Pairs
+/// with different lengths (a pure insertion/deletion) stay unmarked.
+fn mark_whitespace_only(lines: &mut [DiffLine]) {
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind != DiffLineKind::Removed {
+            i += 1;
+            continue;
+        }
+        let removed_start = i;
+        while i < lines.len() && lines[i].kind == DiffLineKind::Removed {
+            i += 1;
+        }
+        let added_start = i;
+        while i < lines.len() && lines[i].kind == DiffLineKind::Added {
+            i += 1;
+        }
+        let pairs = (added_start - removed_start).min(i - added_start);
+        for k in 0..pairs {
+            let (r, a) = (removed_start + k, added_start + k);
+            if let Some((removed, added)) = ws_only_marks(&lines[r].content, &lines[a].content) {
+                lines[r].content = removed;
+                lines[a].content = added;
+            }
+        }
+    }
+}
+
+/// Rewrite a whitespace-only change so its differing run is visible.
+///
+/// `None` when the two lines carry different text (the change is already
+/// visible) or render identically (a tab expanded onto the same spaces).
+/// Otherwise the common prefix/suffix are kept and every space of the
+/// differing run becomes '·', on both sides: `a b` → `a··b` for an added
+/// space, `  foo` → `··foo` for a re-indented line.
+fn ws_only_marks(removed: &str, added: &str) -> Option<(String, String)> {
+    if removed == added {
+        return None;
+    }
+    let text = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    if text(removed) != text(added) {
+        return None;
+    }
+    let r: Vec<char> = removed.chars().collect();
+    let a: Vec<char> = added.chars().collect();
+    let mut head = 0;
+    while head < r.len() && head < a.len() && r[head] == a[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < r.len() - head
+        && tail < a.len() - head
+        && r[r.len() - 1 - tail] == a[a.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let mark = |chars: &[char], from: usize, to: usize| -> String {
+        chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if (from..to).contains(&i) && *c == ' ' {
+                    '·'
+                } else {
+                    *c
+                }
+            })
+            .collect()
+    };
+    Some((
+        mark(&r, head, r.len() - tail),
+        mark(&a, head, a.len() - tail),
+    ))
 }
 
 /// Build a single styled diff line with line numbers.
@@ -410,6 +498,16 @@ mod tests {
     use crate::ui::style::Theme;
     use crossterm::event::KeyCode;
 
+    /// Content of the first line of `kind` in a view.
+    fn line_content(v: &DiffView, kind: DiffLineKind) -> &str {
+        v.parsed
+            .lines
+            .iter()
+            .find(|l| l.kind == kind)
+            .map(|l| l.content.as_str())
+            .unwrap_or("")
+    }
+
     const DIFF: &str = "\
 Index: Cargo.toml
 ===================================================================
@@ -545,10 +643,10 @@ Index: Cargo.toml
     }
 
     #[test]
-    fn tabs_are_expanded_with_visible_marker() {
-        // the terminal buffer drops control characters: a literal tab in
-        // the diff content would vanish, so set_content expands it — with
-        // a visible '→' marker, so tab-vs-space changes stay visible
+    fn tabs_are_expanded_without_a_marker() {
+        // the terminal buffer drops control characters, so a literal tab is
+        // expanded to spaces at the tab stop — no glyph: an arrow on every
+        // indented line is visual noise
         let mut v = DiffView::new("t");
         v.set_content(
             "t".into(),
@@ -561,49 +659,112 @@ Index: Cargo.toml
             .find(|l| l.kind == DiffLineKind::Added)
             .unwrap();
         assert!(!added.content.contains('\t'));
-        // one tab at column 0 expands to a full tab stop, marker first
-        assert_eq!(added.content, "→   let x = 1;");
-        // width math sees the expanded content (marker is one column)
+        assert_eq!(added.content, "    let x = 1;");
+        assert!(!added.content.contains('\u{2192}'), "no arrow marker");
+        // width math sees the expanded content: the line is indented by a
+        // plain 4-space tab stop
         let t = ts::render(40, 6, |f| {
             draw_diff_block(f, Rect::new(0, 0, 40, 6), &v, &Theme::default());
         });
         let buf = t.backend().buffer();
-        // row 4 = the added line: 9-column gutter, then the marker, then
-        // padding spaces, then 'l' — same columns as a plain 4-space indent
-        assert_eq!(buf[(10, 4)].symbol(), "→");
+        // row 4 = the added line: 9-column gutter, then the indent, then 'l'
+        assert_eq!(buf[(10, 4)].symbol(), " ");
         assert_eq!(buf[(14, 4)].symbol(), "l");
     }
 
     #[test]
-    fn whitespace_only_changes_stay_visible() {
-        // a change that only adds trailing blanks / swaps spaces for a tab
-        // must not render as two identical lines
+    fn whitespace_only_changes_are_marked_where_they_differ() {
+        // trailing blanks added
         let mut v = DiffView::new("t");
-        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-foo  \n+foo\t\n");
-        let removed = v
-            .parsed
-            .lines
-            .iter()
-            .find(|l| l.kind == DiffLineKind::Removed)
-            .unwrap();
-        let added = v
-            .parsed
-            .lines
-            .iter()
-            .find(|l| l.kind == DiffLineKind::Added)
-            .unwrap();
-        assert_eq!(removed.content, "foo··");
-        assert_eq!(added.content, "foo→");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-foo\n+foo  \n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "foo");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "foo··");
+
+        // interior space added: only the extra blank is marked
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-a b\n+a  b\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "a b");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "a ·b");
+
+        // ...and removed: the marker lands on the side that lost it
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-a  b\n+a b\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "a ·b");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "a b");
+
+        // re-indented line: the extra leading blank is marked
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-  foo\n+   foo\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "  foo");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "  ·foo");
+
+        // a space removed from the middle
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-foo( a )\n+foo(a)\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "foo(·a·)");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "foo(a)");
+
+        // a real text change is already visible: nothing gets marked
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-a b\n+c d\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "a b");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "c d");
+
+        // context lines are never marked, even with blanks
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: f\n@@ -1,3 +1,3 @@\n a  b\n-x\n+y\n c  d\n",
+        );
+        assert_eq!(line_content(&v, DiffLineKind::Context), "a  b");
+
         // header lines keep their raw text (file headers contain '\t')
-        let mut v2 = DiffView::new("t");
-        v2.set_content("t".into(), DIFF);
-        let file_header = v2
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), DIFF);
+        let file_header = v
             .parsed
             .lines
             .iter()
             .find(|l| l.kind == DiffLineKind::FileHeader)
             .unwrap();
         assert!(file_header.content.contains('\t'));
+    }
+
+    #[test]
+    fn tab_vs_spaces_renders_identically_and_stays_unmarked() {
+        // a tab expanded onto the same spaces leaves nothing to point at —
+        // the same trade-off a browser diff makes when it renders tabs as
+        // blanks; the lines must at least stay readable
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-\tfoo\n+    foo\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "    foo");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "    foo");
+    }
+
+    #[test]
+    fn whitespace_marking_pairs_blocks_by_position() {
+        // two changed lines: both pairs are whitespace-only
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: f\n@@ -1,2 +1,2 @@\n-a b\n-c  d\n+a  b\n+c   d\n",
+        );
+        let removed: Vec<&str> = v
+            .parsed
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Removed)
+            .map(|l| l.content.as_str())
+            .collect();
+        let added: Vec<&str> = v
+            .parsed
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Added)
+            .map(|l| l.content.as_str())
+            .collect();
+        assert_eq!(removed, vec!["a b", "c  d"]);
+        assert_eq!(added, vec!["a ·b", "c  ·d"]);
     }
 
     #[test]

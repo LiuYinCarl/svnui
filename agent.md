@@ -123,10 +123,13 @@ cargo fmt --all --check     # 格式门禁
 - 组件实现 `DrawableComponent`（`draw(&self, ...)` + `event(&mut self, ...)`）；
   `draw` 是 `&self`——需要可变状态（滚动偏移等）用 `Cell`。
 - 文本输入用 `tui-textarea-2`，不要手写字符宽度计算。
-- 终端 buffer 会丢弃控制字符：凡展示文件/命令原始内容，必须先处理 tab——diff 视图用
-  `ui::visualize_whitespace`（tab → `→`、行尾空格 → `·`，纯空白修改才不会显示成两行
-  无差异），blame 等其余视图用 `ui::expand_tabs` 展开（4 列停点、按显示列计宽），
-  否则缩进整个丢失。
+- 终端 buffer 会丢弃控制字符：凡展示文件/命令原始内容，必须先用 `ui::expand_tabs` 把 tab
+  展开成空格（4 列停点、按显示列计宽），否则缩进整个丢失。**不要**用 `→` 之类的可见标记
+  标 tab：每行都有缩进时满屏箭头，纯属干扰（GitHub 的 diff 也是直接渲染成空格）。
+  代价是纯空白改动（空格增删/移动）展开后会变成两行一模一样，所以 diff 视图对"只差空白"
+  的 +/- 行对做**定位标记**（`diff_view::mark_whitespace_only`）：比较两侧去掉空白后的
+  文本，相同才处理，再取公共前后缀，只把差异区间里的空格换成 `·`（哪一侧多了/少了空格就
+  只标在哪一侧）。tab↔空格互换在展开后视觉相同（与浏览器一致），不会标记。
 - 组件不应直接持有 `Svn`；通过 `Context.queue` push `InternalEvent`，由 App 执行命令。
 - 新增快捷键：在 `keys.rs` 加 `KeyAction` 变体 + `key_match` 分支，并更新 `all_binding_groups()`（帮助页，按上下文分组）。
 - 新增用户可见文本：加到 `strings.rs`。
