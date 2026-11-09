@@ -11,7 +11,9 @@
 
 - 这是 **SVN** 项目，不是 git。所有版本控制操作通过 `svn` CLI 完成（见 `src/svn/mod.rs`），
   代码里绝不能出现 `git` 命令或 git 语义（索引、HEAD、rebase 等）。
-- SVN **没有暂存区**。"暂存"被实现为**提交集**（`StatusTreeComponent::staged: HashSet<String>`）：
+- SVN **没有暂存区**。"暂存"被实现为**提交集**（`StatusTreeComponent::staged: HashSet<String>`），
+  界面上的提交集标记是**名字前的绿色 `*`**（`staged_marker()`，行背景 `staged_bg` 只是辅助，
+  选中行不显示背景，所以标记必须独立可见；目录按"自身条目 + 全部子孙都已暂存"判定）：
   只有加入提交集的路径才会随下一次 `svn commit` 提交；未版本化（`?`）文件暂存时自动
   `svn add`；缺失（`!`）文件/目录暂存时自动 `svn rm` 调度删除（否则 `svn commit` 会静默
   跳过缺失路径，删除永远进不了版本库）；提交集为空时拒绝提交（确认弹窗前与

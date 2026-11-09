@@ -8,6 +8,7 @@ use crate::queue::{ConfirmAction, InternalEvent};
 use crate::strings::{self, TITLE};
 use crate::svn::models::{StatusEntry, TreeItem, TreeItemKind};
 use crate::ui;
+use crate::ui::style::Theme;
 use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -731,6 +732,15 @@ fn display_status(e: &StatusEntry) -> char {
     }
 }
 
+/// The commit-set marker rendered in front of a staged file/directory name.
+///
+/// Green is the palette's "safe" colour (added / success / commit set), so
+/// the marker reads as "this will be committed" even without the row
+/// background (which the selected row never shows).
+fn staged_marker(theme: &Theme) -> Span<'static> {
+    Span::styled("*", theme.status_added)
+}
+
 impl DrawableComponent for StatusTreeComponent {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
@@ -843,11 +853,15 @@ impl StatusTreeComponent {
                     }
                 }
                 let sym = if *expanded { "▼ " } else { "▶ " };
+                spans.push(Span::styled(sym, theme.text.add_modifier(Modifier::BOLD)));
+                let staged_all = info.total > 0 && info.staged == info.total;
+                if staged_all {
+                    spans.push(staged_marker(theme));
+                }
                 spans.push(Span::styled(
-                    format!("{sym}{}/", item.name),
+                    format!("{}/", item.name),
                     theme.text.add_modifier(Modifier::BOLD),
                 ));
-                let staged_all = info.total > 0 && info.staged == info.total;
                 (Line::from(spans), staged_all)
             }
             TreeItemKind::File { entry } => {
@@ -862,11 +876,20 @@ impl StatusTreeComponent {
                 } else {
                     spans.push(Span::raw("  "));
                 }
+                let staged = self.staged.contains(&item.path);
+                if staged {
+                    spans.push(staged_marker(theme));
+                }
+                // the marker takes a column of its own: in the flat view
+                // the compact path is elided one column earlier so a
+                // staged row never overflows the pane
                 let name = match name_budget {
-                    Some(budget) => status_flat::elide_middle(&item.name, budget),
+                    Some(budget) => status_flat::elide_middle(
+                        &item.name,
+                        budget.saturating_sub(usize::from(staged)),
+                    ),
                     None => item.name.clone(),
                 };
-                let staged = self.staged.contains(&item.path);
                 let style = if staged {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
@@ -1968,6 +1991,137 @@ mod interaction_tests {
         });
         let row = row_line(&t, 1);
         assert!(row.starts_with("D ▶ gone/"), "{row}");
+    }
+
+    #[test]
+    fn staged_files_show_an_asterisk_before_the_name() {
+        let (mut c, _q) = comp_with(vec![entry('M', "a.txt"), entry('M', "b.txt")]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        // nothing staged yet: plain status + name
+        assert!(
+            row_line(&t, 1).starts_with("M a.txt"),
+            "{}",
+            row_line(&t, 1)
+        );
+        assert!(
+            row_line(&t, 2).starts_with("M b.txt"),
+            "{}",
+            row_line(&t, 2)
+        );
+
+        // staging adds the marker in front of the name, green (safe state)
+        c.set_staged(&["a.txt".to_string()]);
+        let t2 = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let staged_row = row_line(&t2, 1);
+        assert!(staged_row.starts_with("M *a.txt"), "{staged_row}");
+        let theme = Theme::default();
+        let buf = t2.backend().buffer();
+        assert_eq!(buf[(3, 1)].symbol(), "*");
+        assert_eq!(Some(buf[(3, 1)].fg), theme.status_added.fg);
+        // the unstaged neighbour keeps its name at the old column
+        assert!(
+            row_line(&t2, 2).starts_with("M b.txt"),
+            "{}",
+            row_line(&t2, 2)
+        );
+
+        // unstaging removes it again
+        c.unset_staged(&["a.txt".to_string()]);
+        let t3 = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        assert!(
+            row_line(&t3, 1).starts_with("M a.txt"),
+            "{}",
+            row_line(&t3, 1)
+        );
+    }
+
+    #[test]
+    fn staged_dirs_show_the_marker_only_when_fully_staged() {
+        let (mut c, _q) = comp_with(vec![
+            dir_entry('M', "dir"),
+            entry('M', "dir/a.txt"),
+            entry('M', "dir/b.txt"),
+        ]);
+        c.event(&key(KeyCode::Char('l'))).unwrap(); // expand the selected dir
+        // one of two children staged: the dir is only partially in the
+        // commit set, so no marker (same rule as the row background)
+        c.set_staged(&["dir/a.txt".to_string()]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        assert!(
+            row_line(&t, 1).starts_with("M ▼ dir/"),
+            "{}",
+            row_line(&t, 1)
+        );
+        assert!(row_line(&t, 2).contains("*a.txt"), "{}", row_line(&t, 2));
+        assert!(!row_line(&t, 3).contains('*'), "{}", row_line(&t, 3));
+
+        // both children staged, but the dir's own (props) change is not:
+        // the dir row stays unmarked — its entry would not be committed
+        c.set_staged(&["dir/b.txt".to_string()]);
+        let t2 = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        assert!(
+            row_line(&t2, 1).starts_with("M ▼ dir/"),
+            "{}",
+            row_line(&t2, 1)
+        );
+        // staging the dir itself completes the commit set for that row
+        c.set_staged(&["dir".to_string()]);
+        let t3 = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        assert!(
+            row_line(&t3, 1).starts_with("M ▼ *dir/"),
+            "{}",
+            row_line(&t3, 1)
+        );
+
+        // a plain directory (no own status entry) is marked as soon as its
+        // whole subtree is staged
+        let (mut c2, _q2) = comp_with(vec![entry('M', "src/a.txt"), entry('M', "src/b.txt")]);
+        c2.set_staged(&["src/a.txt".to_string()]);
+        let t4 = ts::render(40, 8, |f| {
+            c2.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        assert!(
+            row_line(&t4, 1).starts_with("▶ src/"),
+            "{}",
+            row_line(&t4, 1)
+        );
+        c2.set_staged(&["src/b.txt".to_string()]);
+        let t5 = ts::render(40, 8, |f| {
+            c2.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        assert!(
+            row_line(&t5, 1).starts_with("▶ *src/"),
+            "{}",
+            row_line(&t5, 1)
+        );
+    }
+
+    #[test]
+    fn flat_view_marks_staged_files_and_keeps_the_row_in_bounds() {
+        // long enough to be elided: the marker must not push the compact
+        // path past the pane width
+        let path = "deeply/nested/directory/structure/with/a/long/file_name.rs";
+        let (mut c, _q) = comp_with(vec![entry('M', path)]);
+        c.event(&key(KeyCode::Char('f'))).unwrap();
+        c.set_staged(&[path.to_string()]);
+        let t = ts::render(40, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 40, 8)).unwrap();
+        });
+        let row = row_line(&t, 1);
+        assert!(row.starts_with("M *"), "{row}");
+        assert!(row.trim_end().chars().count() <= 39, "{row}");
     }
 
     #[test]
