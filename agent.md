@@ -52,7 +52,7 @@ src/
 │   ├── status_flat.rs  平铺视图的路径显示（目录缩写、碰撞回退全路径、中间省略）
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用；h/l 横向滚动看长行；
 │   │                 [/] 在多文件 diff 中按文件节跳转——边界取 parser 判出的 Header 行；
-│   │                 w 只看纯空白改动，tab 展开为空格、差异区用 `·`/底色标记）
+│   │                 w 只看纯空白改动，tab 展开为空格、空白差异用底色标记）
 │   ├── commit.rs     提交信息输入栏（tui-textarea-2，Tab 回填最近提交信息）
 │   ├── log.rs        日志标签页（修订列表滚动分页 + 详情 + 关键字筛选 + 多选合并 diff）
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
@@ -128,13 +128,17 @@ cargo fmt --all --check     # 格式门禁
   展开成空格（4 列停点、按显示列计宽），否则缩进整个丢失。**不要**用 `→` 之类的可见标记
   标 tab：每行都有缩进时满屏箭头，纯属干扰（GitHub 的 diff 也是直接渲染成空格）。
   代价是纯空白改动（空格增删/移动、tab↔空格）展开后会变成两行一模一样，所以 diff 视图对
-  "只差空白"的 +/- 行对做**定位标记**（`diff_view::prepare_content`）：
-  `ws_only_difference` 先按**原始文本**比较（去掉空白后相同才算），取公共前后缀，只处理
-  差异区间——空格换成 `·`，由 tab 产生的单元格保持空白但加**底色**（`palette::WS_TAB_BG`），
-  这样 tab 与空格在展开后仍可区分；哪一侧多/少了空白就只标在哪一侧。标记结果落在
-  `DiffLine::ws_only`（`Option<Vec<byte range>>`，由视图填写，parser 恒为 `None`），
-  它同时是 `w` 过滤器（只看纯空白改动）的判据——过滤是重建显示行集（保留文件/hunk 头），
-  完整 diff 暂存在 `DiffView::full` 里，切回时直接换回、不重解析。
+  "只差空白"的 +/- 行对做**底色标记**（`diff_view::prepare_content`）：`ws_only_difference`
+  先按**原始文本**比较（去掉空白后相同才算），取公共前后缀得到差异区间，只给其中的**空白
+  单元格**上底色——删除侧 `palette::WS_REMOVED_BG`（暗红）、新增侧 `WS_ADDED_BG`（暗绿）、
+  区间内由 tab 产生的单元格再覆盖成 `WS_TAB_BG`（中性灰，与空格区分）。
+  **绝不用 `·`/`→` 这类可见字符表示空白**（TUI 原则：不可见字符不该用可见字符表达；
+  gitui 直接展开成 2 空格、tig 用 diff-highlight 的底色，都是这个思路）。只标空白、
+  不标差异区间里的正文，避免暗底上的前景色不可读。标记结果落在 `DiffLine::ws_only`
+  （`Option<WsMark>`：空白区间 + tab 区间，由视图填写，parser 恒为 `None`），它同时是
+  `w` 过滤器（只看纯空白改动）的判据——过滤重建显示行集（保留文件/hunk 头）并记录
+  行映射（`filter_rows`），完整 diff 暂存在 `DiffView::full`；切换时按"当前顶行对应的
+  原始行"恢复滚动位置（横向偏移与搜索也保留/重算），大 diff 不会跳回第一行。
 - 组件不应直接持有 `Svn`；通过 `Context.queue` push `InternalEvent`，由 App 执行命令。
 - 新增快捷键：在 `keys.rs` 加 `KeyAction` 变体 + `key_match` 分支，并更新 `all_binding_groups()`（帮助页，按上下文分组）。
 - 新增用户可见文本：加到 `strings.rs`。

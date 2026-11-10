@@ -126,12 +126,26 @@ pub struct DiffLine {
     /// Raw content (without the leading + / - / space)
     pub content: String,
     /// Set by the diff view (never by the parser): `Some` when this line
-    /// belongs to a change that only touches whitespace. The payload holds
-    /// the byte ranges of cells produced by a *tab* inside the differing
-    /// run — they are rendered with a background tint, so a tab stays
-    /// distinguishable from the spaces that are marked with '·'. An empty
-    /// payload means "whitespace-only change, no tabs involved".
-    pub ws_only: Option<Vec<(usize, usize)>>,
+    /// belongs to a change that only touches whitespace.
+    pub ws_only: Option<WsMark>,
+}
+
+/// A whitespace-only change on one side of a removed/added pair, as byte
+/// ranges into [`DiffLine::content`].
+///
+/// Whitespace is rendered as blanks (tabs are expanded), so the change is
+/// expressed with background colours instead of marker glyphs: the
+/// differing run gets the line's "changed whitespace" tint, and cells that
+/// came from a tab get the tab tint — that is what keeps a tab
+/// distinguishable from spaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsMark {
+    /// Blank cells (spaces and tab expansions) of the differing run. Only
+    /// blanks are tinted: a run may contain text (a blank moved across a
+    /// word), and text keeps its readable foreground.
+    pub blanks: Vec<(usize, usize)>,
+    /// Tab-produced cells inside `blanks`.
+    pub tabs: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

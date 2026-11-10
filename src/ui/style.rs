@@ -37,8 +37,13 @@ pub mod palette {
     pub const ACCENT: Color = Color::Cyan;
     /// 搜索命中的背景色（非当前命中；当前命中直接用 `WARN`）。
     pub const HIT_BG: Color = Color::Indexed(94);
-    /// 纯空白改动里由 tab 产生的单元格底色：中性灰，与 `·`（空格）配对，
-    /// 让 tab 与空格在展开后仍可区分；不承载状态语义。
+    /// 纯空白改动区间的底色（删除侧）：暗红。空白单元格没有字形，所以用
+    /// 底色表达"这里的空白被删掉了"（tig 的 diff-highlight 同理）。
+    pub const WS_REMOVED_BG: Color = Color::Indexed(52);
+    /// 纯空白改动区间的底色（新增侧）：暗绿。
+    pub const WS_ADDED_BG: Color = Color::Indexed(22);
+    /// 改动区间内由 tab 产生的单元格底色：中性灰，让 tab 与空格在展开后
+    /// 仍可区分；不承载状态语义。
     pub const WS_TAB_BG: Color = Color::Indexed(238);
 }
 
@@ -89,6 +94,8 @@ pub struct Theme {
     pub search_hit_current: Style,
 
     // diff whitespace marks
+    pub ws_removed_bg: Color,
+    pub ws_added_bg: Color,
     pub ws_tab_bg: Color,
 
     // popups
@@ -174,6 +181,8 @@ impl Default for Theme {
                 .add_modifier(Modifier::BOLD),
 
             // diff whitespace marks
+            ws_removed_bg: palette::WS_REMOVED_BG,
+            ws_added_bg: palette::WS_ADDED_BG,
             ws_tab_bg: palette::WS_TAB_BG,
 
             // popups
@@ -277,7 +286,9 @@ mod tests {
         // 结构色不承载状态语义：焦点/标识用强调色
         assert_eq!(t.border_focused, palette::ACCENT);
         assert_eq!(t.popup_border, palette::ACCENT);
-        // 空白标记底色是中性结构色，不承载状态语义
+        // 空白改动底色跟随行语义（删=红 / 增=绿），tab 标记是中性结构色
+        assert_eq!(t.ws_removed_bg, palette::WS_REMOVED_BG);
+        assert_eq!(t.ws_added_bg, palette::WS_ADDED_BG);
         assert_eq!(t.ws_tab_bg, palette::WS_TAB_BG);
         assert_eq!(t.log_revision.fg, Some(palette::ACCENT));
         assert_eq!(t.log_author.fg, Some(palette::ACCENT));
