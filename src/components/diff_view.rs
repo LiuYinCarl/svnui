@@ -1119,6 +1119,28 @@ Index: Cargo.toml
     }
 
     #[test]
+    fn whitespace_marks_use_byte_ranges_with_multibyte_text() {
+        // the mark is a *byte* range into the rendered content: a CJK char
+        // before the changed blank must not shift it
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-中 a\n+中  a\n");
+        assert_eq!(line_content(&v, DiffLineKind::Added), "中  a");
+        // 中 = 3 bytes, then the two blanks at 3..5: the added one is 4..5
+        assert_eq!(mark(&v, DiffLineKind::Added).blanks, vec![(4, 5)]);
+        assert!(mark(&v, DiffLineKind::Removed).blanks.is_empty());
+
+        // a tab after CJK text expands from column 2 to the next stop (4),
+        // so it becomes two blanks, not four
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1 @@\n-中\tx\n+中  x\n");
+        assert_eq!(line_content(&v, DiffLineKind::Removed), "中  x");
+        let removed = mark(&v, DiffLineKind::Removed);
+        assert_eq!(removed.blanks, vec![(3, 5)]);
+        assert_eq!(removed.tabs, vec![(3, 5)]);
+        assert!(mark(&v, DiffLineKind::Added).tabs.is_empty());
+    }
+
+    #[test]
     fn whitespace_marking_pairs_blocks_by_position() {
         // two changed lines: both pairs are whitespace-only
         let mut v = DiffView::new("t");
