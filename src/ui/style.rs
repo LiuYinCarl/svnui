@@ -39,12 +39,12 @@ pub mod palette {
     pub const HIT_BG: Color = Color::Indexed(94);
     /// 纯空白改动区间的底色（删除侧）：暗红。空白单元格没有字形，所以用
     /// 底色表达"这里的空白被删掉了"（tig 的 diff-highlight 同理）。
-    pub const WS_REMOVED_BG: Color = Color::Indexed(52);
+    pub const WS_REMOVED_BG: Color = Color::Indexed(88);
     /// 纯空白改动区间的底色（新增侧）：暗绿。
-    pub const WS_ADDED_BG: Color = Color::Indexed(22);
+    pub const WS_ADDED_BG: Color = Color::Indexed(28);
     /// 改动区间内由 tab 产生的单元格底色：中性灰，让 tab 与空格在展开后
     /// 仍可区分；不承载状态语义。
-    pub const WS_TAB_BG: Color = Color::Indexed(238);
+    pub const WS_TAB_BG: Color = Color::Indexed(240);
 }
 
 #[derive(Clone, Debug)]

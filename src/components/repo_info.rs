@@ -46,6 +46,11 @@ pub fn repo_info_lines(
     };
 
     section(&mut out, "Working copy");
+    // the running build, so a stale local binary is obvious at a glance
+    out.push(field(
+        "svnui:",
+        Span::styled(env!("CARGO_PKG_VERSION").to_string(), theme.text),
+    ));
     if let Some(v) = client_version {
         out.push(field(
             "Client:",
@@ -231,6 +236,12 @@ mod tests {
             &theme,
         ));
         assert!(text.contains("Client:        svn 1.14.5"), "{text}");
+        // the running svnui build is shown too (a stale binary is otherwise
+        // indistinguishable from a bug)
+        assert!(
+            text.contains(&format!("svnui:         {}", env!("CARGO_PKG_VERSION"))),
+            "{text}"
+        );
         assert!(text.contains("HEAD:          r3"), "{text}");
         assert!(text.contains("(up to date)"), "{text}");
         assert!(!text.contains("revisions behind"), "{text}");
