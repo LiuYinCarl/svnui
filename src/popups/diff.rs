@@ -27,8 +27,13 @@ pub enum DiffSource {
     /// A patch file shown as a diff (re-read from disk)
     Patch(PathBuf),
     /// The whole file behind a diff (`f`): the working-copy file when
-    /// `revision` is None, else that revision's version
-    Blob { path: String, revision: Option<u64> },
+    /// `revision` is None, else that revision's version. `overlay` keeps
+    /// the diff's colours (and lets F5 rebuild them).
+    Blob {
+        path: String,
+        revision: Option<u64>,
+        overlay: crate::svn::models::FileOverlay,
+    },
 }
 
 pub struct DiffPopup {
@@ -162,9 +167,11 @@ impl DrawableComponent for DiffPopup {
                 Some(DiffSource::Blob { .. }) => self.ctx.queue.push(InternalEvent::ClosePopup),
                 _ => {
                     if let Some((path, revision)) = self.blob_target() {
-                        self.ctx
-                            .queue
-                            .push(InternalEvent::RequestFileContent { path, revision });
+                        self.ctx.queue.push(InternalEvent::RequestFileContent {
+                            path,
+                            revision,
+                            overlay: self.view.file_overlay_at(self.view.tv.scroll.get()),
+                        });
                     }
                 }
             }
@@ -213,69 +220,80 @@ Index: dir/b.txt
 
     #[test]
     fn f_requests_the_file_behind_the_diff() {
+        /// Path/revision of the request `f` pushed (the overlay is checked
+        /// separately: it is per-section, not per-keypress).
+        fn request(p: &mut DiffPopup, q: &crate::queue::Queue) -> Option<(String, Option<u64>)> {
+            p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+            match q.pop() {
+                Some(InternalEvent::RequestFileContent { path, revision, .. }) => {
+                    Some((path, revision))
+                }
+                other => {
+                    assert!(other.is_none(), "unexpected event: {other:?}");
+                    None
+                }
+            }
+        }
+
         // working-copy diff: the file as it is on disk (no revision)
         let (mut p, q) = popup(TWO_FILES);
         p.source = Some(DiffSource::File("a.txt".into()));
-        assert!(p.event(&ts::key(KeyCode::Char('f'))).unwrap().consumed);
-        assert_eq!(
-            q.pop(),
-            Some(InternalEvent::RequestFileContent {
-                path: "a.txt".into(),
-                revision: None
-            })
-        );
+        assert_eq!(request(&mut p, &q), Some(("a.txt".into(), None)));
 
         // file-scoped revision diff: the file at that revision
         let (mut p, q) = popup(TWO_FILES);
         p.source = Some(DiffSource::Revision(7, Some("a.txt".into())));
-        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(
-            q.pop(),
-            Some(InternalEvent::RequestFileContent {
-                path: "a.txt".into(),
-                revision: Some(7)
-            })
-        );
+        assert_eq!(request(&mut p, &q), Some(("a.txt".into(), Some(7))));
 
         // whole-revision diff: the section under the cursor
         let (mut p, q) = popup(TWO_FILES);
         p.source = Some(DiffSource::Revision(7, None));
-        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(
-            q.pop(),
-            Some(InternalEvent::RequestFileContent {
-                path: "a.txt".into(),
-                revision: Some(7)
-            })
-        );
-        // ...scrolled into the second file
+        assert_eq!(request(&mut p, &q), Some(("a.txt".into(), Some(7))));
         p.view.tv.scroll.set(6);
-        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(
-            q.pop(),
-            Some(InternalEvent::RequestFileContent {
-                path: "dir/b.txt".into(),
-                revision: Some(7)
-            })
-        );
+        assert_eq!(request(&mut p, &q), Some(("dir/b.txt".into(), Some(7))));
 
         // range diff: the newest revision is the state it leads to
         let (mut p, q) = popup(TWO_FILES);
         p.source = Some(DiffSource::Range(3, 9));
-        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(
-            q.pop(),
-            Some(InternalEvent::RequestFileContent {
-                path: "a.txt".into(),
-                revision: Some(9)
-            })
-        );
+        assert_eq!(request(&mut p, &q), Some(("a.txt".into(), Some(9))));
 
         // a patch preview has no file behind it: nothing happens
         let (mut p, q) = popup(TWO_FILES);
         p.source = Some(DiffSource::Patch(std::path::PathBuf::from("x.patch")));
+        assert_eq!(request(&mut p, &q), None);
+    }
+
+    #[test]
+    fn f_carries_only_this_files_marks() {
+        // the whole-revision diff has two files; the overlay of the first
+        // section must not colour the view with the second file's changes
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Revision(7, None));
         p.event(&ts::key(KeyCode::Char('f'))).unwrap();
-        assert_eq!(q.pop(), None);
+        match q.pop() {
+            Some(InternalEvent::RequestFileContent { overlay, .. }) => {
+                assert!(overlay.added.contains(&1), "{overlay:?}");
+                assert_eq!(
+                    overlay.removed.get(&1).map(Vec::as_slice),
+                    Some(&[(1u64, "a".to_string())][..]),
+                    "a.txt's removed line only: {overlay:?}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // ...and the second section carries its own
+        p.view.tv.scroll.set(6);
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        match q.pop() {
+            Some(InternalEvent::RequestFileContent { overlay, .. }) => {
+                assert_eq!(
+                    overlay.removed.get(&1).map(Vec::as_slice),
+                    Some(&[(1u64, "c".to_string())][..]),
+                    "{overlay:?}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -284,6 +302,7 @@ Index: dir/b.txt
         p.source = Some(DiffSource::Blob {
             path: "a.txt".into(),
             revision: Some(7),
+            overlay: crate::svn::models::FileOverlay::default(),
         });
         assert!(p.event(&ts::key(KeyCode::Char('f'))).unwrap().consumed);
         assert_eq!(q.pop(), Some(InternalEvent::ClosePopup));

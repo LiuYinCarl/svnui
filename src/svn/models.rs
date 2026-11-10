@@ -130,6 +130,19 @@ pub struct DiffLine {
     pub ws_only: Option<WsMark>,
 }
 
+/// What a whole-file view needs from the diff it was opened from, so the
+/// file keeps the diff's colours: which file lines the diff adds, and where
+/// its removed lines belong (they are inserted, making the view a
+/// full-context diff).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileOverlay {
+    /// New-side line numbers the diff adds (rendered as added lines).
+    pub added: std::collections::HashSet<u64>,
+    /// Removed lines `(old line number, content)` to insert *before* the
+    /// given new-side line; [`u64::MAX`] means "after the last line".
+    pub removed: std::collections::BTreeMap<u64, Vec<(u64, String)>>,
+}
+
 /// A whitespace-only change on one side of a removed/added pair, as byte
 /// ranges into [`DiffLine::content`].
 ///

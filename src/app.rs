@@ -144,7 +144,7 @@ pub struct App {
     last_log_id: u64,
     /// File-content request in flight (`f` in a diff view): a second press
     /// before the answer arrives would stack a duplicate popup
-    pending_file: Option<(String, Option<u64>)>,
+    pending_file: Option<(String, Option<u64>, crate::svn::models::FileOverlay)>,
     /// FIFO of `svn add` batches in flight (mutations run serialized, so
     /// notifications arrive in issue order); a failed add un-stages its
     /// paths so they cannot poison the next commit
@@ -217,11 +217,16 @@ impl App {
     /// reloaded (F5). Static content (no source) yields `None`.
     /// Ask for the whole file behind a diff (`f`). One request at a time:
     /// a second press before the answer arrives would open a duplicate.
-    fn request_file_content(&mut self, path: String, revision: Option<u64>) {
+    fn request_file_content(
+        &mut self,
+        path: String,
+        revision: Option<u64>,
+        overlay: crate::svn::models::FileOverlay,
+    ) {
         if self.pending_file.is_some() {
             return;
         }
-        self.pending_file = Some((path.clone(), revision));
+        self.pending_file = Some((path.clone(), revision, overlay));
         self.svn.file_content(&path, revision);
         self.pending += 1;
     }
@@ -662,16 +667,20 @@ impl App {
                 self.svn.switch_targets();
                 self.pending += 1;
             }
-            InternalEvent::RequestFileContent { path, revision } => {
-                self.request_file_content(path, revision);
-            }
+            InternalEvent::RequestFileContent {
+                path,
+                revision,
+                overlay,
+            } => self.request_file_content(path, revision, overlay),
             InternalEvent::RefreshDiff => match self.open_diff_source() {
                 // a patch is a file on disk: re-read it, like the preview
                 Some(DiffSource::Patch(path)) => self.reload_patch_preview(&path),
                 // a whole-file view: re-read the file (replaces in place)
-                Some(DiffSource::Blob { path, revision }) => {
-                    self.request_file_content(path, revision)
-                }
+                Some(DiffSource::Blob {
+                    path,
+                    revision,
+                    overlay,
+                }) => self.request_file_content(path, revision, overlay),
                 Some(source) => self.request_diff_reload(source),
                 None => {}
             },
@@ -1319,12 +1328,24 @@ impl App {
                 revision,
                 result,
             } => {
-                self.pending_file = None;
+                let overlay = self
+                    .pending_file
+                    .take()
+                    .map(|(_, _, overlay)| overlay)
+                    .unwrap_or_default();
                 match result {
-                    Ok(prepared) => {
+                    Ok(mut prepared) => {
+                        // a full-context diff: every file line stays, added
+                        // lines keep the added colour and the removed ones
+                        // are inserted in red at their position
+                        crate::components::diff_view::apply_file_overlay(
+                            &mut prepared.parsed,
+                            &overlay,
+                        );
                         let source = DiffSource::Blob {
                             path: path.clone(),
                             revision,
+                            overlay,
                         };
                         // F5 re-reads into the open view instead of stacking
                         if self.open_diff_source().as_ref() == Some(&source) {
@@ -3475,9 +3496,14 @@ mod tests {
         let (mut app, rx) = app_with(&repo);
         test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 9\n");
 
+        let overlay = crate::svn::models::FileOverlay {
+            added: std::iter::once(1).collect(),
+            removed: std::iter::once((1, vec![(1u64, "version = 1".to_string())])).collect(),
+        };
         app.queue.push(InternalEvent::RequestFileContent {
             path: "Cargo.toml".into(),
             revision: None,
+            overlay: overlay.clone(),
         });
         app.handle_queue_events();
         // the request really ran against svn (working-copy read)
@@ -3499,6 +3525,7 @@ mod tests {
         app.queue.push(InternalEvent::RequestFileContent {
             path: "Cargo.toml".into(),
             revision: None,
+            overlay: crate::svn::models::FileOverlay::default(),
         });
         app.handle_queue_events();
         assert_eq!(app.pending, pending, "duplicate request must be dropped");
@@ -3515,12 +3542,23 @@ mod tests {
         match app.popups.last() {
             Some(Popup::Diff(d)) => {
                 assert_eq!(d.view.title, "Cargo.toml (working copy)");
-                assert_eq!(d.view.parsed.lines.len(), 1);
+                // full-context diff: the removed line is inserted in red
+                // above the added (green) file line
+                assert_eq!(d.view.parsed.lines.len(), 2);
+                assert_eq!(
+                    d.view.parsed.lines[0].kind,
+                    crate::svn::models::DiffLineKind::Removed
+                );
+                assert_eq!(
+                    d.view.parsed.lines[1].kind,
+                    crate::svn::models::DiffLineKind::Added
+                );
                 assert_eq!(
                     d.source,
                     Some(DiffSource::Blob {
                         path: "Cargo.toml".into(),
-                        revision: None
+                        revision: None,
+                        overlay
                     })
                 );
             }

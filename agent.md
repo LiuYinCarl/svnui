@@ -203,7 +203,10 @@ cargo fmt --all --check     # 格式门禁
   `Index:` 段（`DiffView::file_at`），range diff 取 `to`（差异指向的状态），补丁预览没有
   对应文件所以不响应。二进制（含 NUL）与超过 8 MiB 的文件拒绝展示，避免把大块数据塞进 UI；
   内容在 worker 线程解析成 `Context` 行（`parse_file_content`），`F5` 在原弹窗里重读而不是
-  再开一个。
+  再开一个。整文件视图是**全上下文 diff**：`DiffView::file_overlay_at(行)` 只取光标所在
+  `Index:` 段的标记（多文件 diff 不能把别的文件的改动涂上来），`apply_file_overlay` 把新增行
+  标成 Added、被删行按插入点插回（末尾用 `u64::MAX` 哨兵），overlay 随 `DiffSource::Blob`
+  保存，所以 `F5` 重读后配色仍在。
 - `svn cleanup` 成功时**不输出任何内容**（验证于 svn 1.14.5）：结果通知不带文本，成功用
   消息弹窗而不是输出弹窗。只做"删写锁"修复，**绝不能**加 `--remove-unversioned` /
   `--remove-ignored` / `--vacuum-pristines`（那些会删文件与 pristine）。target 用 `svn info`

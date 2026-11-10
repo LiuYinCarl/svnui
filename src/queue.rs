@@ -103,7 +103,12 @@ pub enum InternalEvent {
     PreviewPatch(PathBuf),
     /// Load the whole file behind the open diff (`f` in a diff view):
     /// `revision` None means the working-copy file
-    RequestFileContent { path: String, revision: Option<u64> },
+    RequestFileContent {
+        path: String,
+        revision: Option<u64>,
+        /// The diff's colours, applied to the whole-file view
+        overlay: crate::svn::models::FileOverlay,
+    },
 }
 
 /// An action that needs user confirmation.

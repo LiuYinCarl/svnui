@@ -222,6 +222,7 @@ impl StatusTab {
             self.ctx.queue.push(InternalEvent::RequestFileContent {
                 path,
                 revision: None,
+                overlay: self.diff.file_overlay_at(self.diff.tv.scroll.get()),
             });
             return Ok(EventState::consumed());
         }
@@ -499,7 +500,8 @@ mod tests {
             q.pop(),
             Some(InternalEvent::RequestFileContent {
                 path: "a.txt".into(),
-                revision: None
+                revision: None,
+                overlay: crate::svn::models::FileOverlay::default(),
             })
         );
         // the tree keeps its own `f` (flat view) when it has focus

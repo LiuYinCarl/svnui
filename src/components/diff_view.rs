@@ -5,7 +5,9 @@ use super::EventState;
 use super::text_search::highlight_spans;
 use super::text_view::{SearchOutcome, TextView};
 use crate::keys::{KeyAction, key_match};
-use crate::svn::models::{DiffLine, DiffLineKind, LogEntry, ParsedDiff, PreparedDiff, WsMark};
+use crate::svn::models::{
+    DiffLine, DiffLineKind, FileOverlay, LogEntry, ParsedDiff, PreparedDiff, WsMark,
+};
 use crate::ui::{self, style::Theme};
 use crossterm::event::Event;
 use ratatui::Frame;
@@ -231,6 +233,56 @@ impl DiffView {
         let full = std::mem::take(&mut self.parsed);
         (self.parsed, self.filter_rows) = filter_ws_only(&full);
         self.full = Some(full);
+    }
+
+    /// Marks the whole-file view needs to keep this diff's colours: the
+    /// added new-side lines and the removed lines with their insertion
+    /// point, limited to the file section the given line is in (a
+    /// multi-file diff must not colour the file with another file's
+    /// changes). Removals at the end of the file land under [`u64::MAX`].
+    pub fn file_overlay_at(&self, line: usize) -> FileOverlay {
+        let lines = &self.parsed.lines;
+        if lines.is_empty() {
+            return FileOverlay::default();
+        }
+        let head = (line + 1).min(lines.len());
+        let start = lines[..head]
+            .iter()
+            .rposition(is_file_boundary)
+            .unwrap_or(0);
+        let end = lines[start + 1..]
+            .iter()
+            .position(is_file_boundary)
+            .map_or(lines.len(), |i| start + 1 + i);
+
+        let mut overlay = FileOverlay::default();
+        // removals wait for the next line that exists on the new side
+        let mut pending: Vec<(u64, String)> = Vec::new();
+        for dl in &lines[start..end] {
+            let new_line = match dl.kind {
+                DiffLineKind::Removed => {
+                    pending.push((dl.old.unwrap_or(0), dl.content.clone()));
+                    None
+                }
+                DiffLineKind::Added => {
+                    if let Some(n) = dl.new {
+                        overlay.added.insert(n);
+                    }
+                    dl.new
+                }
+                DiffLineKind::Context => dl.new,
+                _ => None,
+            };
+            if let Some(at) = new_line
+                && !pending.is_empty()
+            {
+                overlay.removed.entry(at).or_default().append(&mut pending);
+            }
+        }
+        if !pending.is_empty() {
+            overlay.removed.insert(u64::MAX, pending);
+        }
+        overlay
     }
 
     /// Path of the file section the given line belongs to, for the
@@ -484,6 +536,37 @@ fn ws_only_difference(removed: &str, added: &str) -> Option<((usize, usize), (us
         tail += 1;
     }
     Some(((head, r.len() - tail), (head, a.len() - tail)))
+}
+
+/// Merge a diff's marks into a whole-file view: the file stays complete and
+/// line-numbered, its added lines keep the added style, and the diff's
+/// removed lines are inserted at their position — a full-context diff.
+pub fn apply_file_overlay(file: &mut ParsedDiff, overlay: &FileOverlay) {
+    let mut out = Vec::with_capacity(file.lines.len());
+    let push_removed = |out: &mut Vec<DiffLine>, removed: &[(u64, String)]| {
+        out.extend(removed.iter().map(|(old, content)| DiffLine {
+            old: Some(*old),
+            new: None,
+            kind: DiffLineKind::Removed,
+            content: content.clone(),
+            ws_only: None,
+        }));
+    };
+    for (i, mut line) in std::mem::take(&mut file.lines).into_iter().enumerate() {
+        let n = i as u64 + 1;
+        if let Some(removed) = overlay.removed.get(&n) {
+            push_removed(&mut out, removed);
+        }
+        if overlay.added.contains(&n) {
+            line.kind = DiffLineKind::Added;
+        }
+        line.new = Some(n);
+        out.push(line);
+    }
+    if let Some(removed) = overlay.removed.get(&u64::MAX) {
+        push_removed(&mut out, removed);
+    }
+    file.lines = out;
 }
 
 /// Keep only the lines that belong to a whitespace-only change, plus the
@@ -1174,6 +1257,63 @@ Index: Cargo.toml
         };
         assert_eq!(marks(DiffLineKind::Removed), vec![vec![], vec![]]);
         assert_eq!(marks(DiffLineKind::Added), vec![vec![(2, 3)], vec![(3, 4)]]);
+    }
+
+    #[test]
+    fn file_overlay_marks_added_and_inserts_removed_lines() {
+        // a change on line 2: the file keeps every line, the added one is
+        // green and the removed one is inserted above it in red
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n",
+        );
+        let overlay = v.file_overlay_at(0);
+        assert!(overlay.added.contains(&2), "{overlay:?}");
+        assert_eq!(
+            overlay.removed.get(&2).map(Vec::as_slice),
+            Some(&[(2u64, "two".to_string())][..])
+        );
+
+        let mut file = crate::svn::parser::parse_file_content("one\nTWO\nthree\n");
+        apply_file_overlay(&mut file, &overlay);
+        let kinds: Vec<(DiffLineKind, Option<u64>, Option<u64>, &str)> = file
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.old, l.new, l.content.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (DiffLineKind::Context, None, Some(1), "one"),
+                (DiffLineKind::Removed, Some(2), None, "two"),
+                (DiffLineKind::Added, None, Some(2), "TWO"),
+                (DiffLineKind::Context, None, Some(3), "three"),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_overlay_handles_end_of_file_changes() {
+        // deletion at the end: inserted after the last line
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1,2 +1 @@\n one\n-two\n");
+        let overlay = v.file_overlay_at(0);
+        let mut file = crate::svn::parser::parse_file_content("one\n");
+        apply_file_overlay(&mut file, &overlay);
+        assert_eq!(file.lines.len(), 2);
+        assert_eq!(file.lines[1].kind, DiffLineKind::Removed);
+        assert_eq!(file.lines[1].content, "two");
+
+        // addition at the end: the file's last line is green
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "Index: f\n@@ -1 +1,2 @@\n one\n+two\n");
+        let overlay = v.file_overlay_at(0);
+        let mut file = crate::svn::parser::parse_file_content("one\ntwo\n");
+        apply_file_overlay(&mut file, &overlay);
+        assert_eq!(file.lines.len(), 2);
+        assert_eq!(file.lines[1].kind, DiffLineKind::Added);
+        assert_eq!(file.lines[1].content, "two");
     }
 
     #[test]
