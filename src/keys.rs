@@ -98,6 +98,8 @@ pub enum KeyAction {
     PrevDiffFile,
     /// Diff view: show only whitespace-only changes (`w`)
     ToggleWhitespace,
+    /// Diff view: show the whole file behind the diff (`f`)
+    ShowFile,
 }
 
 /// Central keybindings: every `KeyAction` maps to one or more keys.
@@ -187,6 +189,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::NextDiffFile => is_key(ev, KeyCode::Char(']')),
         KeyAction::PrevDiffFile => is_key(ev, KeyCode::Char('[')),
         KeyAction::ToggleWhitespace => is_key(ev, KeyCode::Char('w')),
+        KeyAction::ShowFile => is_key(ev, KeyCode::Char('f')),
     }
 }
 

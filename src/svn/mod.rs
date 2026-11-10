@@ -91,6 +91,13 @@ pub enum AsyncSvnNotification {
     Resolve(Result<String, String>),
     /// `svn cleanup`: no text on success (svn prints nothing)
     Cleanup(Result<(), String>),
+    /// Whole file for the diff view's `f`: parsed on the worker thread
+    FileContent {
+        path: String,
+        /// None = the working-copy file
+        revision: Option<u64>,
+        result: Result<PreparedDiff, String>,
+    },
     /// Working copy updated to a specific revision (svn update -r N)
     UpdateToRevision(Result<String, String>),
     /// Switch targets discovered in the repository (`svn list ^/` plus
@@ -714,6 +721,60 @@ impl Svn {
         );
     }
 
+    /// Whole content of one file for the diff view's `f` (`svn cat` for a
+    /// revision, the file on disk for the working copy — `svn cat` on a
+    /// working-copy path returns the pristine BASE version, not the local
+    /// edits). Parsed on the worker thread; binary and oversized files are
+    /// refused with a message instead of flooding the view.
+    pub fn file_content(&self, path: &str, revision: Option<u64>) {
+        let cwd = self.cwd.clone();
+        let path = path.to_string();
+        let err_path = path.clone();
+        self.spawn(
+            move || {
+                let result = (|| {
+                    let bytes = match revision {
+                        Some(rev) => Self::run_in_raw(
+                            &cwd,
+                            &["cat", "-r", &rev.to_string(), "--", &Self::peg(&path)],
+                        )?,
+                        None => {
+                            let full = cwd.join(&path);
+                            let meta =
+                                std::fs::metadata(&full).map_err(|e| format!("{path}: {e}"))?;
+                            if meta.len() > MAX_FILE_VIEW_BYTES {
+                                return Err(too_large(&path, meta.len()));
+                            }
+                            std::fs::read(&full).map_err(|e| format!("{path}: {e}"))?
+                        }
+                    };
+                    if bytes.len() as u64 > MAX_FILE_VIEW_BYTES {
+                        return Err(too_large(&path, bytes.len() as u64));
+                    }
+                    if bytes.contains(&0) {
+                        return Err(format!("{path}: binary file — not displayed"));
+                    }
+                    let text = String::from_utf8_lossy(&bytes);
+                    let parsed = parser::parse_file_content(&text);
+                    Ok(PreparedDiff {
+                        empty_reason: parsed.lines.is_empty().then(|| "Empty file".to_string()),
+                        parsed,
+                    })
+                })();
+                AsyncSvnNotification::FileContent {
+                    path,
+                    revision,
+                    result,
+                }
+            },
+            move |e| AsyncSvnNotification::FileContent {
+                path: err_path,
+                revision,
+                result: Err(e),
+            },
+        );
+    }
+
     pub fn update_to_revision(&self, revision: u64) {
         let cwd = self.cwd.clone();
         self.spawn_mutating(
@@ -918,6 +979,17 @@ impl Svn {
             Err(err.trim().to_string())
         }
     }
+}
+
+/// Cap for the whole-file view: past this the file is refused with a
+/// message instead of being loaded into the UI.
+const MAX_FILE_VIEW_BYTES: u64 = 8 * 1024 * 1024;
+
+fn too_large(path: &str, bytes: u64) -> String {
+    format!(
+        "{path}: file is too large to display ({:.1} MiB)",
+        bytes as f64 / (1024.0 * 1024.0)
+    )
 }
 
 #[cfg(test)]
@@ -1182,6 +1254,80 @@ mod tests {
         c.cleanup(None);
         match recv(&rx) {
             AsyncSvnNotification::Cleanup(Ok(())) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The whole-file view must show the right version: the working copy
+    /// for a pending diff (not the pristine BASE `svn cat` returns) and the
+    /// file *as of that revision* for a historical one.
+    #[test]
+    fn file_content_reads_the_working_copy_and_a_revision() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 2\n");
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        // working copy: the local edit, not BASE
+        c.file_content("Cargo.toml", None);
+        match recv(&rx) {
+            AsyncSvnNotification::FileContent {
+                path,
+                revision,
+                result,
+            } => {
+                assert_eq!(path, "Cargo.toml");
+                assert_eq!(revision, None);
+                let prepared = result.unwrap();
+                assert!(prepared.empty_reason.is_none());
+                let text: String = prepared
+                    .parsed
+                    .lines
+                    .iter()
+                    .map(|l| format!("{}\n", l.content))
+                    .collect();
+                assert_eq!(text, "version = 2\n");
+                // every line is context with a right-hand line number
+                assert!(
+                    prepared
+                        .parsed
+                        .lines
+                        .iter()
+                        .all(|l| l.kind == crate::svn::models::DiffLineKind::Context)
+                );
+                assert_eq!(prepared.parsed.lines[0].new, Some(1));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // r1: the committed version, not the working copy
+        c.file_content("Cargo.toml", Some(1));
+        match recv(&rx) {
+            AsyncSvnNotification::FileContent {
+                revision, result, ..
+            } => {
+                assert_eq!(revision, Some(1));
+                let prepared = result.unwrap();
+                assert_eq!(prepared.parsed.lines[0].content, "version = 1");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // a missing file and a binary file are refused, not rendered
+        c.file_content("nope.txt", None);
+        match recv(&rx) {
+            AsyncSvnNotification::FileContent { result, .. } => {
+                assert!(result.unwrap_err().contains("nope.txt"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        std::fs::write(repo.wc.join("bin.dat"), b"a\0b").unwrap();
+        c.file_content("bin.dat", None);
+        match recv(&rx) {
+            AsyncSvnNotification::FileContent { result, .. } => {
+                let err = result.unwrap_err();
+                assert!(err.contains("binary"), "{err}");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -5,7 +5,7 @@ use super::components::{
     status_tree::StatusTreeComponent,
 };
 use crate::keys::{KeyAction, key_match};
-
+use crate::queue::InternalEvent;
 use crate::svn::models::{PreparedDiff, StatusEntry};
 use crossterm::event::Event;
 use ratatui::Frame;
@@ -27,6 +27,7 @@ pub struct StatusTab {
     pub commit: CommitComponent,
     pub focus: PaneFocus,
     pub last_diff_requested: Option<String>,
+    ctx: Context,
 }
 
 impl StatusTab {
@@ -42,6 +43,7 @@ impl StatusTab {
             commit: CommitComponent::new(ctx),
             focus: PaneFocus::Tree,
             last_diff_requested: None,
+            ctx: ctx.clone(),
         }
     }
 
@@ -209,6 +211,20 @@ impl StatusTab {
     // ----- events -----
 
     pub fn event(&mut self, ev: &Event) -> Result<EventState, String> {
+        // `f` in the diff pane shows the whole file behind the preview; the
+        // tree's `f` (flat view) only applies when the tree has focus.
+        if self.focus == PaneFocus::Diff
+            && let Event::Key(k) = ev
+            && key_match(k, KeyAction::ShowFile)
+            && self.tree.selection_entry().is_some()
+            && let Some(path) = self.tree.selection_path()
+        {
+            self.ctx.queue.push(InternalEvent::RequestFileContent {
+                path,
+                revision: None,
+            });
+            return Ok(EventState::consumed());
+        }
         // Focused pane first
         let consumed = match self.focus {
             PaneFocus::Tree => self.tree.event(ev)?.consumed,
@@ -467,6 +483,42 @@ mod tests {
             q.pop(),
             Some(crate::queue::InternalEvent::OpenCommit)
         ));
+    }
+
+    #[test]
+    fn f_in_the_diff_pane_requests_the_whole_file() {
+        let (mut t, q) = tab();
+        t.update_status(vec![entry('M', "a.txt")], None);
+        t.set_focus(PaneFocus::Diff);
+        assert!(
+            t.event(&ts::key(crossterm::event::KeyCode::Char('f')))
+                .unwrap()
+                .consumed
+        );
+        assert_eq!(
+            q.pop(),
+            Some(InternalEvent::RequestFileContent {
+                path: "a.txt".into(),
+                revision: None
+            })
+        );
+        // the tree keeps its own `f` (flat view) when it has focus
+        let (mut t2, q2) = tab();
+        t2.update_status(vec![entry('M', "a.txt")], None);
+        t2.event(&ts::key(crossterm::event::KeyCode::Char('f')))
+            .unwrap();
+        assert_eq!(q2.pop(), None);
+        assert!(t2.tree.is_flat());
+        // no file selected (directory) → nothing to open
+        let (mut t3, q3) = tab();
+        t3.update_status(vec![entry('M', "dir/a.txt")], None);
+        t3.set_focus(PaneFocus::Diff);
+        t3.tree
+            .event(&ts::key(crossterm::event::KeyCode::Char('k')))
+            .unwrap();
+        t3.event(&ts::key(crossterm::event::KeyCode::Char('f')))
+            .unwrap();
+        assert_eq!(q3.pop(), None);
     }
 
     #[test]

@@ -101,6 +101,9 @@ pub enum InternalEvent {
     ShowCommitInfo(LogEntry),
     /// Preview a patch file in the diff popup (patches tab)
     PreviewPatch(PathBuf),
+    /// Load the whole file behind the open diff (`f` in a diff view):
+    /// `revision` None means the working-copy file
+    RequestFileContent { path: String, revision: Option<u64> },
 }
 
 /// An action that needs user confirmation.

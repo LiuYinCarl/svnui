@@ -233,6 +233,22 @@ impl DiffView {
         self.full = Some(full);
     }
 
+    /// Path of the file section the given line belongs to, for the
+    /// whole-file view of a multi-file diff: the closest `Index: <path>`
+    /// header above it (svn prints one per file) or, for a property-only
+    /// section that has no `Index:` line, its `Property changes on: <path>`.
+    pub fn file_at(&self, line: usize) -> Option<String> {
+        let end = (line + 1).min(self.parsed.lines.len());
+        self.parsed.lines[..end].iter().rev().find_map(|dl| {
+            if dl.kind != DiffLineKind::Header {
+                return None;
+            }
+            ["Index: ", "Property changes on: "]
+                .iter()
+                .find_map(|prefix| dl.content.strip_prefix(prefix).map(str::to_string))
+        })
+    }
+
     /// Display width of the widest rendered line, including the
     /// line-number gutter (" 12  34 │ ", 2*num_w + 3 columns) for
     /// numbered lines.
@@ -1158,6 +1174,31 @@ Index: Cargo.toml
         };
         assert_eq!(marks(DiffLineKind::Removed), vec![vec![], vec![]]);
         assert_eq!(marks(DiffLineKind::Added), vec![vec![(2, 3)], vec![(3, 4)]]);
+    }
+
+    #[test]
+    fn file_at_finds_the_section_above_the_line() {
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\nIndex: dir/b.txt\n===\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        assert_eq!(v.file_at(0).as_deref(), Some("a.txt"));
+        assert_eq!(v.file_at(3).as_deref(), Some("a.txt"));
+        assert_eq!(v.file_at(5).as_deref(), Some("dir/b.txt"));
+        assert_eq!(v.file_at(9).as_deref(), Some("dir/b.txt"));
+        // a property-only section has no Index line: its own header names
+        // the file
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Property changes on: p.txt\n___________________________________________________________________\nAdded: svn:ignore\n",
+        );
+        assert_eq!(v.file_at(2).as_deref(), Some("p.txt"));
+        // a diff without any section header has none
+        let mut v = DiffView::new("t");
+        v.set_content("t".into(), "@@ -1 +1 @@\n-a\n+b\n");
+        assert_eq!(v.file_at(1), None);
     }
 
     #[test]

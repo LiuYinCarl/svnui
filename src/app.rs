@@ -142,6 +142,9 @@ pub struct App {
     last_status_id: u64,
     /// Highest applied `svn log` request id, as above
     last_log_id: u64,
+    /// File-content request in flight (`f` in a diff view): a second press
+    /// before the answer arrives would stack a duplicate popup
+    pending_file: Option<(String, Option<u64>)>,
     /// FIFO of `svn add` batches in flight (mutations run serialized, so
     /// notifications arrive in issue order); a failed add un-stages its
     /// paths so they cannot poison the next commit
@@ -179,6 +182,7 @@ impl App {
             next_req_id: 1,
             last_status_id: 0,
             last_log_id: 0,
+            pending_file: None,
             pending_adds: std::collections::VecDeque::new(),
             pending_removes: std::collections::VecDeque::new(),
         }
@@ -211,6 +215,17 @@ impl App {
 
     /// The source of the diff popup on top of the stack, if it can be
     /// reloaded (F5). Static content (no source) yields `None`.
+    /// Ask for the whole file behind a diff (`f`). One request at a time:
+    /// a second press before the answer arrives would open a duplicate.
+    fn request_file_content(&mut self, path: String, revision: Option<u64>) {
+        if self.pending_file.is_some() {
+            return;
+        }
+        self.pending_file = Some((path.clone(), revision));
+        self.svn.file_content(&path, revision);
+        self.pending += 1;
+    }
+
     fn open_diff_source(&self) -> Option<DiffSource> {
         match self.popups.last() {
             Some(Popup::Diff(d)) => d.source.clone(),
@@ -321,8 +336,9 @@ impl App {
                 self.svn.revision_diff(*rev, path.as_deref(), Some(id))
             }
             DiffSource::Range(from, to) => self.svn.range_diff(*from, *to, Some(id)),
-            // patches never reach the svn worker (see `RefreshDiff`)
-            DiffSource::Patch(_) => return,
+            // patches and whole-file views never reach this path (see
+            // `RefreshDiff`, which re-reads them directly)
+            DiffSource::Patch(_) | DiffSource::Blob { .. } => return,
         }
         self.pending_fullscreen = Some((id, source));
         self.reload_token = Some(id);
@@ -646,9 +662,16 @@ impl App {
                 self.svn.switch_targets();
                 self.pending += 1;
             }
+            InternalEvent::RequestFileContent { path, revision } => {
+                self.request_file_content(path, revision);
+            }
             InternalEvent::RefreshDiff => match self.open_diff_source() {
                 // a patch is a file on disk: re-read it, like the preview
                 Some(DiffSource::Patch(path)) => self.reload_patch_preview(&path),
+                // a whole-file view: re-read the file (replaces in place)
+                Some(DiffSource::Blob { path, revision }) => {
+                    self.request_file_content(path, revision)
+                }
                 Some(source) => self.request_diff_reload(source),
                 None => {}
             },
@@ -1291,6 +1314,32 @@ impl App {
                     self.refresh_after_op();
                 }
             },
+            AsyncSvnNotification::FileContent {
+                path,
+                revision,
+                result,
+            } => {
+                self.pending_file = None;
+                match result {
+                    Ok(prepared) => {
+                        let source = DiffSource::Blob {
+                            path: path.clone(),
+                            revision,
+                        };
+                        // F5 re-reads into the open view instead of stacking
+                        if self.open_diff_source().as_ref() == Some(&source) {
+                            self.replace_open_diff(&source, prepared, Vec::new());
+                        } else {
+                            let title = match revision {
+                                Some(rev) => format!("{path} (r{rev})"),
+                                None => format!("{path} (working copy)"),
+                            };
+                            self.show_diff_popup_prepared(source, title, prepared, Vec::new());
+                        }
+                    }
+                    Err(e) => self.show_error(e),
+                }
+            }
             AsyncSvnNotification::UpdateToRevision(result) => match result {
                 Ok(out) => {
                     self.show_output("svn update -r".to_string(), &out);
@@ -3418,6 +3467,91 @@ mod tests {
         // it right after handle_input
         app.handle_queue_events();
         assert!(matches!(app.popups.last(), Some(Popup::FileFinder(_))));
+    }
+
+    #[test]
+    fn whole_file_view_opens_reloads_and_reports_errors() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 9\n");
+
+        app.queue.push(InternalEvent::RequestFileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+        });
+        app.handle_queue_events();
+        // the request really ran against svn (working-copy read)
+        match recv(&rx) {
+            AsyncSvnNotification::FileContent {
+                path,
+                revision,
+                result,
+            } => {
+                assert_eq!(path, "Cargo.toml");
+                assert_eq!(revision, None);
+                assert_eq!(result.unwrap().parsed.lines[0].content, "version = 9");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // a second press while one is in flight is dropped
+        let pending = app.pending;
+        app.queue.push(InternalEvent::RequestFileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+        });
+        app.handle_queue_events();
+        assert_eq!(app.pending, pending, "duplicate request must be dropped");
+
+        // the delivered file becomes a diff popup titled with its version
+        app.handle_async(AsyncSvnNotification::FileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+            result: Ok(PreparedDiff {
+                parsed: crate::svn::parser::parse_file_content("version = 9\n"),
+                empty_reason: None,
+            }),
+        });
+        match app.popups.last() {
+            Some(Popup::Diff(d)) => {
+                assert_eq!(d.view.title, "Cargo.toml (working copy)");
+                assert_eq!(d.view.parsed.lines.len(), 1);
+                assert_eq!(
+                    d.source,
+                    Some(DiffSource::Blob {
+                        path: "Cargo.toml".into(),
+                        revision: None
+                    })
+                );
+            }
+            _ => panic!("expected a diff popup with the file"),
+        }
+
+        // F5 on that view re-reads the file instead of stacking a popup
+        app.queue.push(InternalEvent::RefreshDiff);
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::FileContent { revision: None, .. }
+        ));
+        app.handle_async(AsyncSvnNotification::FileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+            result: Ok(PreparedDiff {
+                parsed: crate::svn::parser::parse_file_content("version = 9\n"),
+                empty_reason: None,
+            }),
+        });
+        assert_eq!(app.popups.len(), 1, "reload replaces, never stacks");
+
+        // failures surface as an error popup
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::FileContent {
+            path: "x".into(),
+            revision: Some(3),
+            result: Err("x: binary file — not displayed".into()),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(m)) if m.is_error));
     }
 
     #[test]

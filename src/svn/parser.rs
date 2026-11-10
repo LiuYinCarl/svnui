@@ -577,6 +577,23 @@ pub fn parse_new_file_content(content: &str) -> ParsedDiff {
     ParsedDiff { lines }
 }
 
+/// Build a line-numbered view of a whole file (the diff view's `f`):
+/// every line is context, numbered on the right like a diff's new side.
+pub fn parse_file_content(content: &str) -> ParsedDiff {
+    let lines = content
+        .lines()
+        .enumerate()
+        .map(|(i, raw)| DiffLine {
+            old: None,
+            new: Some(i as u64 + 1),
+            kind: DiffLineKind::Context,
+            content: raw.trim_end_matches('\r').to_string(),
+            ws_only: None,
+        })
+        .collect();
+    ParsedDiff { lines }
+}
+
 /// Decide whether raw content is a unified diff (vs. plain text, e.g. an
 /// unversioned file shown as all-added lines). Only the *start* of the
 /// content counts: every file section of real `svn diff` output begins
@@ -626,6 +643,18 @@ mod tests {
     /// A root that matches nothing on disk (is_dir always false).
     fn no_root() -> &'static Path {
         Path::new("/svnui-test-no-such-dir")
+    }
+
+    #[test]
+    fn parse_file_content_numbers_every_line_as_context() {
+        let p = parse_file_content("first\n\nthird\r\n");
+        assert_eq!(p.lines.len(), 3);
+        assert!(p.lines.iter().all(|l| l.kind == DiffLineKind::Context));
+        assert_eq!(p.lines[0].new, Some(1));
+        assert_eq!(p.lines[1].content, "");
+        assert_eq!(p.lines[2].content, "third", "CRLF is stripped");
+        assert_eq!(p.lines[2].new, Some(3));
+        assert!(parse_file_content("").lines.is_empty());
     }
 
     #[test]

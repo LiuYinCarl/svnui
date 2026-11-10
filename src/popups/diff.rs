@@ -26,6 +26,9 @@ pub enum DiffSource {
     Range(u64, u64),
     /// A patch file shown as a diff (re-read from disk)
     Patch(PathBuf),
+    /// The whole file behind a diff (`f`): the working-copy file when
+    /// `revision` is None, else that revision's version
+    Blob { path: String, revision: Option<u64> },
 }
 
 pub struct DiffPopup {
@@ -37,6 +40,24 @@ pub struct DiffPopup {
 }
 
 impl DiffPopup {
+    /// `(path, revision)` of the file the reader is in — the target of the
+    /// whole-file view. Multi-file diffs (a whole revision, a range) use
+    /// the `Index:` section at the cursor; a patch preview has no file.
+    fn blob_target(&self) -> Option<(String, Option<u64>)> {
+        match self.source.as_ref()? {
+            DiffSource::File(path) => Some((path.clone(), None)),
+            DiffSource::Revision(rev, Some(path)) => Some((path.clone(), Some(*rev))),
+            DiffSource::Revision(rev, None) => {
+                Some((self.view.file_at(self.view.tv.scroll.get())?, Some(*rev)))
+            }
+            // the range's newest revision is the state the diff leads to
+            DiffSource::Range(_, to) => {
+                Some((self.view.file_at(self.view.tv.scroll.get())?, Some(*to)))
+            }
+            DiffSource::Patch(_) | DiffSource::Blob { .. } => None,
+        }
+    }
+
     pub fn new(ctx: &Context, title: String, content: &str) -> Self {
         let mut view = DiffView::new(&title);
         view.set_content(title, content);
@@ -132,6 +153,23 @@ impl DrawableComponent for DiffPopup {
             }
             return Ok(EventState::consumed());
         }
+        // `f`: the whole file behind this diff. On a whole-file view the
+        // same key goes back to the diff underneath.
+        if let Event::Key(k) = ev
+            && key_match(k, KeyAction::ShowFile)
+        {
+            match self.source.as_ref() {
+                Some(DiffSource::Blob { .. }) => self.ctx.queue.push(InternalEvent::ClosePopup),
+                _ => {
+                    if let Some((path, revision)) = self.blob_target() {
+                        self.ctx
+                            .queue
+                            .push(InternalEvent::RequestFileContent { path, revision });
+                    }
+                }
+            }
+            return Ok(EventState::consumed());
+        }
         let consumed = self.view.event(ev);
         if consumed.consumed {
             return Ok(EventState::consumed());
@@ -157,6 +195,98 @@ mod tests {
             theme: Theme::default(),
         };
         (DiffPopup::new(&c, "a".to_string(), content), q)
+    }
+
+    /// Two-file diff: `Index:` sections at parsed lines 0 and 4.
+    const TWO_FILES: &str = "\
+Index: a.txt
+===================================================================
+@@ -1 +1 @@
+-a
++b
+Index: dir/b.txt
+===================================================================
+@@ -1 +1 @@
+-c
++d
+";
+
+    #[test]
+    fn f_requests_the_file_behind_the_diff() {
+        // working-copy diff: the file as it is on disk (no revision)
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::File("a.txt".into()));
+        assert!(p.event(&ts::key(KeyCode::Char('f'))).unwrap().consumed);
+        assert_eq!(
+            q.pop(),
+            Some(InternalEvent::RequestFileContent {
+                path: "a.txt".into(),
+                revision: None
+            })
+        );
+
+        // file-scoped revision diff: the file at that revision
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Revision(7, Some("a.txt".into())));
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(
+            q.pop(),
+            Some(InternalEvent::RequestFileContent {
+                path: "a.txt".into(),
+                revision: Some(7)
+            })
+        );
+
+        // whole-revision diff: the section under the cursor
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Revision(7, None));
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(
+            q.pop(),
+            Some(InternalEvent::RequestFileContent {
+                path: "a.txt".into(),
+                revision: Some(7)
+            })
+        );
+        // ...scrolled into the second file
+        p.view.tv.scroll.set(6);
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(
+            q.pop(),
+            Some(InternalEvent::RequestFileContent {
+                path: "dir/b.txt".into(),
+                revision: Some(7)
+            })
+        );
+
+        // range diff: the newest revision is the state it leads to
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Range(3, 9));
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(
+            q.pop(),
+            Some(InternalEvent::RequestFileContent {
+                path: "a.txt".into(),
+                revision: Some(9)
+            })
+        );
+
+        // a patch preview has no file behind it: nothing happens
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Patch(std::path::PathBuf::from("x.patch")));
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn f_closes_the_whole_file_view() {
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Blob {
+            path: "a.txt".into(),
+            revision: Some(7),
+        });
+        assert!(p.event(&ts::key(KeyCode::Char('f'))).unwrap().consumed);
+        assert_eq!(q.pop(), Some(InternalEvent::ClosePopup));
     }
 
     /// A diff with the needle "needle" on parsed lines 8 and 10, far enough

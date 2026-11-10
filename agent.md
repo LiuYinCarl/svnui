@@ -52,7 +52,7 @@ src/
 │   ├── status_flat.rs  平铺视图的路径显示（目录缩写、碰撞回退全路径、中间省略）
 │   ├── diff_view.rs  可滚动 Diff 视图（状态页与全屏弹窗共用；h/l 横向滚动看长行；
 │   │                 [/] 在多文件 diff 中按文件节跳转——边界取 parser 判出的 Header 行；
-│   │                 w 只看纯空白改动，tab 展开为空格、空白差异用底色标记）
+│   │                 w 只看纯空白改动；f 看整个文件（工作副本或该修订版本））
 │   ├── commit.rs     提交信息输入栏（tui-textarea-2，Tab 回填最近提交信息）
 │   ├── log.rs        日志标签页（修订列表滚动分页 + 详情 + 关键字筛选 + 多选合并 diff）
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
@@ -197,6 +197,13 @@ cargo fmt --all --check     # 格式门禁
   `RefreshInfo`，不能复用 `check_info`（那里失败会置 fatal_error，把切换后的瞬时
   网络错误变成启动级致命错误）。
 - `svn list -R` 必须带 `.@HEAD` peg，否则按 wc 根目录的 BASE 修订列举。
+- 整个文件视图（diff 里按 `f`）：待提交的 diff 要显示**工作副本**内容，必须直接读磁盘——
+  `svn cat <wc路径>` 返回的是 pristine 的 BASE 版本，不是本地修改；历史 diff 用
+  `svn cat -r <rev> -- path@`（空 peg 防 `@` 文件名），多文件 diff 取光标所在行之上最近的
+  `Index:` 段（`DiffView::file_at`），range diff 取 `to`（差异指向的状态），补丁预览没有
+  对应文件所以不响应。二进制（含 NUL）与超过 8 MiB 的文件拒绝展示，避免把大块数据塞进 UI；
+  内容在 worker 线程解析成 `Context` 行（`parse_file_content`），`F5` 在原弹窗里重读而不是
+  再开一个。
 - `svn cleanup` 成功时**不输出任何内容**（验证于 svn 1.14.5）：结果通知不带文本，成功用
   消息弹窗而不是输出弹窗。只做"删写锁"修复，**绝不能**加 `--remove-unversioned` /
   `--remove-ignored` / `--vacuum-pristines`（那些会删文件与 pristine）。target 用 `svn info`
