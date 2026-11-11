@@ -285,6 +285,36 @@ impl DiffView {
         overlay
     }
 
+    /// New-side line number the whole-file view (`f`) should open at, so
+    /// the reader keeps their place instead of jumping to the top: the
+    /// number of the file line the viewport starts on. Context and added
+    /// lines carry their own number; a removed line does not exist on the
+    /// new side, so the nearest number above it is used (the overlay
+    /// inserts removals right after that line, which keeps them on
+    /// screen); header/hunk rows take the section's first numbered line
+    /// below. A section with no numbered rows (property changes) gives
+    /// `None`, and the file view simply opens at the top.
+    pub fn file_line_at(&self, line: usize) -> Option<u64> {
+        let lines = &self.parsed.lines;
+        let at = lines.get(line)?;
+        // the file section the row belongs to (same bounds as overlay_at):
+        // the scan must not cross an `Index:` boundary, where line numbers
+        // restart for the next file
+        let start = lines[..=line]
+            .iter()
+            .rposition(is_file_boundary)
+            .unwrap_or(0);
+        let end = lines[start + 1..]
+            .iter()
+            .position(is_file_boundary)
+            .map_or(lines.len(), |i| start + 1 + i);
+        if at.kind == DiffLineKind::Removed {
+            lines[start..=line].iter().rev().find_map(|dl| dl.new)
+        } else {
+            lines[line..end].iter().find_map(|dl| dl.new)
+        }
+    }
+
     /// Path of the file section the given line belongs to, for the
     /// whole-file view of a multi-file diff: the closest `Index: <path>`
     /// header above it (svn prints one per file) or, for a property-only
@@ -1339,6 +1369,47 @@ Index: Cargo.toml
         let mut v = DiffView::new("t");
         v.set_content("t".into(), "@@ -1 +1 @@\n-a\n+b\n");
         assert_eq!(v.file_at(1), None);
+    }
+
+    #[test]
+    fn file_line_maps_the_diff_row_to_the_file_line() {
+        // rows: 0 Index, 1 ===, 2 @@, 3 " one"(new 1), 4 "-two",
+        // 5 "+2"(new 2), 6 " three"(new 3), 7 " four"(new 4)
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: f\n===\n@@ -1,4 +1,4 @@\n one\n-two\n+2\n three\n four\n",
+        );
+        // a header/hunk row takes the section's first numbered line below
+        assert_eq!(v.file_line_at(0), Some(1));
+        assert_eq!(v.file_line_at(2), Some(1));
+        // context/added rows carry their own number
+        assert_eq!(v.file_line_at(3), Some(1));
+        assert_eq!(v.file_line_at(5), Some(2));
+        assert_eq!(v.file_line_at(6), Some(3));
+        assert_eq!(v.file_line_at(7), Some(4));
+        // a removed row is not on the new side: the nearest number above,
+        // so the overlay-inserted removal stays just below the viewport top
+        assert_eq!(v.file_line_at(4), Some(1));
+        // out of range: no anchor at all
+        assert_eq!(v.file_line_at(8), None);
+    }
+
+    #[test]
+    fn file_line_never_crosses_a_section_boundary() {
+        // each section restarts its numbering; a scan for the anchor row's
+        // number must not pick up the previous file's lines
+        let mut v = DiffView::new("t");
+        v.set_content(
+            "t".into(),
+            "Index: a.txt\n===\n@@ -1 +1 @@\n-a\n+b\nIndex: dir/b.txt\n===\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        // b.txt's diff starts with a removal at the top of the file: there
+        // is no numbered line above it in that section (a.txt's "+b" is
+        // across the boundary), so the file view opens at the top
+        assert_eq!(v.file_line_at(8), None);
+        // still, the section's own first numbered line is found below
+        assert_eq!(v.file_line_at(6), Some(1));
     }
 
     #[test]

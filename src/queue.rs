@@ -108,6 +108,9 @@ pub enum InternalEvent {
         revision: Option<u64>,
         /// The diff's colours, applied to the whole-file view
         overlay: crate::svn::models::FileOverlay,
+        /// New-side line number the view should open at (the diff row
+        /// the `f` came from), so the reader keeps their place
+        anchor: Option<u64>,
     },
 }
 

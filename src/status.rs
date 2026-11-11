@@ -219,10 +219,13 @@ impl StatusTab {
             && self.tree.selection_entry().is_some()
             && let Some(path) = self.tree.selection_path()
         {
+            let at = self.diff.tv.scroll.get();
             self.ctx.queue.push(InternalEvent::RequestFileContent {
                 path,
                 revision: None,
-                overlay: self.diff.file_overlay_at(self.diff.tv.scroll.get()),
+                overlay: self.diff.file_overlay_at(at),
+                // open the whole file where the diff is being read
+                anchor: self.diff.file_line_at(at),
             });
             return Ok(EventState::consumed());
         }
@@ -502,6 +505,7 @@ mod tests {
                 path: "a.txt".into(),
                 revision: None,
                 overlay: crate::svn::models::FileOverlay::default(),
+                anchor: None,
             })
         );
         // the tree keeps its own `f` (flat view) when it has focus

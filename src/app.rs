@@ -143,8 +143,16 @@ pub struct App {
     /// Highest applied `svn log` request id, as above
     last_log_id: u64,
     /// File-content request in flight (`f` in a diff view): a second press
-    /// before the answer arrives would stack a duplicate popup
-    pending_file: Option<(String, Option<u64>, crate::svn::models::FileOverlay)>,
+    /// before the answer arrives would stack a duplicate popup. The last
+    /// element is the line to open the whole-file view at (the diff row
+    /// the `f` came from); `None` keeps the top (F5 re-reads keep their
+    /// scroll through `reload`, so they pass no anchor).
+    pending_file: Option<(
+        String,
+        Option<u64>,
+        crate::svn::models::FileOverlay,
+        Option<u64>,
+    )>,
     /// FIFO of `svn add` batches in flight (mutations run serialized, so
     /// notifications arrive in issue order); a failed add un-stages its
     /// paths so they cannot poison the next commit
@@ -222,11 +230,12 @@ impl App {
         path: String,
         revision: Option<u64>,
         overlay: crate::svn::models::FileOverlay,
+        anchor: Option<u64>,
     ) {
         if self.pending_file.is_some() {
             return;
         }
-        self.pending_file = Some((path.clone(), revision, overlay));
+        self.pending_file = Some((path.clone(), revision, overlay, anchor));
         self.svn.file_content(&path, revision);
         self.pending += 1;
     }
@@ -671,16 +680,18 @@ impl App {
                 path,
                 revision,
                 overlay,
-            } => self.request_file_content(path, revision, overlay),
+                anchor,
+            } => self.request_file_content(path, revision, overlay, anchor),
             InternalEvent::RefreshDiff => match self.open_diff_source() {
                 // a patch is a file on disk: re-read it, like the preview
                 Some(DiffSource::Patch(path)) => self.reload_patch_preview(&path),
-                // a whole-file view: re-read the file (replaces in place)
+                // a whole-file view: re-read the file (replaces in place);
+                // no anchor — the reload keeps the current scroll position
                 Some(DiffSource::Blob {
                     path,
                     revision,
                     overlay,
-                }) => self.request_file_content(path, revision, overlay),
+                }) => self.request_file_content(path, revision, overlay, None),
                 Some(source) => self.request_diff_reload(source),
                 None => {}
             },
@@ -1328,10 +1339,10 @@ impl App {
                 revision,
                 result,
             } => {
-                let overlay = self
+                let (overlay, anchor) = self
                     .pending_file
                     .take()
-                    .map(|(_, _, overlay)| overlay)
+                    .map(|(_, _, overlay, anchor)| (overlay, anchor))
                     .unwrap_or_default();
                 match result {
                     Ok(mut prepared) => {
@@ -1356,6 +1367,16 @@ impl App {
                                 None => format!("{path} (working copy)"),
                             };
                             self.show_diff_popup_prepared(source, title, prepared, Vec::new());
+                            // open where the diff was being read (`f` keeps
+                            // the reader's place); after the overlay each
+                            // file line carries its number in `new`
+                            if let Some(n) = anchor
+                                && let Some(Popup::Diff(d)) = self.popups.last_mut()
+                                && let Some(row) =
+                                    d.view.parsed.lines.iter().position(|dl| dl.new == Some(n))
+                            {
+                                d.view.tv.scroll.set(row);
+                            }
                         }
                     }
                     Err(e) => self.show_error(e),
@@ -3504,6 +3525,7 @@ mod tests {
             path: "Cargo.toml".into(),
             revision: None,
             overlay: overlay.clone(),
+            anchor: None,
         });
         app.handle_queue_events();
         // the request really ran against svn (working-copy read)
@@ -3526,6 +3548,7 @@ mod tests {
             path: "Cargo.toml".into(),
             revision: None,
             overlay: crate::svn::models::FileOverlay::default(),
+            anchor: None,
         });
         app.handle_queue_events();
         assert_eq!(app.pending, pending, "duplicate request must be dropped");
@@ -3590,6 +3613,59 @@ mod tests {
             result: Err("x: binary file — not displayed".into()),
         });
         assert!(matches!(app.popups.last(), Some(Popup::Msg(m)) if m.is_error));
+    }
+
+    #[test]
+    fn whole_file_view_opens_where_the_diff_was_read() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        // `f` on a diff scrolled to its line for file line 3: the view
+        // must open there, not jump to the top
+        app.queue.push(InternalEvent::RequestFileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+            overlay: crate::svn::models::FileOverlay::default(),
+            anchor: Some(3),
+        });
+        app.handle_queue_events();
+        app.handle_async(AsyncSvnNotification::FileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+            result: Ok(PreparedDiff {
+                parsed: crate::svn::parser::parse_file_content("a\nb\nc\nd\n"),
+                empty_reason: None,
+            }),
+        });
+        match app.popups.last() {
+            Some(Popup::Diff(d)) => {
+                assert_eq!(d.view.tv.scroll.get(), 2, "file line 3 is row 2");
+            }
+            _ => panic!("expected a diff popup with the file"),
+        }
+
+        // an anchor without a matching line falls back to the top
+        app.queue.push(InternalEvent::RequestFileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+            overlay: crate::svn::models::FileOverlay::default(),
+            anchor: Some(99),
+        });
+        app.handle_queue_events();
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::FileContent {
+            path: "Cargo.toml".into(),
+            revision: None,
+            result: Ok(PreparedDiff {
+                parsed: crate::svn::parser::parse_file_content("a\nb\nc\nd\n"),
+                empty_reason: None,
+            }),
+        });
+        match app.popups.last() {
+            Some(Popup::Diff(d)) => {
+                assert_eq!(d.view.tv.scroll.get(), 0, "no match: stay at the top");
+            }
+            _ => panic!("expected a diff popup with the file"),
+        }
     }
 
     #[test]

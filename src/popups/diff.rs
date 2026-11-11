@@ -167,10 +167,13 @@ impl DrawableComponent for DiffPopup {
                 Some(DiffSource::Blob { .. }) => self.ctx.queue.push(InternalEvent::ClosePopup),
                 _ => {
                     if let Some((path, revision)) = self.blob_target() {
+                        let at = self.view.tv.scroll.get();
                         self.ctx.queue.push(InternalEvent::RequestFileContent {
                             path,
                             revision,
-                            overlay: self.view.file_overlay_at(self.view.tv.scroll.get()),
+                            overlay: self.view.file_overlay_at(at),
+                            // open the whole file where the diff is being read
+                            anchor: self.view.file_line_at(at),
                         });
                     }
                 }
@@ -291,6 +294,34 @@ Index: dir/b.txt
                     Some(&[(1u64, "c".to_string())][..]),
                     "{overlay:?}"
                 );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f_carries_the_position_to_the_whole_file_view() {
+        // the whole-file view must open where the diff is being read, not
+        // at the top: the request carries the viewport's new-side line
+        let (mut p, q) = popup(TWO_FILES);
+        p.source = Some(DiffSource::Revision(7, None));
+        // scrolled into the second file's section: its first numbered line
+        p.view.tv.scroll.set(6);
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        match q.pop() {
+            Some(InternalEvent::RequestFileContent { anchor, .. }) => {
+                assert_eq!(anchor, Some(1));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // a removal at the top of the section has no numbered line above
+        // it within that section: the file view opens at the top (the file
+        // starts the same way)
+        p.view.tv.scroll.set(8);
+        p.event(&ts::key(KeyCode::Char('f'))).unwrap();
+        match q.pop() {
+            Some(InternalEvent::RequestFileContent { anchor, .. }) => {
+                assert_eq!(anchor, None);
             }
             other => panic!("unexpected: {other:?}"),
         }
