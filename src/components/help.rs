@@ -26,6 +26,50 @@ impl HelpPopup {
     }
 }
 
+/// Wrap a help description to `width` columns. Words are kept whole
+/// where possible; a single word longer than the width is hard-split so
+/// nothing is silently clipped. Returns at least one line.
+fn wrap_description(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            if word_len > width {
+                let mut rest = word;
+                while rest.chars().count() > width {
+                    let split = rest
+                        .char_indices()
+                        .nth(width)
+                        .map(|(i, _)| i)
+                        .unwrap_or(rest.len());
+                    lines.push(rest[..split].to_string());
+                    rest = &rest[split..];
+                }
+                current.push_str(rest);
+            } else {
+                current.push_str(word);
+            }
+        } else if current.chars().count() + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 impl DrawableComponent for HelpPopup {
     fn draw(&self, f: &mut Frame, area: Rect) -> Result<(), String> {
         let theme = &self.ctx.theme;
@@ -47,11 +91,25 @@ impl DrawableComponent for HelpPopup {
         lines.push(Line::from(""));
         for group in all_binding_groups() {
             lines.push(Line::from(Span::styled(group.title, theme.title_focused)));
+            // The key column is 20 cells wide (two spaces + 18); wrap the
+            // description into what is left instead of letting the buffer
+            // clip it (at 80 cols a single line only fits ~38 chars).
+            let desc_width = (inner.width as usize).saturating_sub(20);
             for b in group.bindings {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {: <18}", b.keys), theme.info),
-                    Span::styled(b.description, theme.text),
-                ]));
+                for (i, part) in wrap_description(&b.description, desc_width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let prefix = if i == 0 {
+                        format!("  {: <18}", b.keys)
+                    } else {
+                        " ".repeat(20)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, theme.info),
+                        Span::styled(part, theme.text),
+                    ]));
+                }
             }
             lines.push(Line::from(""));
         }
@@ -101,6 +159,22 @@ mod tests {
     use crate::queue::InternalEvent;
     use crate::test_support as ts;
     use crate::ui::style::Theme;
+
+    #[test]
+    fn long_descriptions_wrap_instead_of_clipping() {
+        assert_eq!(
+            wrap_description("one two three four five six", 10),
+            vec!["one two", "three four", "five six"]
+        );
+        // a single over-long word is hard-split rather than dropped
+        assert_eq!(
+            wrap_description("abcdefghijkl", 5),
+            vec!["abcde", "fghij", "kl"]
+        );
+        assert_eq!(wrap_description("", 5), vec![""]);
+        // no width to wrap into: keep the text on one (clipped) line
+        assert_eq!(wrap_description("abc", 0), vec!["abc"]);
+    }
 
     #[test]
     fn draw_and_close() {

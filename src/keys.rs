@@ -227,7 +227,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "Tab / Shift+Tab",
                     "Cycle pane focus (status: tree/diff/commit, log: list/details); in the commit input Tab opens history",
                 ),
-                KeyBinding::new("Ctrl+p", "Fuzzy find a versioned file"),
+                KeyBinding::new("Ctrl+p", "Fuzzy find a working-copy file"),
                 KeyBinding::new("P", "Save working-copy changes as a patch file (no revert)"),
                 KeyBinding::new(
                     "C",
@@ -238,7 +238,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("?", "Show this help"),
                 KeyBinding::new(
                     "q / Ctrl+C",
-                    "Quit svnui (Ctrl+C is ignored during working-copy mutations)",
+                    "Quit svnui (deferred during working-copy mutations)",
                 ),
             ],
         },
@@ -257,11 +257,15 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "Revert selected files (or the whole staged set; svn revert)",
                 ),
                 KeyBinding::new("x", "Resolve conflict (accept working copy)"),
-                KeyBinding::new("Enter / d", "Diff of the selected file"),
+                KeyBinding::new(
+                    "Enter / d",
+                    "Diff of selected file (Enter also expands a directory)",
+                ),
                 KeyBinding::new("b", "Blame file (svn blame)"),
                 KeyBinding::new("t", "File history (svn log of selected file)"),
                 KeyBinding::new("/", "Filter status files (popup)"),
                 KeyBinding::new("f", "Toggle flat view (only M/A/D files, compact paths)"),
+                KeyBinding::new("Esc", "Clear the active status filter"),
                 KeyBinding::new("c", "Focus commit message / commit"),
                 KeyBinding::new("Enter / Ctrl+s", "Commit (in commit input)"),
                 KeyBinding::new("Tab", "Commit input: pick a recent message"),
@@ -272,20 +276,28 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
         KeyGroup {
             title: "Log tab",
             bindings: vec![
+                KeyBinding::new("j / ↓ / k / ↑", "Move selection"),
+                KeyBinding::new("g / G", "Jump to first / last revision"),
+                KeyBinding::new("PgUp / PgDn", "Page up / down"),
                 KeyBinding::new("Enter / d", "Diff of selected / marked revisions"),
                 KeyBinding::new("space", "Mark / unmark revision (range diff)"),
                 KeyBinding::new("v", "Show full commit info"),
                 KeyBinding::new("o", "Update working copy to selected revision"),
                 KeyBinding::new("/", "Filter loaded commits / search all history"),
                 KeyBinding::new("Tab", "Focus the details pane (j/k scroll it)"),
+                KeyBinding::new("Esc", "Clear filter/search, else back to the status tab"),
             ],
         },
         KeyGroup {
             title: "Patches tab",
             bindings: vec![
+                KeyBinding::new("j / ↓ / k / ↑", "Move selection"),
+                KeyBinding::new("g / G", "Jump to first / last patch"),
+                KeyBinding::new("PgUp / PgDn", "Page up / down"),
                 KeyBinding::new("Enter / p", "Preview patch (diff view)"),
                 KeyBinding::new("a", "Apply patch (svn patch, confirmed)"),
                 KeyBinding::new("d", "Delete patch file (confirmed)"),
+                KeyBinding::new("Esc", "Back to the status tab"),
             ],
         },
         KeyGroup {
@@ -311,6 +323,11 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "Diff view: previous / next file in a multi-file diff",
                 ),
                 KeyBinding::new("w", "Diff view: show only whitespace-only changes (toggle)"),
+                KeyBinding::new(
+                    "f",
+                    "Diff view: show the whole file (toggle back to the diff)",
+                ),
+                KeyBinding::new("Enter / d", "File history: diff of the selected revision"),
                 KeyBinding::new("Enter", "Blame popup: diff of the cursor line's revision"),
                 KeyBinding::new("Ctrl+b", "File finder: blame highlighted file"),
                 KeyBinding::new("b", "File history popup: blame the file"),
@@ -318,7 +335,21 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "Ctrl+d / Ctrl+u",
                     "File history popup: scroll commit message",
                 ),
-                KeyBinding::new("j / k", "Message popup: scroll a long error"),
+                KeyBinding::new(
+                    "Enter / ↑ / ↓",
+                    "Switch popup: confirm / pick a branch; Esc cancels",
+                ),
+                KeyBinding::new(
+                    "Enter / ↑ / ↓",
+                    "File finder: open history / move; Ctrl+b blames",
+                ),
+                KeyBinding::new(
+                    "Enter / Esc",
+                    "Status filter / log search: keep / cancel input",
+                ),
+                KeyBinding::new("y / n", "Confirm popup: yes / no (Esc cancels)"),
+                KeyBinding::new("j / k / g / G", "Message / output popup: scroll"),
+                KeyBinding::new("j / k / PgUp / PgDn", "This help: scroll"),
                 KeyBinding::new("Esc", "Close popup / cancel / clear search highlights"),
             ],
         },
@@ -485,6 +516,35 @@ mod tests {
         // ctrl-modified letters are rejected by plain char matches
         let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
         assert!(!key_match(&ctrl_j, KeyAction::MoveDown));
+    }
+
+    #[test]
+    fn help_lists_current_features() {
+        let groups = all_binding_groups();
+        let all: Vec<(&str, &str)> = groups
+            .iter()
+            .flat_map(|g| {
+                g.bindings
+                    .iter()
+                    .map(|b| (b.keys.as_str(), b.description.as_str()))
+            })
+            .collect();
+        let has = |keys: &str, needle: &str| {
+            all.iter()
+                .any(|(k, d)| k.contains(keys) && d.contains(needle))
+        };
+        // recently added features must stay documented (help went stale
+        // before: the flat view and the whole-file diff `f` were missing)
+        assert!(has("f", "flat view"));
+        assert!(has("f", "whole file"));
+        assert!(has("w", "whitespace"));
+        assert!(has("C", "Clean up"));
+        assert!(has("s", "Switch working copy"));
+        assert!(has("Ctrl+C", "Quit"));
+        assert!(has("Ctrl+p", "Fuzzy"));
+        assert!(has("Ctrl+b", "blame"));
+        assert!(has("y / n", "Confirm popup"));
+        assert!(has("[ / ]", "previous / next file"));
     }
 
     #[test]
