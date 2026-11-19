@@ -103,7 +103,7 @@ src/
 - `build_tree` 为 O(n)：一次性 HashMap 建节点 + 索引装配 + 排序；
 - 虚拟化渲染：文件树 / 日志列表 / Diff / Blame 每次 draw 只构建可见窗口（O(屏幕高度)）；
 - `dir_staged_counts` 缓存：按目录的暂存计数只在暂存集合或条目变化时重算；
-- 提交路径索引一次构建：`expand_commit_paths`/`status_chars` 不再对每个路径线性扫描；
+- 提交路径索引一次构建：`expand_commit_paths`/`expanded_commit_targets` 不再对每个路径线性扫描；
 - add/commit/revert 超过 128 个路径时走 `svn --targets` 临时文件，避免 ARG_MAX；
 - `cargo test perf` 是 CI 强制的带时间预算回归测试，复杂度回归会被门禁拦下；
   `cargo bench --bench tree`（criterion，release）提供本地精确数据。
