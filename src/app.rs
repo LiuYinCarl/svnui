@@ -736,7 +736,7 @@ impl App {
                     // in order)
                     self.pending_removes.push_back(paths.clone());
                     self.svn.remove(&paths);
-                    self.pending += 1;
+                    self.begin_mutation();
                 }
             }
             InternalEvent::RequestFileDiff => {
@@ -935,11 +935,11 @@ impl App {
                 // fall back to the start directory)
                 let root = self.svn_info.as_ref().map(|i| i.wc_root.as_str());
                 self.svn.cleanup(root);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::Switch(target) => {
                 self.svn.switch(&target);
-                self.pending += 1;
+                self.begin_mutation();
             }
             ConfirmAction::Resolve(path) => {
                 self.svn.resolve(&path);
@@ -995,11 +995,14 @@ impl App {
         if matches!(
             &notif,
             AsyncSvnNotification::Add(_)
+                | AsyncSvnNotification::Remove(_)
                 | AsyncSvnNotification::Revert(_)
                 | AsyncSvnNotification::Resolve(_)
                 | AsyncSvnNotification::Update(_)
                 | AsyncSvnNotification::UpdateToRevision(_)
                 | AsyncSvnNotification::Commit(_)
+                | AsyncSvnNotification::Cleanup(_)
+                | AsyncSvnNotification::Switch(_)
                 | AsyncSvnNotification::ApplyPatch(_)
         ) {
             self.pending_mutations = self.pending_mutations.saturating_sub(1);
@@ -1859,6 +1862,27 @@ mod tests {
         app.popups.clear();
         app.handle_input(&ts_key(KeyCode::Char('q'))).unwrap();
         assert!(app.quitting);
+    }
+
+    #[test]
+    fn remove_cleanup_and_switch_also_defer_quit() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.handle_internal(InternalEvent::RemoveFiles(vec!["Cargo.toml".to_string()]));
+        assert_eq!(app.pending_mutations, 1, "svn rm is a mutation");
+        app.perform_confirmed(ConfirmAction::Cleanup);
+        assert_eq!(app.pending_mutations, 2, "svn cleanup is a mutation");
+        app.perform_confirmed(ConfirmAction::Switch("^/branches/does-not-exist".into()));
+        assert_eq!(app.pending_mutations, 3, "svn switch is a mutation");
+        // mutations run serialized: drain them so the temporary repo is
+        // not dropped while svn is still writing to it
+        // each mutation refreshes the status/diff, so drain until every
+        // follow-up read is done too
+        while app.pending > 0 {
+            let notif = recv(&rx);
+            app.handle_async(notif);
+        }
+        assert_eq!(app.pending_mutations, 0);
     }
 
     #[test]
