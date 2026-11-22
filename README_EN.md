@@ -147,6 +147,14 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
+If the tagged commit message carries `[skip ci]` (as the automated bump commit does), GitHub skips every
+workflow for that push — including the tag-triggered `release.yml`. Dispatch it manually instead (the tag
+must already be pushed and match the `Cargo.toml` version):
+
+```bash
+gh workflow run release.yml -f tag=v0.2.0
+```
+
 ## Performance (very large SVN projects)
 
 Optimized for working copies with 100k+ files:

@@ -144,6 +144,13 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
+如果标签指向的提交信息带 `[skip ci]`（如自动 bump 产生的提交），GitHub 会跳过该次 push 的所有工作流，
+包括标签触发的 release.yml。这时改成手动 dispatch（标签必须已推送且与 `Cargo.toml` 版本一致）：
+
+```bash
+gh workflow run release.yml -f tag=v0.2.0
+```
+
 ## 性能（超大型 SVN 项目）
 
 针对 10 万+ 文件的工作副本做了针对性优化：

@@ -11,6 +11,15 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual dispatch, e.g. when the tag points at a `[skip ci]` bump commit
+  # (GitHub skips every push-triggered workflow for such commits, including
+  # the tag push itself): `gh workflow run release.yml -f tag=v0.1.1`.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release (e.g. v0.1.1)'
+        required: true
+        type: string
   workflow_call:
     inputs:
       tag:
