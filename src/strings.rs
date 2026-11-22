@@ -44,6 +44,9 @@ pub struct Msg {
     pub commit_staged: &'static str,
     pub commit_nothing_staged: &'static str,
     pub revert_confirm: &'static str,
+    /// Revert confirmation when every target is a scheduled add ('A'):
+    /// `svn revert` only un-schedules those, nothing is restored/lost.
+    pub undo_add_confirm: &'static str,
     pub update_confirm: &'static str,
     pub resolve_confirm: &'static str,
     pub cleanup_confirm: &'static str,
@@ -80,6 +83,7 @@ pub const MSG: Msg = Msg {
     commit_staged: "Commit staged changes?",
     commit_nothing_staged: "Nothing staged — stage files with space, or stage all with A",
     revert_confirm: "Revert local changes? (discards modifications)",
+    undo_add_confirm: "Undo add? (svn revert un-schedules it; a plain new file stays on disk)",
     update_confirm: "Run svn update?",
     resolve_confirm: "Resolve conflict using the working copy version?",
     cleanup_confirm: "Run svn cleanup? It removes write locks left by an interrupted operation; make sure no other SVN client is using this working copy.",

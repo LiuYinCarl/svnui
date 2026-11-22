@@ -110,7 +110,7 @@ impl StatusTab {
             None => (entries, None),
         };
         self.tree.set_svnignore_hidden(hidden);
-        self.tree.update(entries);
+        self.tree.update_with_filter(entries, ignore.cloned());
         // force the diff to reload after status changes
         self.last_diff_requested = None;
         self.update_commit_hint();

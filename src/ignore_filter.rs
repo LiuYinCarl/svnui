@@ -20,6 +20,7 @@ use std::path::Path;
 pub const IGNORE_FILE: &str = ".svnignore";
 
 /// A loaded `.svnignore` rule set.
+#[derive(Clone)]
 pub struct IgnoreFilter {
     matcher: Gitignore,
     /// Extra path prefix (relative to the ignore root) prepended to

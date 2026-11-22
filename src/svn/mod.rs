@@ -698,10 +698,14 @@ impl Svn {
         let paths = paths.to_vec();
         self.spawn_mutating(
             move || {
+                // `--parents`: the tree can expand an unversioned directory
+                // and stage a single file inside it, so the file's missing
+                // ancestors must be scheduled in the same command (svn
+                // refuses to add a child whose parent is not versioned).
                 let result = if paths.len() > TARGETS_THRESHOLD {
-                    Self::run_with_targets(&cwd, &["add"], &paths)
+                    Self::run_with_targets(&cwd, &["add", "--parents"], &paths)
                 } else {
-                    let mut args: Vec<String> = vec!["add".into(), "--".into()];
+                    let mut args: Vec<String> = vec!["add".into(), "--parents".into(), "--".into()];
                     args.extend(paths.iter().map(|p| Self::peg(p)));
                     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                     Self::run_in(&cwd, &arg_refs)
@@ -1245,6 +1249,36 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// Staging a single file inside an unversioned directory (the tree
+    /// reads such dirs from disk) must schedule its missing ancestors too,
+    /// or `svn add` rejects the child.
+    #[test]
+    fn add_nested_file_schedules_missing_parents() {
+        let Some(repo) = TestRepo::new() else { return };
+        test_support::write_file(&repo.wc.join("newdir/sub/only.txt"), "x\n");
+        test_support::write_file(&repo.wc.join("newdir/other.txt"), "y\n");
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        c.add(&["newdir/sub/only.txt".to_string()]);
+        match recv(&rx) {
+            AsyncSvnNotification::Add(Ok(paths)) => {
+                assert_eq!(paths, vec!["newdir/sub/only.txt"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let status = repo.svn(&["status"]);
+        let has = |code: char, path: &str| {
+            status
+                .lines()
+                .any(|l| l.starts_with(code) && l.trim_end().ends_with(path))
+        };
+        assert!(has('A', "newdir"), "{status}");
+        assert!(has('A', "newdir/sub"), "{status}");
+        assert!(has('A', "newdir/sub/only.txt"), "{status}");
+        // the sibling stays unversioned
+        assert!(has('?', "newdir/other.txt"), "{status}");
     }
 
     #[test]

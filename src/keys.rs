@@ -246,15 +246,21 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
             title: "Status tab",
             bindings: vec![
                 KeyBinding::new("j / ↓ / k / ↑", "Move selection"),
-                KeyBinding::new("h / ← / l / →", "Collapse / expand directory"),
+                KeyBinding::new(
+                    "h / ← / l / →",
+                    "Collapse / expand directory (an unversioned dir is read from disk)",
+                ),
                 KeyBinding::new("g / G", "Jump to first / last entry"),
                 KeyBinding::new("PgUp / PgDn", "Page up / down"),
                 KeyBinding::new("space", "Stage / unstage (toggle commit set)"),
                 KeyBinding::new("A / U", "Stage all changes / unstage all"),
-                KeyBinding::new("a", "Add selected files (svn add)"),
+                KeyBinding::new(
+                    "a",
+                    "Add selected files (svn add); on a scheduled add ('A'): undo the add",
+                ),
                 KeyBinding::new(
                     "r",
-                    "Revert selected files (or the whole staged set; svn revert)",
+                    "Revert selected files (or the whole staged set; svn revert un-schedules 'A' paths)",
                 ),
                 KeyBinding::new("x", "Resolve conflict (accept working copy)"),
                 KeyBinding::new(

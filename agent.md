@@ -22,7 +22,11 @@
   只提交自身改动、不递归卷入未列出的子孙；提交前 `expand_commit_paths()` 会扩展目标：
   拉入新增（A）祖先目录（否则 svn 报 E200009），并把"新增目录 target"展开为其新增子孙
   （否则 --depth empty 会提交空目录、把子文件留在工作副本）；`svn add` / `svn rm` 失败
-  的路径会从提交集回滚（`unstage_paths()`）。缺失目录可整树暂存：`svn rm` 会把整棵子树
+  的路径会从提交集回滚（`unstage_paths()`）。SVN 没有 un-add，撤销 add 的唯一办法是
+  `svn revert`：`a` 在选区没有 `?` 可加时对 `A` 路径弹确认并走 revert（全 `A` 的 revert
+  确认文案是 "Undo add?"，不是通用的 "discards modifications"）；普通新增文件 revert 后
+  留在磁盘上变回 `?`，带历史的 `A +`（外部 `svn cp`）revert 会删掉文件，所以必须确认。
+  缺失目录可整树暂存：`svn rm` 会把整棵子树
   调度为 D，目录 target 的 `--depth empty` 提交会连同子孙删除一起入库（验证于 svn 1.15.0）。
 - 状态树支持 `.svnignore`（工作副本根目录，.gitignore 语法，见 `src/ignore_filter.rs`；`App` 在 `svn info` 成功后会把工作目录重定位到 WC 根目录）：
   命中的条目不展示也不可操作，标题栏显示 `[N hidden by .svnignore]` 提示；`4` 键打开
@@ -171,6 +175,17 @@ cargo fmt --all --check     # 格式门禁
   Windows 上输出可能是 `dir\file`，解析器统一归一化为 `/`，树的路径逻辑只认 `/`。
   工作副本有冲突时输出尾部固定带 `Summary of conflicts:` 块，解析器显式跳过。
   属性冲突标在**第 2 列**（` C`），`StatusEntry::is_conflicted` 覆盖第 1/2/7 列。
+  `svn status` **不会递归未版本化目录**（连 `--depth infinity` 也只输出 `? dir` 一行），
+  所以状态树展开 `?` 目录时由 `StatusTreeComponent::read_dir_entries` 直接读磁盘
+  （跳过 `.svn`、符号链接按文件处理、非 UTF-8 名称跳过，并应用已保存的 `.svnignore`）；
+  `set_root()` 提供路径基准，`update_with_filter()` 保存过滤器并在 status 刷新后由
+  `synthesize_expanded()` 重建所有已展开的 `?` 目录（必须在剪提交集之前，否则 `?` 目录里
+  已暂存的子文件会被状态快照剪掉；`prune_staged()` 对“存在磁盘上、且祖先仍是 `?` 目录”
+  的无条目路径也不剪）。`files_under()` 对 `?` 目录只返回目录自身：`svn add dir` 本就
+  递归，同一批目标里再带子项会报 E200009。StageAll/ToggleStage 仍把整棵子树的路径放进
+  `AddFiles`（失败回滚要完整列表），由 App 在发命令前用 `collapse_add_targets()` 压成
+  目录目标；单独暂存这类子文件走 `svn add --parents`（`Svn::add`），由 svn 补上缺失的父
+  目录，提交时 `expand_commit_paths()` 再把 A 祖先拉进目标列表。
 - `svn log`：必须显式传范围 `-r HEAD:0 -l N`（`HEAD:1` 在 r0 空仓库上报 E160006）。
   消息体严格按 header 的 `line_count` 行数消费——消息内含恰好 72 连字符或形似
   `r99 | ... | ...` 的假 header 行都不会截断条目或产生幻影 revision；author 含
@@ -225,7 +240,8 @@ cargo fmt --all --check     # 格式门禁
   无效的 `@xxx` 后缀当普通路径处理，所以工作副本 diff 不传 peg；`svn diff -c`（单修订 diff）
   必须传空 peg，否则会把 `foo@.service` 的 `.service` 当成铆钉版本解析（验证于 svn 1.14.5）。
 - `svn commit -m "docs"` 这类"像路径"的消息在部分 svn 版本会报 E205005，需要 `--force-log` 或用更长文本。
-- `svn revert` 一个刚 add 的文件：取消 add，文件留在磁盘上（变成 `?`）。
+- `svn revert` 一个刚 add 的文件：取消 add，文件留在磁盘上（变成 `?`）；带历史的
+  `A +`（copy）revert 会把文件从磁盘删掉（验证于 svn 1.14.5）。
 - `svn commit` 对缺失（`!`）目标**静默跳过**，不报错也不删除——提交删除必须先 `svn rm`
   调度。`svn rm` 对缺失文件/目录（含整棵子树，重叠的 dir+child target 也接受）以及
   "add 后又被从磁盘删掉"的文件（直接撤销 add）都成立；`svn status` 会把整棵被删目录

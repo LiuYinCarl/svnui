@@ -44,10 +44,10 @@ Covers the most common daily SVN operations:
 
 | Feature | Description |
 | --- | --- |
-| **Status view** | `svn status` rendered as a collapsible directory tree, with color-coded M/A/D/C/? states; `f` toggles a flat view (M/A/D files only, abbreviated paths with middle elision) |
+| **Status view** | `svn status` rendered as a collapsible directory tree, with color-coded M/A/D/C/? states; unversioned (`?`) directories expand too — their children are read from disk on demand (honoring `.svnignore`), so a single file inside can be inspected and staged on its own (`svn add --parents` schedules the missing ancestors); `f` toggles a flat view (M/A/D files only, abbreviated paths with middle elision) |
 | **Branch info** | The status bar always shows the current branch; the commit confirmation popup shows the target branch and the files to be committed |
 | **Diff pane** | Selecting a file automatically shows its `svn diff` with line numbers and +/− highlighting; tabs are expanded to spaces (no arrow glyphs, like a browser's diff); a whitespace-only edit is shown with **background colours** — dark red on the removed side, dark green on the added side, with tab cells in a neutral grey so a tab never reads as spaces (no `·`-style glyphs for invisible characters); `w` shows only whitespace-only changes (file and hunk headers kept, the reading position is preserved); `f` shows the whole file — the working copy for a pending diff, the file **as of that revision** for a historical one (for multi-file diffs: the `Index:` section under the cursor; patch previews have no file), as a **full-context diff**: every line is there, added lines stay green and removed lines are inserted in red at their position; unversioned files show their content directly |
-| **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staged files/directories carry a green `*` in front of their name in the tree (a directory is marked once its whole subtree is staged), unstaged rows carry none; staging an unversioned file runs `svn add` automatically, staging a file/directory deleted from disk runs `svn rm` to schedule the deletion; committing with an empty set is rejected. Unstaging only removes paths from the commit set; an already executed `svn add` stays scheduled in SVN (use revert to undo it). The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
+| **Staging / commit** | `space` stages (adds to the commit set), `A` stages all, `U` unstages all; staged files/directories carry a green `*` in front of their name in the tree (a directory is marked once its whole subtree is staged), unstaged rows carry none; staging an unversioned file runs `svn add` automatically, staging a file/directory deleted from disk runs `svn rm` to schedule the deletion; committing with an empty set is rejected. Unstaging only removes paths from the commit set; an already executed `svn add` stays scheduled in SVN. To undo the add, press `a` (or `r`) on the `A` path: SVN's only un-add is `svn revert` (confirmed; a plain new file stays on disk and simply becomes unversioned again). The input box supports CJK/wide chars and multi-line paste; `Tab` recalls recent commit messages |
 | **Log view** | `svn log -v` revision list with changed paths and message details; scrolling to the bottom loads older revisions (paged, 50 at a time); `/` opens a search box (live-filters the loaded list while typing, Enter searches the full history with `svn log --search`, also paged); mark revisions with `space` and view a combined diff with `d`/`Enter` |
 | **File history** | `t` shows the selected file's `svn log` history; `Enter` in the popup opens that revision's diff, `b` opens its blame. Scrolling to the bottom loads older revisions (paged, 50 at a time), the title shows how many are loaded, and paging stops at the file's first revision |
 | **File finder** | `Ctrl+p` fzf-style fuzzy file search with highlighted matches; Enter jumps to the file's history, `Ctrl+b` opens its blame |
@@ -85,13 +85,13 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 | --- | --- |
 | `q` / `Ctrl+C` | Quit (deferred while a working-copy mutation is running) |
 | `j` / `↓` / `k` / `↑` | Move selection |
-| `h` / `←` / `l` / `→` | Collapse / expand directory |
+| `h` / `←` / `l` / `→` | Collapse / expand directory (an unversioned dir is read from disk so its files can be staged individually) |
 | `g` / `G` | Jump to first / last entry |
 | `PgUp` / `PgDn` | Page up / down |
 | `space` | Stage / unstage (toggle commit set) |
 | `A` / `U` | Stage all / unstage all |
-| `a` | `svn add` selected unversioned files |
-| `r` | `svn revert` selected files; when the commit set is non-empty, revert the whole staged set (confirmed) |
+| `a` | `svn add` selected unversioned files; with nothing unversioned selected, undo the add for scheduled-add (`A`) paths (`svn revert`, confirmed) |
+| `r` | `svn revert` selected files (`A` paths only lose the add schedule, no previous version is restored); when the commit set is non-empty, revert the whole staged set (confirmed) |
 | `x` | Resolve conflict (accept working copy) |
 | `c` | Focus the commit message input |
 | `Enter` | Commit (inside the input) |
@@ -168,7 +168,7 @@ The architecture follows gitui:
 - `src/popups/` — confirm, message, output viewer, fullscreen diff, etc. (gitui's `popups/`)
 - `src/keys.rs` — central key-binding definitions (gitui's `keys/`)
 
-SVN has no staging area like git, so "staging" is implemented as a **commit set**: the files marked to go into the next commit; staging an unversioned file runs `svn add` automatically; staging a missing (`!`) file/directory deleted from disk runs `svn rm` to schedule the deletion — otherwise `svn commit` would silently skip it and the deletion could never be recorded; committing with an empty set is rejected.
+SVN has no staging area like git, so "staging" is implemented as a **commit set**: the files marked to go into the next commit; staging an unversioned file runs `svn add` automatically; staging a missing (`!`) file/directory deleted from disk runs `svn rm` to schedule the deletion — otherwise `svn commit` would silently skip it and the deletion could never be recorded; committing with an empty set is rejected. Undo a mistaken `svn add` with `svn revert` (in the status tab press `a` or `r` on the `A` path, confirmed); a plain new file stays on disk and becomes unversioned again.
 
 ## Testing
 

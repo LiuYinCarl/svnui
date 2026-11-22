@@ -172,7 +172,11 @@ pub struct App {
 
 impl App {
     pub fn new(cwd: PathBuf, svn: Svn, ctx: Context) -> Self {
-        let status = StatusTab::new(&ctx);
+        let mut status = StatusTab::new(&ctx);
+        // Status paths are relative to the launch directory (re-rooted to
+        // the working-copy root once `svn info` arrives): the tree reads
+        // unversioned directories from disk relative to the same base.
+        status.tree.set_root(cwd.clone());
         let log = LogComponent::new(&ctx);
         let patches = PatchesComponent::new(&ctx);
         let ignore = IgnoreEditor::new(&ctx, cwd.clone());
@@ -638,11 +642,19 @@ impl App {
                             .iter()
                             .map(|p| (self.status.tree.status_char(p), p.clone()))
                             .collect();
-                        format!(
-                            "{}\n\nFiles:\n{}",
-                            MSG.revert_confirm,
-                            file_list_lines(&targets)
-                        )
+                        // Reverting a scheduled add ('A') is not a revert to
+                        // a previous version: svn only un-schedules the add.
+                        // The generic "discards modifications" warning reads
+                        // as "your new file will be deleted" and hides the
+                        // only way to undo a mistaken `svn add`.
+                        let headline = if !targets.is_empty()
+                            && targets.iter().all(|(status, _)| *status == 'A')
+                        {
+                            MSG.undo_add_confirm
+                        } else {
+                            MSG.revert_confirm
+                        };
+                        format!("{headline}\n\nFiles:\n{}", file_list_lines(&targets))
                     }
                     ConfirmAction::Update => format!(
                         "{}\nWorking copy: {}",
@@ -722,10 +734,12 @@ impl App {
             },
             InternalEvent::AddFiles(paths) => {
                 if !paths.is_empty() {
-                    // remembered so a failed add can un-stage its paths
-                    // (mutations run serialized: results arrive in order)
+                    // remembered (the full staged set) so a failed add can
+                    // un-stage its paths; the command itself gets collapsed
+                    // targets — svn rejects a batch that names both a new
+                    // dir and its children (E200009)
                     self.pending_adds.push_back(paths.clone());
-                    self.svn.add(&paths);
+                    self.svn.add(&self.status.tree.collapse_add_targets(&paths));
                     self.begin_mutation();
                 }
             }
@@ -1048,8 +1062,10 @@ impl App {
                     self.svn_info = Some(info);
                     // the working-copy root is only known here; re-point
                     // the ignore editor (launched from a subdir, it may
-                    // have been editing the wrong .svnignore)
+                    // have been editing the wrong .svnignore) and the
+                    // tree's on-disk expansion base
                     self.ignore.set_root(&self.ignore_root());
+                    self.status.tree.set_root(self.cwd.clone());
                     self.svn.status();
                     self.svn.log(50);
                     self.pending += 2;
@@ -4673,6 +4689,86 @@ mod tests {
         // the failed paths are rolled out of the commit set
         assert_eq!(app.status.tree.staged_count(), 0);
         assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    /// The commit set can hold a new dir and its expanded children; svn
+    /// rejects that as one add batch, so the app sends only the dir (the
+    /// full list stays in `pending_adds` for the failure rollback).
+    #[test]
+    fn add_files_sends_collapsed_targets_to_svn() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        test_support::write_file(&repo.wc.join("newdir/a.txt"), "a\n");
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![StatusEntry {
+                status: '?',
+                props_status: ' ',
+                tree_conflict: ' ',
+                path: "newdir".into(),
+                is_dir: true,
+            }]),
+        ));
+        app.status
+            .set_staged(&["newdir".into(), "newdir/a.txt".into()]);
+        app.queue.push(InternalEvent::AddFiles(vec![
+            "newdir".into(),
+            "newdir/a.txt".into(),
+        ]));
+        app.handle_queue_events();
+        match recv(&rx) {
+            AsyncSvnNotification::Add(Ok(paths)) => assert_eq!(paths, vec!["newdir"]),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let status = repo.svn(&["status"]);
+        assert!(
+            status
+                .lines()
+                .any(|l| l.starts_with('A') && l.trim_end().ends_with("newdir")),
+            "{status}"
+        );
+        assert!(
+            status
+                .lines()
+                .any(|l| l.starts_with('A') && l.trim_end().ends_with("newdir/a.txt")),
+            "{status}"
+        );
+    }
+
+    /// Reverting a scheduled add is an un-add, not a discard: the
+    /// confirmation must say so instead of warning that modifications are
+    /// lost (which hides the only way to undo a mistaken `svn add`).
+    #[test]
+    fn revert_confirm_undo_add_wording() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.handle_async(AsyncSvnNotification::Status(
+            0,
+            Ok(vec![entry('A', "new.txt"), entry('M', "m.txt")]),
+        ));
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Revert(vec![
+                "new.txt".into(),
+            ])));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p.message.contains("Undo add?"), "{}", p.message);
+        assert!(p.message.contains("A new.txt"), "{}", p.message);
+        // mixed A/M targets keep the generic revert warning
+        app.popups.clear();
+        app.queue
+            .push(InternalEvent::Confirm(ConfirmAction::Revert(vec![
+                "new.txt".into(),
+                "m.txt".into(),
+            ])));
+        app.handle_queue_events();
+        let Some(Popup::Confirm(p2)) = app.popups.last() else {
+            panic!("expected confirm popup");
+        };
+        assert!(p2.message.contains(MSG.revert_confirm), "{}", p2.message);
+        assert!(!p2.message.contains("Undo add?"), "{}", p2.message);
     }
 
     #[test]

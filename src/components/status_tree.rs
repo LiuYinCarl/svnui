@@ -1,8 +1,10 @@
 //! Status file tree: shows `svn status` entries grouped by directory,
-//! supports staging (commit set), filtering, and selection-driven diff.
+//! supports staging (commit set), filtering, selection-driven diff, and
+//! on-demand expansion of unversioned dirs (svn never lists their children).
 
 use super::status_flat;
 use super::{Context, DrawableComponent, EventState};
+use crate::ignore_filter::IgnoreFilter;
 use crate::keys::{KeyAction, key_match};
 use crate::queue::{ConfirmAction, InternalEvent};
 use crate::strings::{self, TITLE};
@@ -16,6 +18,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// Internal tree node while building.
 #[derive(Clone, Debug)]
@@ -62,6 +65,13 @@ pub struct StatusTreeComponent {
     /// or the status entries change (not per draw).
     counts_cache: std::cell::RefCell<std::collections::HashMap<String, DirCounts>>,
     counts_dirty: std::cell::Cell<bool>,
+    /// Working-copy root the status paths are relative to (set by the
+    /// app). Empty disables reading unversioned directories from disk.
+    root: PathBuf,
+    /// `.svnignore` rules the status entries were filtered with: reused
+    /// when an unversioned directory is expanded from disk, so hidden
+    /// children stay hidden.
+    ignore: Option<IgnoreFilter>,
 }
 
 impl StatusTreeComponent {
@@ -81,22 +91,68 @@ impl StatusTreeComponent {
             focused: true,
             counts_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             counts_dirty: std::cell::Cell::new(true),
+            root: PathBuf::new(),
+            ignore: None,
         }
     }
 
     // ----- public API used by the app -----
 
     pub fn update(&mut self, entries: Vec<StatusEntry>) {
+        self.update_with_filter(entries, None);
+    }
+
+    /// [`Self::update`] plus the `.svnignore` rules the entries were
+    /// filtered with: kept so expanded unversioned directories can be
+    /// re-read from disk after a refresh without re-exposing hidden files.
+    pub fn update_with_filter(&mut self, entries: Vec<StatusEntry>, ignore: Option<IgnoreFilter>) {
         self.pending = false;
-        // Prune staged paths that no longer have a status entry (committed
-        // or reverted elsewhere) so they cannot poison the next commit.
-        if !self.staged.is_empty() {
-            let present: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-            self.staged.retain(|p| present.contains(p.as_str()));
-        }
+        self.ignore = ignore;
         self.entries = entries;
+        // Materialize the children of expanded unversioned dirs *before*
+        // pruning the staged set (see `prune_staged`).
+        self.synthesize_expanded();
+        self.prune_staged();
         self.counts_dirty.set(true);
         self.rebuild_visible();
+    }
+
+    /// Drop staged paths that no longer have a status entry (committed or
+    /// reverted elsewhere) so they cannot poison the next commit.
+    ///
+    /// Children of unversioned dirs are an exception: `svn status` never
+    /// lists them, so a staged child is absent from the snapshot while its
+    /// add is still in flight (and after the dir was collapsed). Keep it
+    /// while the file exists on disk — a deleted one is pruned as usual.
+    fn prune_staged(&mut self) {
+        if self.staged.is_empty() {
+            return;
+        }
+        let present: HashSet<&str> = self.entries.iter().map(|e| e.path.as_str()).collect();
+        let unversioned_dirs: HashSet<&str> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && e.status == '?')
+            .map(|e| e.path.as_str())
+            .collect();
+        let root = &self.root;
+        self.staged.retain(|p| {
+            present.contains(p.as_str())
+                || (!root.as_os_str().is_empty()
+                    && under_unversioned_dir(p, &unversioned_dirs)
+                    && std::fs::symlink_metadata(root.join(p)).is_ok())
+        });
+    }
+
+    /// Set the working-copy root that status paths are relative to. The
+    /// app re-points this after `svn info` re-roots a subdirectory launch
+    /// and passes the launch directory when no info is available yet.
+    pub fn set_root(&mut self, root: PathBuf) {
+        if self.root != root {
+            // expanded paths are relative to the previous base
+            self.expanded.clear();
+        }
+        self.root = root;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -141,7 +197,9 @@ impl StatusTreeComponent {
     /// Paths affected by staging the item under the cursor. For a directory
     /// this includes the directory's own status entry (if any — e.g. an
     /// unversioned or property-changed dir) plus all descendant files; svn
-    /// accepts directories as add/commit/revert targets.
+    /// accepts directories as add/commit/revert targets. An unversioned
+    /// dir is the exception: `svn add` already recurses, so only the dir
+    /// itself is returned (see `files_under`).
     pub fn paths_at_selection(&self) -> Vec<String> {
         let Some(item) = self.visible.get(self.selection) else {
             return Vec::new();
@@ -398,6 +456,15 @@ impl StatusTreeComponent {
     /// matters for unversioned dirs (`? newdir` has no children in
     /// `svn status` output) and dirs with property-only changes.
     fn files_under(&self, dir_path: &str) -> Vec<String> {
+        // `svn add <unversioned dir>` is already recursive; passing the
+        // children listed in the expanded tree as well would make the same
+        // command add the dir and then reject the now-versioned children
+        // (E200009 "already under version control"). Selecting a child
+        // explicitly still adds just that file: `svn add --parents`
+        // schedules the missing ancestors.
+        if self.is_unversioned_dir(dir_path) {
+            return vec![dir_path.to_string()];
+        }
         let prefix = format!("{dir_path}/");
         self.entries
             .iter()
@@ -502,14 +569,159 @@ impl StatusTreeComponent {
         let Some(item) = self.visible.get(self.selection) else {
             return;
         };
-        if let TreeItemKind::Dir { .. } = item.kind {
-            if expand {
-                self.expanded.insert(item.path.clone());
-            } else {
-                self.expanded.remove(&item.path);
-            }
-            self.rebuild_visible();
+        if !matches!(item.kind, TreeItemKind::Dir { .. }) {
+            return;
         }
+        let path = item.path.clone();
+        if expand {
+            self.expanded.insert(path.clone());
+            // `svn status` reports an unversioned dir as a single line and
+            // never lists its children: read them from disk so a single
+            // file inside can be selected and staged on its own.
+            self.synthesize_dir(&path);
+        } else {
+            self.expanded.remove(&path);
+        }
+        self.rebuild_visible();
+    }
+
+    /// Materialize the direct children of an expanded unversioned dir.
+    /// No-op for versioned dirs (their children come from `svn status`).
+    fn synthesize_dir(&mut self, dir_path: &str) {
+        if self.root.as_os_str().is_empty() || !self.is_unversioned_dir(dir_path) {
+            return;
+        }
+        let seen: HashSet<String> = self.entries.iter().map(|e| e.path.clone()).collect();
+        let before = self.entries.len();
+        self.entries.extend(
+            self.read_dir_entries(dir_path)
+                .into_iter()
+                .filter(|c| !seen.contains(&c.path)),
+        );
+        if self.entries.len() != before {
+            self.counts_dirty.set(true);
+        }
+    }
+
+    /// Re-materialize every expanded unversioned dir (nested ones too)
+    /// after a status refresh replaced `entries`.
+    fn synthesize_expanded(&mut self) {
+        if self.root.as_os_str().is_empty() || self.expanded.is_empty() {
+            return;
+        }
+        let mut unversioned_dirs: HashSet<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && e.status == '?')
+            .map(|e| e.path.clone())
+            .collect();
+        if unversioned_dirs.is_empty() {
+            return;
+        }
+        let mut seen: HashSet<String> = self.entries.iter().map(|e| e.path.clone()).collect();
+        let mut todo: Vec<String> = unversioned_dirs
+            .intersection(&self.expanded)
+            .cloned()
+            .collect();
+        while let Some(dir) = todo.pop() {
+            for child in self.read_dir_entries(&dir) {
+                if !seen.insert(child.path.clone()) {
+                    continue;
+                }
+                if child.is_dir {
+                    unversioned_dirs.insert(child.path.clone());
+                    if self.expanded.contains(&child.path) {
+                        todo.push(child.path.clone());
+                    }
+                }
+                self.entries.push(child);
+            }
+        }
+    }
+
+    fn is_unversioned_dir(&self, path: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.path == path && e.is_dir && e.status == '?')
+    }
+
+    /// `svn add <dir>` recurses, so a batch that also names the dir's
+    /// children is rejected wholesale (E200009 "already under version
+    /// control"). Drop the children covered by an unversioned dir target
+    /// in the same batch; they are added along with the dir anyway. Called
+    /// by the app when it turns a staged batch into `svn add` targets, so
+    /// the commit-set rollback still sees the full path list.
+    ///
+    /// O(paths × depth): StageAll on 100k files must not turn into an
+    /// entry scan per path.
+    pub fn collapse_add_targets(&self, paths: &[String]) -> Vec<String> {
+        if paths.len() < 2 {
+            return paths.to_vec();
+        }
+        let unversioned_dirs: HashSet<&str> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && e.status == '?')
+            .map(|e| e.path.as_str())
+            .collect();
+        if unversioned_dirs.is_empty() {
+            return paths.to_vec();
+        }
+        // only ancestors that are themselves targets cover a path: svn
+        // recurses into the dirs it was given, not into arbitrary parents
+        let batch: HashSet<&str> = paths.iter().map(String::as_str).collect();
+        paths
+            .iter()
+            .filter(|p| {
+                let mut cur = p.as_str();
+                while let Some((parent, _)) = cur.rsplit_once('/') {
+                    if unversioned_dirs.contains(parent) && batch.contains(parent) {
+                        return false;
+                    }
+                    cur = parent;
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Direct children of `dir_path` on disk, as unversioned entries.
+    ///
+    /// `.svn` metadata dirs are skipped (they are never part of the
+    /// versioned tree), symlinks are treated as files like svn does,
+    /// non-UTF-8 names are skipped (all paths here are UTF-8), and the
+    /// active `.svnignore` rules still hide matching children.
+    fn read_dir_entries(&self, dir_path: &str) -> Vec<StatusEntry> {
+        let Ok(children) = std::fs::read_dir(self.root.join(dir_path)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for child in children.flatten() {
+            let Some(name) = child.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name == ".svn" {
+                continue;
+            }
+            let is_dir = child.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let path = format!("{dir_path}/{name}");
+            if self
+                .ignore
+                .as_ref()
+                .is_some_and(|f| f.is_ignored(&path, is_dir))
+            {
+                continue;
+            }
+            out.push(StatusEntry {
+                status: '?',
+                props_status: ' ',
+                tree_conflict: ' ',
+                path,
+                is_dir,
+            });
+        }
+        out
     }
 
     // ----- event handling -----
@@ -629,6 +841,22 @@ impl StatusTreeComponent {
                     .collect();
                 if !unversioned.is_empty() {
                     self.ctx.queue.push(InternalEvent::AddFiles(unversioned));
+                } else {
+                    // `a` is a toggle: with nothing left to add, scheduled
+                    // adds ('A') are undone. SVN has no un-add — the only
+                    // way is `svn revert`, which just drops the schedule
+                    // (a plain new file stays on disk). Confirm it first:
+                    // a path added as a copy loses the copy on revert.
+                    let added: Vec<String> = paths
+                        .iter()
+                        .filter(|p| by_path.get(p.as_str()).is_some_and(|e| e.status == 'A'))
+                        .cloned()
+                        .collect();
+                    if !added.is_empty() {
+                        self.ctx
+                            .queue
+                            .push(InternalEvent::Confirm(ConfirmAction::Revert(added)));
+                    }
                 }
             }
         } else if key_match(k, KeyAction::RevertFiles) {
@@ -735,6 +963,18 @@ impl StatusTreeComponent {
     fn entries_by_path(&self) -> HashMap<&str, &StatusEntry> {
         self.entries.iter().map(|e| (e.path.as_str(), e)).collect()
     }
+}
+
+/// Whether `path` sits below one of `dirs` (both use status paths).
+fn under_unversioned_dir(path: &str, dirs: &HashSet<&str>) -> bool {
+    let mut current = path;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if dirs.contains(parent) {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Whether an entry can be committed. Obstructed ('~') files make
@@ -1184,6 +1424,8 @@ mod tests {
             focused: true,
             counts_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             counts_dirty: std::cell::Cell::new(true),
+            root: PathBuf::new(),
+            ignore: None,
         };
         let (added, removed) = comp.toggle_stage_at_selection();
         assert_eq!(added, vec!["a.txt"]);
@@ -1379,6 +1621,47 @@ mod interaction_tests {
         // toggle off removes both
         c.event(&key(KeyCode::Char(' '))).unwrap();
         assert!(c.staged.is_empty());
+    }
+
+    #[test]
+    fn add_key_undoes_scheduled_add() {
+        // `a` on an 'A' path toggles back: SVN has no un-add, so it queues
+        // the (confirmed) revert that un-schedules it.
+        let (mut c, q) = comp_with(vec![entry('A', "new.txt")]);
+        c.event(&key(KeyCode::Char('a'))).unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::Confirm(ConfirmAction::Revert(p)))
+                if p == vec!["new.txt"]
+        ));
+        // nothing to add and nothing scheduled: still a no-op
+        let (mut c2, q2) = comp_with(vec![entry('M', "m.txt")]);
+        c2.event(&key(KeyCode::Char('a'))).unwrap();
+        assert!(q2.pop().is_none());
+    }
+
+    #[test]
+    fn add_key_undoes_a_scheduled_added_dir_with_its_children() {
+        let (mut c, q) = comp_with(vec![
+            dir_entry('A', "newdir"),
+            entry('A', "newdir/a.txt"),
+            entry('A', "newdir/sub/b.txt"),
+        ]);
+        assert_eq!(c.selection_path().as_deref(), Some("newdir"));
+        c.event(&key(KeyCode::Char('a'))).unwrap();
+        match q.pop() {
+            Some(InternalEvent::Confirm(ConfirmAction::Revert(paths))) => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        "newdir".to_string(),
+                        "newdir/a.txt".to_string(),
+                        "newdir/sub/b.txt".to_string()
+                    ]
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -1828,6 +2111,166 @@ mod interaction_tests {
             q.pop(),
             Some(InternalEvent::AddFiles(p)) if p == vec!["newdir"]
         ));
+    }
+
+    /// Unique scratch dir for tests that need real files (no svn repo).
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("svnui-tree-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn expanding_an_unversioned_dir_reads_children_from_disk() {
+        let root = temp_dir("expand-unversioned");
+        crate::test_support::write_file(&root.join("newdir/a.txt"), "a\n");
+        crate::test_support::write_file(&root.join("newdir/sub/b.txt"), "b\n");
+        std::fs::create_dir_all(root.join("newdir/empty")).unwrap();
+        std::fs::create_dir_all(root.join("newdir/.svn")).unwrap();
+
+        let (mut c, q) = comp_with(vec![dir_entry('?', "newdir")]);
+        c.set_root(root.clone());
+        assert_eq!(c.visible_len(), 1);
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        let paths: Vec<&str> = c.visible.iter().map(|t| t.path.as_str()).collect();
+        assert!(paths.contains(&"newdir/a.txt"), "{paths:?}");
+        assert!(paths.contains(&"newdir/empty"), "{paths:?}");
+        assert!(paths.contains(&"newdir/sub"), "{paths:?}");
+        // nested dirs stay collapsed until expanded themselves; svn
+        // metadata dirs are never shown
+        assert!(!paths.contains(&"newdir/sub/b.txt"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains(".svn")), "{paths:?}");
+
+        // staging the dir itself still adds only the dir: `svn add` is
+        // recursive, and passing the synthesized children alongside it
+        // would be rejected as "already under version control"
+        c.event(&key(KeyCode::Home)).unwrap();
+        assert_eq!(c.paths_at_selection(), vec!["newdir"]);
+
+        // a single child can be staged on its own
+        c.selection = c
+            .visible
+            .iter()
+            .position(|t| t.path == "newdir/a.txt")
+            .unwrap();
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("newdir/a.txt"));
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::AddFiles(p)) if p == vec!["newdir/a.txt"]
+        ));
+
+        // nested dirs are expanded lazily, one level at a time
+        c.selection = c
+            .visible
+            .iter()
+            .position(|t| t.path == "newdir/sub")
+            .unwrap();
+        c.event(&key(KeyCode::Enter)).unwrap();
+        assert!(c.visible.iter().any(|t| t.path == "newdir/sub/b.txt"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage_all_add_targets_collapse_under_a_new_dir() {
+        let root = temp_dir("stage-all-collapse");
+        crate::test_support::write_file(&root.join("newdir/a.txt"), "a\n");
+        crate::test_support::write_file(&root.join("newdir/sub/b.txt"), "b\n");
+        let (mut c, q) = comp_with(vec![dir_entry('?', "newdir")]);
+        c.set_root(root.clone());
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        c.event(&key(KeyCode::Char('A'))).unwrap();
+        assert!(c.staged.contains("newdir"));
+        assert!(c.staged.contains("newdir/a.txt"));
+        let Some(InternalEvent::AddFiles(paths)) = q.pop() else {
+            panic!("expected AddFiles");
+        };
+        // the whole subtree is staged, so a failed add can roll it back ...
+        assert!(paths.contains(&"newdir".to_string()));
+        assert!(paths.contains(&"newdir/a.txt".to_string()));
+        // ... but `svn add` only gets the dir: dir + child targets in one
+        // batch is rejected (E200009)
+        assert_eq!(c.collapse_add_targets(&paths), vec!["newdir"]);
+        // unrelated targets are kept
+        assert_eq!(
+            c.collapse_add_targets(&["newdir".into(), "other.txt".into()]),
+            vec!["newdir", "other.txt"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expanded_unversioned_dir_survives_status_refresh() {
+        let root = temp_dir("expand-refresh");
+        crate::test_support::write_file(&root.join("newdir/a.txt"), "a\n");
+        let (mut c, _q) = comp_with(vec![dir_entry('?', "newdir")]);
+        c.set_root(root.clone());
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        c.selection = c
+            .visible
+            .iter()
+            .position(|t| t.path == "newdir/a.txt")
+            .unwrap();
+        c.event(&key(KeyCode::Char(' '))).unwrap();
+        assert!(c.staged.contains("newdir/a.txt"));
+
+        // a status snapshot can arrive while `svn add` is still running:
+        // svn still reports only `? newdir`, but the staged child and the
+        // expanded tree must survive (the prune must not eat it)
+        c.update_with_filter(vec![dir_entry('?', "newdir")], None);
+        assert!(c.staged.contains("newdir/a.txt"));
+        assert!(c.visible.iter().any(|t| t.path == "newdir/a.txt"));
+        assert_eq!(c.selection_path().as_deref(), Some("newdir/a.txt"));
+
+        // collapsing the dir does not lose a staged child either: the
+        // child is still absent from `svn status`, but its ancestor is a
+        // known unversioned dir
+        c.event(&key(KeyCode::Home)).unwrap();
+        c.event(&key(KeyCode::Char('h'))).unwrap();
+        c.update_with_filter(vec![dir_entry('?', "newdir")], None);
+        assert!(c.staged.contains("newdir/a.txt"));
+
+        // a staged child that is gone from disk is pruned as usual, so a
+        // stale path cannot poison the next commit
+        std::fs::remove_file(root.join("newdir/a.txt")).unwrap();
+        c.update_with_filter(vec![dir_entry('?', "newdir")], None);
+        assert!(!c.staged.contains("newdir/a.txt"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn changing_the_root_drops_stale_expansions() {
+        // expanded paths are relative to the old status base: after a
+        // subdirectory launch is re-rooted by `svn info`, they no longer
+        // name the same directories on disk
+        let (mut c, _q) = comp_with(vec![entry('M', "src/main.rs")]);
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        assert!(c.expanded.contains("src"));
+        c.set_root(std::path::PathBuf::from("/tmp/svnui-other-wc"));
+        assert!(c.expanded.is_empty());
+        // re-expanding under the new root, then setting the same root
+        // again (every `svn info` refresh does) keeps the expansion state
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        assert!(c.expanded.contains("src"));
+        c.set_root(std::path::PathBuf::from("/tmp/svnui-other-wc"));
+        assert!(c.expanded.contains("src"));
+    }
+
+    #[test]
+    fn expanded_unversioned_dir_respects_svnignore() {
+        let root = temp_dir("expand-ignore");
+        crate::test_support::write_file(&root.join("newdir/keep.txt"), "k\n");
+        crate::test_support::write_file(&root.join("newdir/build.log"), "l\n");
+        let filter = crate::ignore_filter::IgnoreFilter::from_lines("*.log\n").unwrap();
+        let (mut c, _q) = comp_with(vec![dir_entry('?', "newdir")]);
+        c.set_root(root.clone());
+        c.update_with_filter(vec![dir_entry('?', "newdir")], Some(filter));
+        c.event(&key(KeyCode::Char('l'))).unwrap();
+        let paths: Vec<&str> = c.visible.iter().map(|t| t.path.as_str()).collect();
+        assert!(paths.contains(&"newdir/keep.txt"), "{paths:?}");
+        assert!(!paths.contains(&"newdir/build.log"), "{paths:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
