@@ -58,6 +58,8 @@ pub enum InternalEvent {
     SwitchTab(Tab),
     /// Refresh status from the working copy
     RefreshStatus,
+    /// Read `svn status -u` and show the update preview before updating
+    RequestUpdatePreview,
     /// Open the branch/target picker for `svn switch` (status tab)
     OpenSwitch,
     /// Re-run the request behind the open fullscreen diff (F5 in the popup)
@@ -70,12 +72,20 @@ pub enum InternalEvent {
     RequestFileDiff,
     /// Request blame of a file (path relative to the working copy root)
     RequestBlame(String),
+    /// Show read-only conflict details for a path (`x` on a conflicted entry)
+    ShowConflictDetails(String),
     /// Request the history of the currently selected file (status tab)
     RequestFileHistory,
     /// Open the history popup for a specific path (e.g. from file finder)
     OpenFileHistory(String),
     /// Open the fuzzy file finder popup
     OpenFileFinder,
+    /// Repository tab: load one directory level at HEAD
+    RepoLoad(String),
+    /// Repository tab: preview a file at HEAD
+    RepoPreview(String),
+    /// Repository tab: show `svn log` for a path/URL
+    RepoLog(String),
     /// Request a diff of the selected revision (log tab). With `Some(path)`
     /// the diff is limited to that one file — a working-copy-root-relative
     /// path (file history popup, blame popup).
@@ -96,9 +106,17 @@ pub enum InternalEvent {
     LogLoadMore,
     /// Load the next page of a file's history (file history popup);
     /// `before_rev` is the oldest revision currently loaded
-    FileLogLoadMore { path: String, before_rev: u64 },
+    FileLogLoadMore {
+        path: String,
+        before_rev: u64,
+        stop_on_copy: bool,
+    },
+    /// Reload a file-history popup with/without `--stop-on-copy`
+    ReloadFileLog { path: String, stop_on_copy: bool },
     /// Show the full info of the selected commit (log tab)
     ShowCommitInfo(LogEntry),
+    /// Pick one changed path from a revision (log tab `p`)
+    OpenChangedPaths(u64, Vec<(char, String)>),
     /// Preview a patch file in the diff popup (patches tab)
     PreviewPatch(PathBuf),
     /// Load the whole file behind the open diff (`f` in a diff view):
@@ -125,8 +143,8 @@ pub enum ConfirmAction {
     Update,
     /// Run `svn cleanup` on the working copy (remove stale write locks)
     Cleanup,
-    /// Resolve conflict on a path
-    Resolve(String),
+    /// Kill the currently running cancellable mutation (update/switch/cleanup)
+    CancelOperation,
     /// Update working copy to a revision
     UpdateToRevision(u64),
     /// Switch the working copy to another branch/target (`svn switch`)
@@ -145,6 +163,8 @@ pub enum Tab {
     Patches,
     /// `.svnignore` editor
     Ignore,
+    /// Read-only repository browser (branches/tags/files at HEAD)
+    Repo,
 }
 
 /// Simple FIFO queue shared via Rc, so components can push events without

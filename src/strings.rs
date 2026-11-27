@@ -48,7 +48,6 @@ pub struct Msg {
     /// `svn revert` only un-schedules those, nothing is restored/lost.
     pub undo_add_confirm: &'static str,
     pub update_confirm: &'static str,
-    pub resolve_confirm: &'static str,
     pub cleanup_confirm: &'static str,
     /// Appended to svn errors that ask for a cleanup (E155004/E155037)
     pub cleanup_hint: &'static str,
@@ -57,7 +56,6 @@ pub struct Msg {
     pub add_done: &'static str,
     pub remove_done: &'static str,
     pub revert_done: &'static str,
-    pub resolve_done: &'static str,
     pub cleanup_done: &'static str,
     pub switch_done: &'static str,
     pub empty_patches: &'static str,
@@ -85,7 +83,6 @@ pub const MSG: Msg = Msg {
     revert_confirm: "Revert local changes? (discards modifications)",
     undo_add_confirm: "Undo add? (svn revert un-schedules it; a plain new file stays on disk)",
     update_confirm: "Run svn update?",
-    resolve_confirm: "Resolve conflict using the working copy version?",
     cleanup_confirm: "Run svn cleanup? It removes write locks left by an interrupted operation; make sure no other SVN client is using this working copy.",
     cleanup_hint: "Hint: press C to run svn cleanup",
     switch_confirm: "Switch the working copy? Local changes are kept; conflicts are postponed.",
@@ -93,7 +90,6 @@ pub const MSG: Msg = Msg {
     add_done: "Added to version control",
     remove_done: "Scheduled for deletion",
     revert_done: "Reverted",
-    resolve_done: "Conflict resolved",
     cleanup_done: "Working copy cleaned",
     switch_done: "Working copy switched",
     empty_patches: "No patches yet — press P to save the working-copy changes as a patch file",

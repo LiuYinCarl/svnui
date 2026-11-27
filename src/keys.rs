@@ -43,7 +43,9 @@ pub enum KeyAction {
     UnstageAll,
     AddFiles,
     RevertFiles,
-    ResolveConflict,
+    ShowConflictDetails,
+    /// Cancel the running update/switch/cleanup (`Ctrl+x`)
+    CancelOperation,
     Commit,
     UpdateWc,
     /// Run `svn cleanup` — remove write locks left by an interrupted
@@ -74,10 +76,16 @@ pub enum KeyAction {
     OpenFileFinder,
     ToggleMark,
     ViewCommitInfo,
+    /// Log tab: pick one changed path from the selected revision (`p`)
+    OpenChangedPaths,
+    /// File history popup: toggle `--stop-on-copy` (`c`)
+    ToggleStopOnCopy,
     BlameFileFinder,
     SwitchTabPatches,
     /// Switch to the `.svnignore` editor tab (`4`)
     SwitchTabIgnore,
+    /// Read-only repository browser tab (`5`)
+    SwitchTabRepo,
     /// Ignore tab: save the file (Ctrl+s)
     IgnoreSave,
     /// Save the working-copy changes as a patch file (`P`, app-level)
@@ -124,7 +132,10 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::UnstageAll => is_key(ev, KeyCode::Char('U')),
         KeyAction::AddFiles => is_key(ev, KeyCode::Char('a')),
         KeyAction::RevertFiles => is_key(ev, KeyCode::Char('r')),
-        KeyAction::ResolveConflict => is_key(ev, KeyCode::Char('x')),
+        KeyAction::ShowConflictDetails => is_key(ev, KeyCode::Char('x')),
+        KeyAction::CancelOperation => {
+            ev.code == KeyCode::Char('x') && ev.modifiers.contains(KeyModifiers::CONTROL)
+        }
         KeyAction::Commit => is_key(ev, KeyCode::Char('c')),
         KeyAction::UpdateWc => is_key(ev, KeyCode::Char('u')),
         KeyAction::CleanupWc => is_key(ev, KeyCode::Char('C')),
@@ -138,6 +149,7 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         KeyAction::SwitchTabLog => is_key(ev, KeyCode::Char('2')),
         KeyAction::SwitchTabPatches => is_key(ev, KeyCode::Char('3')),
         KeyAction::SwitchTabIgnore => is_key(ev, KeyCode::Char('4')),
+        KeyAction::SwitchTabRepo => is_key(ev, KeyCode::Char('5')),
         KeyAction::IgnoreSave => {
             ev.code == KeyCode::Char('s') && ev.modifiers.contains(KeyModifiers::CONTROL)
         }
@@ -168,6 +180,8 @@ pub fn key_match(ev: &KeyEvent, action: KeyAction) -> bool {
         }
         KeyAction::ToggleMark => is_key(ev, KeyCode::Char(' ')),
         KeyAction::ViewCommitInfo => is_key(ev, KeyCode::Char('v')),
+        KeyAction::OpenChangedPaths => is_key(ev, KeyCode::Char('p')),
+        KeyAction::ToggleStopOnCopy => is_key(ev, KeyCode::Char('c')),
         // In the file finder a bare 'b' is query text, so blame uses Ctrl+b
         KeyAction::BlameFileFinder => {
             ev.code == KeyCode::Char('b') && ev.modifiers.contains(KeyModifiers::CONTROL)
@@ -220,8 +234,8 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
             title: "Global",
             bindings: vec![
                 KeyBinding::new(
-                    "1 / 2 / 3 / 4",
-                    "Switch tab: status / log / patches / .svnignore",
+                    "1 / 2 / 3 / 4 / 5",
+                    "Switch tab: status / log / patches / .svnignore / repository",
                 ),
                 KeyBinding::new(
                     "Tab / Shift+Tab",
@@ -232,6 +246,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new(
                     "C",
                     "Clean up the working copy (svn cleanup: remove stale locks)",
+                ),
+                KeyBinding::new(
+                    "Ctrl+x",
+                    "Cancel the running update/switch/cleanup (asks for confirmation)",
                 ),
                 KeyBinding::new("F5 / R", "Refresh status / log / patch list"),
                 KeyBinding::new("i", "Show repository / working-copy info (svn info)"),
@@ -262,7 +280,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "r",
                     "Revert selected files (or the whole staged set; svn revert un-schedules 'A' paths)",
                 ),
-                KeyBinding::new("x", "Resolve conflict (accept working copy)"),
+                KeyBinding::new(
+                    "x",
+                    "Show conflict details (read-only; resolve in your editor/svn)",
+                ),
                 KeyBinding::new(
                     "Enter / d",
                     "Diff of selected file (Enter also expands a directory)",
@@ -288,6 +309,10 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                 KeyBinding::new("Enter / d", "Diff of selected / marked revisions"),
                 KeyBinding::new("space", "Mark / unmark revision (range diff)"),
                 KeyBinding::new("v", "Show full commit info"),
+                KeyBinding::new(
+                    "p",
+                    "Pick a changed path → diff of that file at the revision",
+                ),
                 KeyBinding::new("o", "Update working copy to selected revision"),
                 KeyBinding::new("/", "Filter loaded commits / search all history"),
                 KeyBinding::new("Tab", "Focus the details pane (j/k scroll it)"),
@@ -315,6 +340,18 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
             ],
         },
         KeyGroup {
+            title: "Repository tab (read-only)",
+            bindings: vec![
+                KeyBinding::new("j / ↓ / k / ↑", "Move selection"),
+                KeyBinding::new("h / ←", "Collapse directory"),
+                KeyBinding::new("l / → / Enter", "Expand directory / preview file at HEAD"),
+                KeyBinding::new("t", "Show recent revisions (svn log) for the selection"),
+                KeyBinding::new("Tab", "Focus the file preview (scroll with j/k/h/l)"),
+                KeyBinding::new("F5 / R", "Reload the selected directory / file"),
+                KeyBinding::new("Esc", "Back to the status tab"),
+            ],
+        },
+        KeyGroup {
             title: "Popups",
             bindings: vec![
                 KeyBinding::new("F5 / R", "Diff popup: reload the diff"),
@@ -334,6 +371,7 @@ pub fn all_binding_groups() -> Vec<KeyGroup> {
                     "Diff view: show the whole file (toggle back to the diff)",
                 ),
                 KeyBinding::new("Enter / d", "File history: diff of the selected revision"),
+                KeyBinding::new("c", "File history: toggle --stop-on-copy (branch point)"),
                 KeyBinding::new("Enter", "Blame popup: diff of the cursor line's revision"),
                 KeyBinding::new("Ctrl+b", "File finder: blame highlighted file"),
                 KeyBinding::new("b", "File history popup: blame the file"),
@@ -408,7 +446,7 @@ mod tests {
         assert!(key_match(&key(KeyCode::Char('r')), KeyAction::RevertFiles));
         assert!(key_match(
             &key(KeyCode::Char('x')),
-            KeyAction::ResolveConflict
+            KeyAction::ShowConflictDetails
         ));
         assert!(key_match(&key(KeyCode::Char('c')), KeyAction::Commit));
         assert!(key_match(&key(KeyCode::Char('u')), KeyAction::UpdateWc));

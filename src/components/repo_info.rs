@@ -201,6 +201,7 @@ mod tests {
             tree_conflict: ' ',
             path: path.to_string(),
             is_dir: std::path::Path::new(path).is_dir(),
+            ..Default::default()
         }
     }
 

@@ -7,6 +7,7 @@ use crate::components::{
     ignore_editor::{self, IgnoreEditor},
     log::{self, LogComponent},
     patches::{self, PatchesComponent},
+    repo::{self, RepoBrowser},
     repo_info,
 };
 use crate::keys::{KeyAction, key_match};
@@ -15,7 +16,9 @@ use crate::popups::{DiffPopup, OutputPopup, Popup};
 use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Queue, Tab};
 use crate::status::StatusTab;
 use crate::strings::MSG;
-use crate::svn::models::{BlameLine, LogEntry, PreparedDiff, SvnInfo};
+use crate::svn::models::{
+    BlameLine, ConflictDetails, LogEntry, PreparedDiff, RemoteStatus, RemoteStatusEntry, SvnInfo,
+};
 use crate::svn::{AsyncSvnNotification, Svn};
 use crate::ui;
 use crossterm::event::Event;
@@ -24,7 +27,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use std::cell::Cell;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// Cap for file lists in confirmation messages: beyond it a
 /// "… and N more" tail is appended, so reverting a huge directory cannot
@@ -55,6 +58,117 @@ fn file_list_lines(targets: &[(char, String)]) -> String {
 /// in `show_error`, so every svn error path gets it for free.
 fn svn_error_hint(msg: &str) -> Option<&'static str> {
     (msg.contains("E155004") || msg.contains("E155037")).then_some(crate::strings::MSG.cleanup_hint)
+}
+
+/// Render the read-only conflict summary shown by `x`.
+fn conflict_details_text(d: &ConflictDetails) -> String {
+    let mut out = format!("Path: {}\n", d.path);
+    if !d.properties.is_empty() {
+        out.push_str(&format!(
+            "Conflicted properties: {}\n",
+            d.properties.join(", ")
+        ));
+    }
+    for line in &d.summary {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !d.sources.is_empty() {
+        out.push('\n');
+        for line in &d.sources {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "\nThis tool does not resolve conflicts. Edit the file, then resolve it \
+         with svn (e.g. `svn resolve --accept=working <path>`) or your merge tool.",
+    );
+    out
+}
+
+/// Cap for each section of the update preview: a huge remote change set
+/// must not build an unbounded confirmation message.
+const MAX_UPDATE_PREVIEW: usize = 200;
+
+/// Status char for an XML `item`/`props` pair.
+fn remote_item_char(item: &str, props: &str) -> char {
+    match item {
+        "added" => 'A',
+        "modified" => 'M',
+        "deleted" => 'D',
+        "replaced" => 'R',
+        "conflicted" => 'C',
+        "missing" => '!',
+        "unversioned" => '?',
+        "obstructed" => '~',
+        "normal" | "none" | "" => match props {
+            "modified" => 'M',
+            "conflicted" => 'C',
+            _ => ' ',
+        },
+        _ => '?',
+    }
+}
+
+fn remote_preview_lines(
+    entries: impl Iterator<Item = RemoteStatusEntry>,
+    remote_side: bool,
+    out: &mut String,
+) -> usize {
+    let mut n = 0;
+    for e in entries {
+        if n >= MAX_UPDATE_PREVIEW {
+            break;
+        }
+        let code = if remote_side {
+            match &e.remote_item {
+                Some(item) => remote_item_char(item, e.remote_props.as_deref().unwrap_or("none")),
+                None => remote_item_char("normal", e.remote_props.as_deref().unwrap_or("none")),
+            }
+        } else {
+            remote_item_char(&e.local_item, &e.local_props)
+        };
+        out.push_str(&format!("  {code} {}\n", e.path));
+        n += 1;
+    }
+    n
+}
+
+/// Confirmation text for `u`: what the server would bring in, plus local
+/// changes that could conflict.
+fn update_preview_message(status: &RemoteStatus, wc: &str, local_rev: Option<u64>) -> String {
+    let incoming: Vec<_> = status.incoming().cloned().collect();
+    let local: Vec<_> = status.local().cloned().collect();
+    let mut out = format!("{}\nWorking copy: {wc}\n", MSG.update_confirm);
+    match (status.head_revision, local_rev) {
+        (Some(head), Some(local)) => {
+            let behind = head.saturating_sub(local);
+            out.push_str(&format!(
+                "Remote HEAD: r{head} (working copy r{local}, {behind} revision(s) behind)\n"
+            ));
+        }
+        (Some(head), None) => out.push_str(&format!("Remote HEAD: r{head}\n")),
+        _ => out.push_str("Remote HEAD: unknown\n"),
+    }
+    if incoming.is_empty() {
+        out.push_str("\nNo incoming changes — update would be a no-op.\n");
+    } else {
+        out.push_str(&format!("\nIncoming changes ({}):\n", incoming.len()));
+        let shown = remote_preview_lines(incoming.iter().cloned(), true, &mut out);
+        if incoming.len() > shown {
+            out.push_str(&format!("  … and {} more\n", incoming.len() - shown));
+        }
+    }
+    if !local.is_empty() {
+        out.push_str(&format!("\nLocal changes ({}):\n", local.len()));
+        let shown = remote_preview_lines(local.iter().cloned(), false, &mut out);
+        if local.len() > shown {
+            out.push_str(&format!("  … and {} more\n", local.len() - shown));
+        }
+    }
+    out.push_str("\nRun svn update?");
+    out
 }
 
 /// Display name of a patch file path.
@@ -108,6 +222,8 @@ pub struct App {
     pub status: StatusTab,
     pub log: LogComponent,
     pub patches: PatchesComponent,
+    /// Read-only repository browser tab
+    pub repo: RepoBrowser,
     /// `.svnignore` editor tab
     pub ignore: IgnoreEditor,
     pub active_tab: Tab,
@@ -168,6 +284,12 @@ pub struct App {
     /// FIFO of `svn rm` batches in flight, mirroring `pending_adds`; a
     /// failed remove un-stages its paths the same way
     pending_removes: std::collections::VecDeque<Vec<String>>,
+    /// `svn status -u` request in flight for the update preview; `u` is
+    /// ignored until it finishes so repeated presses cannot stack popups.
+    update_preview_pending: bool,
+    /// Running working-copy mutation (label + start time), shown in the
+    /// status bar so a long update/commit is not just a spinner.
+    operation: Option<(String, Instant)>,
 }
 
 impl App {
@@ -179,6 +301,7 @@ impl App {
         status.tree.set_root(cwd.clone());
         let log = LogComponent::new(&ctx);
         let patches = PatchesComponent::new(&ctx);
+        let repo = RepoBrowser::new(&ctx);
         let ignore = IgnoreEditor::new(&ctx, cwd.clone());
         Self {
             svn,
@@ -186,6 +309,7 @@ impl App {
             status,
             log,
             patches,
+            repo,
             ignore,
             ctx,
             active_tab: Tab::Status,
@@ -207,6 +331,8 @@ impl App {
             pending_mutations: 0,
             pending_adds: std::collections::VecDeque::new(),
             pending_removes: std::collections::VecDeque::new(),
+            update_preview_pending: false,
+            operation: None,
         }
     }
 
@@ -296,6 +422,13 @@ impl App {
     }
 
     fn show_error(&mut self, msg: String) {
+        if msg.contains("operation cancelled") {
+            self.show_info(
+                "Operation cancelled. If the working copy reports a lock, press C (svn cleanup)."
+                    .to_string(),
+            );
+            return;
+        }
         let msg = match svn_error_hint(&msg) {
             Some(hint) => format!("{msg}\n{hint}"),
             None => msg,
@@ -438,6 +571,7 @@ impl App {
             Tab::Log => self.log.event(ev)?.consumed,
             Tab::Patches => self.patches.event(ev)?.consumed,
             Tab::Ignore => self.ignore.event(ev)?.consumed,
+            Tab::Repo => self.repo.event(ev)?.consumed,
         };
         if consumed {
             return Ok(());
@@ -466,6 +600,8 @@ impl App {
         } else if key_match(k, KeyAction::SavePatch) {
             self.svn.create_patch();
             self.pending += 1;
+        } else if key_match(k, KeyAction::CancelOperation) {
+            self.request_cancel_operation();
         } else if key_match(k, KeyAction::CleanupWc) {
             // working-copy repair, not tied to the status view: a lock left
             // by an interrupted operation surfaces on whichever tab issued
@@ -484,6 +620,8 @@ impl App {
             self.activate_tab(Tab::Patches);
         } else if key_match(k, KeyAction::SwitchTabIgnore) {
             self.activate_tab(Tab::Ignore);
+        } else if key_match(k, KeyAction::SwitchTabRepo) {
+            self.activate_tab(Tab::Repo);
         }
         // Tab / Shift+Tab are pane-focus keys, handled per tab (status:
         // handle_global_key; log: its own event); they never switch tabs
@@ -499,6 +637,9 @@ impl App {
         self.active_tab = tab;
         if tab == Tab::Patches {
             self.patches.refresh();
+        }
+        if tab == Tab::Repo {
+            self.repo.activate();
         }
         if tab == Tab::Ignore {
             self.ignore.reload();
@@ -525,9 +666,35 @@ impl App {
     /// Account for a working-copy mutation. Mutations are tracked
     /// separately from read-only requests so quitting can be deferred
     /// while a commit/update is in flight.
-    fn begin_mutation(&mut self) {
+    fn begin_mutation(&mut self, label: &str) {
         self.pending_mutations = self.pending_mutations.saturating_add(1);
         self.pending += 1;
+        self.operation = Some((label.to_string(), Instant::now()));
+    }
+
+    /// `Ctrl+x`: cancel only operations that are safe to abort. Commits and
+    /// patch applications must run to completion; queued-but-not-started
+    /// jobs cannot be targeted yet (the mutation queue is FIFO).
+    fn request_cancel_operation(&mut self) {
+        if self.pending_mutations == 0 {
+            self.show_info("No working-copy operation is running".to_string());
+            return;
+        }
+        let Some((label, _)) = &self.operation else {
+            self.show_info("No cancellable operation is running".to_string());
+            return;
+        };
+        let cancellable = label.starts_with("svn update")
+            || label.starts_with("svn switch")
+            || label.starts_with("svn cleanup");
+        if !cancellable {
+            self.show_info(format!(
+                "{label} cannot be cancelled safely — wait for it to finish"
+            ));
+            return;
+        }
+        self.queue
+            .push(InternalEvent::Confirm(ConfirmAction::CancelOperation));
     }
 
     // ----- queue events (pushed by components) -----
@@ -607,18 +774,35 @@ impl App {
                     self.pending += 1;
                 }
             }
-            InternalEvent::FileLogLoadMore { path, before_rev } => {
+            InternalEvent::FileLogLoadMore {
+                path,
+                before_rev,
+                stop_on_copy,
+            } => {
                 if before_rev > 1 {
-                    self.svn.file_log_more(
+                    self.svn.file_log_more_opts(
                         &path,
                         before_rev,
                         crate::components::file_log::FILE_LOG_PAGE,
+                        stop_on_copy,
                     );
                     self.pending += 1;
                 }
             }
+            InternalEvent::ReloadFileLog { path, stop_on_copy } => {
+                self.svn.file_log_opts(
+                    &path,
+                    crate::components::file_log::FILE_LOG_PAGE,
+                    stop_on_copy,
+                );
+                self.pending += 1;
+            }
             InternalEvent::ShowCommitInfo(entry) => {
                 self.show_commit_info(&entry);
+            }
+            InternalEvent::OpenChangedPaths(rev, paths) => {
+                let ctx = self.ctx.clone();
+                self.push_popup(Popup::changed_paths(&ctx, rev, paths));
             }
             InternalEvent::Confirm(action) => {
                 let message = match &action {
@@ -666,6 +850,16 @@ impl App {
                         MSG.cleanup_confirm,
                         self.working_copy_label()
                     ),
+                    ConfirmAction::CancelOperation => {
+                        let label = self
+                            .operation
+                            .as_ref()
+                            .map(|(l, _)| l.as_str())
+                            .unwrap_or("operation");
+                        format!(
+                            "Cancel the running {label}?\nThe working copy may need `svn cleanup` (C) afterwards."
+                        )
+                    }
                     ConfirmAction::Switch(target) => {
                         let current = self.svn_info.as_ref().map(|i| i.branch_label().to_string());
                         match current {
@@ -674,9 +868,6 @@ impl App {
                             }
                             _ => format!("{}\nTarget: {target}", MSG.switch_confirm),
                         }
-                    }
-                    ConfirmAction::Resolve(path) => {
-                        format!("{} ({path})", MSG.resolve_confirm)
                     }
                     ConfirmAction::UpdateToRevision(rev) => format!(
                         "{} (r{rev})\nWorking copy: {}",
@@ -700,6 +891,14 @@ impl App {
             }
             InternalEvent::RefreshStatus => {
                 self.svn.status();
+                self.pending += 1;
+            }
+            InternalEvent::RequestUpdatePreview => {
+                if self.update_preview_pending {
+                    return;
+                }
+                self.update_preview_pending = true;
+                self.svn.remote_status();
                 self.pending += 1;
             }
             InternalEvent::OpenSwitch => {
@@ -740,7 +939,7 @@ impl App {
                     // dir and its children (E200009)
                     self.pending_adds.push_back(paths.clone());
                     self.svn.add(&self.status.tree.collapse_add_targets(&paths));
-                    self.begin_mutation();
+                    self.begin_mutation("svn add");
                 }
             }
             InternalEvent::RemoveFiles(paths) => {
@@ -750,7 +949,7 @@ impl App {
                     // in order)
                     self.pending_removes.push_back(paths.clone());
                     self.svn.remove(&paths);
-                    self.begin_mutation();
+                    self.begin_mutation("svn rm");
                 }
             }
             InternalEvent::RequestFileDiff => {
@@ -808,12 +1007,22 @@ impl App {
                     self.pending += 1;
                 }
             }
+            InternalEvent::ShowConflictDetails(path) => {
+                self.svn.conflict_details(&path);
+                self.pending += 1;
+            }
             InternalEvent::RequestFileHistory => {
-                if let Some(e) = self.status.tree.selection_entry() {
-                    if !e.is_dir && e.status == '?' {
-                        self.show_error("svn log: file is not under version control".to_string());
-                    } else if !e.is_dir {
-                        let path = e.path.clone();
+                if let Some(path) = self.status.tree.selection_path() {
+                    // A plain directory has no status entry but is versioned
+                    // by construction; reject only known-unversioned paths.
+                    if self
+                        .status
+                        .tree
+                        .selection_entry()
+                        .is_some_and(|e| e.status == '?')
+                    {
+                        self.show_error("svn log: path is not under version control".to_string());
+                    } else {
                         self.open_file_history(&path);
                     }
                 }
@@ -825,6 +1034,18 @@ impl App {
                 let ctx = self.ctx.clone();
                 self.push_popup(Popup::file_finder(&ctx));
                 self.svn.list_files();
+                self.pending += 1;
+            }
+            InternalEvent::RepoLoad(url) => {
+                self.svn.repo_list(&url);
+                self.pending += 1;
+            }
+            InternalEvent::RepoPreview(url) => {
+                self.svn.repo_cat(&url);
+                self.pending += 1;
+            }
+            InternalEvent::RepoLog(url) => {
+                self.svn.repo_log(&url);
                 self.pending += 1;
             }
             InternalEvent::PreviewPatch(path) => {
@@ -932,15 +1153,15 @@ impl App {
                 // commit (file targets are unaffected by it)
                 let depth_empty = from_staged && self.status.tree.any_dir(&paths);
                 self.svn.commit(&message, &paths, depth_empty);
-                self.begin_mutation();
+                self.begin_mutation("svn commit");
             }
             ConfirmAction::Revert(paths) => {
                 self.svn.revert(&paths);
-                self.begin_mutation();
+                self.begin_mutation("svn revert");
             }
             ConfirmAction::Update => {
                 self.svn.update();
-                self.begin_mutation();
+                self.begin_mutation("svn update");
             }
             ConfirmAction::Cleanup => {
                 // repair the whole working copy, not just the start
@@ -949,23 +1170,26 @@ impl App {
                 // fall back to the start directory)
                 let root = self.svn_info.as_ref().map(|i| i.wc_root.as_str());
                 self.svn.cleanup(root);
-                self.begin_mutation();
+                self.begin_mutation("svn cleanup");
+            }
+            ConfirmAction::CancelOperation => {
+                if self.svn.cancel() {
+                    self.show_info("Cancelling the running operation...".to_string());
+                } else {
+                    self.show_info("The operation already finished".to_string());
+                }
             }
             ConfirmAction::Switch(target) => {
                 self.svn.switch(&target);
-                self.begin_mutation();
-            }
-            ConfirmAction::Resolve(path) => {
-                self.svn.resolve(&path);
-                self.begin_mutation();
+                self.begin_mutation("svn switch");
             }
             ConfirmAction::UpdateToRevision(rev) => {
                 self.svn.update_to_revision(rev);
-                self.begin_mutation();
+                self.begin_mutation("svn update -r");
             }
             ConfirmAction::ApplyPatch(path) => {
                 self.svn.apply_patch(&path);
-                self.begin_mutation();
+                self.begin_mutation("svn patch");
             }
             ConfirmAction::DeletePatch(path) => {
                 let name = patch_name(&path);
@@ -1011,7 +1235,6 @@ impl App {
             AsyncSvnNotification::Add(_)
                 | AsyncSvnNotification::Remove(_)
                 | AsyncSvnNotification::Revert(_)
-                | AsyncSvnNotification::Resolve(_)
                 | AsyncSvnNotification::Update(_)
                 | AsyncSvnNotification::UpdateToRevision(_)
                 | AsyncSvnNotification::Commit(_)
@@ -1020,6 +1243,9 @@ impl App {
                 | AsyncSvnNotification::ApplyPatch(_)
         ) {
             self.pending_mutations = self.pending_mutations.saturating_sub(1);
+            if self.pending_mutations == 0 {
+                self.operation = None;
+            }
         }
         match notif {
             AsyncSvnNotification::Version(result) => {
@@ -1099,6 +1325,28 @@ impl App {
                         // leave the tree out of its Loading state
                         self.status.tree.pending = false;
                         self.show_error(format!("svn status: {e}"));
+                    }
+                }
+            }
+            AsyncSvnNotification::RemoteStatus(result) => {
+                self.update_preview_pending = false;
+                match result {
+                    Ok(status) => {
+                        let local_rev = self.svn_info.as_ref().map(|i| i.revision);
+                        let msg =
+                            update_preview_message(&status, &self.working_copy_label(), local_rev);
+                        self.show_confirm(msg, ConfirmAction::Update);
+                    }
+                    Err(e) => {
+                        // offline/auth failure must not dead-end the update:
+                        // show the reason and let the user decide.
+                        self.show_confirm(
+                            format!(
+                                "Could not read remote status:\n{e}\n\nRun svn update anyway?\nWorking copy: {}",
+                                self.working_copy_label()
+                            ),
+                            ConfirmAction::Update,
+                        );
                     }
                 }
             }
@@ -1560,12 +1808,25 @@ impl App {
                 }
                 Err(e) => self.show_error(format!("svn revert: {e}")),
             },
-            AsyncSvnNotification::Resolve(result) => match result {
-                Ok(path) => {
-                    self.show_info(format!("{}: {path}", MSG.resolve_done));
-                    self.refresh_after_op();
+            AsyncSvnNotification::ConflictDetails { path, result } => match result {
+                Ok(Some(details)) => {
+                    let title = format!("Conflict: {path}");
+                    self.show_output(title, &conflict_details_text(&details));
                 }
-                Err(e) => self.show_error(format!("svn resolve: {e}")),
+                Ok(None) => {
+                    self.show_info(format!("{path}: no conflict details (already resolved?)"));
+                }
+                Err(e) => self.show_error(format!("svn info {path}: {e}")),
+            },
+            AsyncSvnNotification::RepoList { url, result } => {
+                self.repo.apply_list(&url, result);
+            }
+            AsyncSvnNotification::RepoFile { url, result } => {
+                self.repo.apply_file(&url, result);
+            }
+            AsyncSvnNotification::RepoLog { url, result } => match result {
+                Ok(text) => self.show_output(format!("svn log {url}"), &text),
+                Err(e) => self.show_error(format!("svn log {url}: {e}")),
             },
             AsyncSvnNotification::CreatePatch(result) => match result {
                 Ok(diff) => self.save_patch(&diff),
@@ -1628,6 +1889,7 @@ impl App {
             Tab::Log => self.log.draw(f, main)?,
             Tab::Patches => self.patches.draw(f, main)?,
             Tab::Ignore => self.ignore.draw(f, main)?,
+            Tab::Repo => self.repo.draw(f, main)?,
         }
 
         // status bar
@@ -1663,7 +1925,18 @@ impl App {
         if self.pending > 0 {
             let frame = ui::spinner_frame(self.spinner_frame.get());
             spans.push(Span::styled(format!("{frame} "), theme.info));
-            spans.push(Span::styled(format!("{} op", self.pending), theme.info));
+            if let Some((label, started)) = &self.operation {
+                let elapsed = started.elapsed().as_secs();
+                spans.push(Span::styled(format!("{label} {elapsed}s"), theme.info));
+                if label.starts_with("svn update")
+                    || label.starts_with("svn switch")
+                    || label.starts_with("svn cleanup")
+                {
+                    spans.push(Span::styled(" (ctrl+x cancel)", theme.dim));
+                }
+            } else {
+                spans.push(Span::styled(format!("{} op", self.pending), theme.info));
+            }
             spans.push(Span::raw(" "));
         }
         let staged = self.status.tree.staged_count();
@@ -1680,6 +1953,7 @@ impl App {
             Tab::Log => crate::components::log::HINTS,
             Tab::Patches => patches::HINTS,
             Tab::Ignore => ignore_editor::HINTS,
+            Tab::Repo => repo::HINTS,
         };
         spans.push(Span::styled(
             format!("{hints}  ? help  i info  q quit  [1]status [2]log [3]patches [4]ignore"),
@@ -1695,7 +1969,9 @@ mod tests {
     use super::*;
     use crate::components::Context;
     use crate::queue::{ConfirmAction, InternalEvent, NeedsUpdate, Tab};
-    use crate::svn::models::{BlameLine, LogEntry, PreparedDiff, StatusEntry, SvnInfo};
+    use crate::svn::models::{
+        BlameLine, LogEntry, PreparedDiff, RemoteStatus, RemoteStatusEntry, StatusEntry, SvnInfo,
+    };
     use crate::svn::parser::parse_diff_content;
     use crate::test_support::{self, TestRepo};
     use crate::ui::style::Theme;
@@ -1730,6 +2006,7 @@ mod tests {
             tree_conflict: ' ',
             path: path.to_string(),
             is_dir: std::path::Path::new(path).is_dir(),
+            ..Default::default()
         }
     }
 
@@ -2383,11 +2660,11 @@ mod tests {
     }
 
     #[test]
-    fn update_commit_add_revert_resolve_async_flows() {
+    fn update_commit_add_revert_async_flows() {
         let Some(repo) = TestRepo::new() else { return };
         let (mut app, rx) = app_with(&repo);
 
-        // update ok → output popup + refresh; then resolve result arrives
+        // update ok → output popup + refresh
         app.handle_async(AsyncSvnNotification::Update(Ok(
             "Updating '.':\nAt revision 1.\n".into(),
         )));
@@ -2436,10 +2713,46 @@ mod tests {
         assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.handle_async(AsyncSvnNotification::Revert(Err("boom".into())));
 
-        // resolve ok / err
-        app.handle_async(AsyncSvnNotification::Resolve(Ok("c.txt".into())));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
-        app.handle_async(AsyncSvnNotification::Resolve(Err("boom".into())));
+        // conflict details are read-only: showing them must not refresh
+        // or mutate anything
+        app.popups.clear();
+        app.handle_async(AsyncSvnNotification::ConflictDetails {
+            path: "c.txt".into(),
+            result: Ok(Some(ConflictDetails {
+                path: "c.txt".into(),
+                properties: vec!["myprop".into()],
+                summary: vec!["incoming file edit upon update".into()],
+                sources: vec!["Source left: (file) ^/c.txt@1".into()],
+            })),
+        });
+        match app.popups.last() {
+            Some(Popup::Output(p)) => {
+                let text: String = p
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect();
+                assert!(text.contains("myprop"), "{text}");
+                assert!(text.contains("incoming file edit"), "{text}");
+                assert!(text.contains("does not resolve"), "{text}");
+            }
+            _ => panic!("expected conflict details output popup"),
+        }
+        app.handle_async(AsyncSvnNotification::ConflictDetails {
+            path: "c.txt".into(),
+            result: Ok(None),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        app.handle_async(AsyncSvnNotification::ConflictDetails {
+            path: "c.txt".into(),
+            result: Err("boom".into()),
+        });
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
 
         // update to revision ok / err
         app.handle_async(AsyncSvnNotification::UpdateToRevision(Ok(
@@ -2447,6 +2760,62 @@ mod tests {
         )));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Status(..)));
         app.handle_async(AsyncSvnNotification::UpdateToRevision(Err("boom".into())));
+    }
+
+    #[test]
+    fn update_preview_lists_incoming_and_local_changes() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.svn_info = Some(test_info());
+        app.pending = 1; // remote_status bumped it
+        app.handle_async(AsyncSvnNotification::RemoteStatus(Ok(RemoteStatus {
+            head_revision: Some(45),
+            entries: vec![
+                RemoteStatusEntry {
+                    path: "src/remote.rs".into(),
+                    local_item: "normal".into(),
+                    local_props: "none".into(),
+                    remote_item: Some("modified".into()),
+                    remote_props: None,
+                },
+                RemoteStatusEntry {
+                    path: "src/local.rs".into(),
+                    local_item: "modified".into(),
+                    local_props: "none".into(),
+                    remote_item: None,
+                    remote_props: None,
+                },
+            ],
+        })));
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected update confirmation");
+        };
+        assert!(p.message.contains("Working copy"), "{}", p.message);
+        assert!(p.message.contains("42 revision(s) behind"), "{}", p.message);
+        assert!(p.message.contains("Incoming changes (1)"), "{}", p.message);
+        assert!(p.message.contains("M src/remote.rs"), "{}", p.message);
+        assert!(p.message.contains("Local changes (1)"), "{}", p.message);
+        assert!(p.message.contains("M src/local.rs"), "{}", p.message);
+        assert!(
+            matches!(p.action, Some(ConfirmAction::Update)),
+            "update must stay the confirmed action"
+        );
+    }
+
+    #[test]
+    fn update_preview_falls_back_on_remote_status_error() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.pending = 1;
+        app.handle_async(AsyncSvnNotification::RemoteStatus(Err(
+            "E170001: authorization failed".into(),
+        )));
+        let Some(Popup::Confirm(p)) = app.popups.last() else {
+            panic!("expected fallback confirmation");
+        };
+        assert!(p.message.contains("E170001"), "{}", p.message);
+        assert!(p.message.contains("update anyway"), "{}", p.message);
+        assert!(matches!(p.action, Some(ConfirmAction::Update)));
     }
 
     #[test]
@@ -2468,7 +2837,7 @@ mod tests {
         app.perform_confirmed(ConfirmAction::Revert(vec!["docs/readme.md".into()]));
         assert!(matches!(recv(&rx), AsyncSvnNotification::Revert(_)));
 
-        // update + update to revision + resolve + cleanup
+        // update + update to revision + cleanup
         app.perform_confirmed(ConfirmAction::Update);
         assert!(matches!(recv(&rx), AsyncSvnNotification::Update(_)));
         app.perform_confirmed(ConfirmAction::UpdateToRevision(1));
@@ -2476,8 +2845,6 @@ mod tests {
             recv(&rx),
             AsyncSvnNotification::UpdateToRevision(_)
         ));
-        app.perform_confirmed(ConfirmAction::Resolve("Cargo.toml".into()));
-        assert!(matches!(recv(&rx), AsyncSvnNotification::Resolve(_)));
         app.perform_confirmed(ConfirmAction::Cleanup);
         assert!(matches!(recv(&rx), AsyncSvnNotification::Cleanup(_)));
 
@@ -2524,11 +2891,10 @@ mod tests {
         assert!(matches!(app.popups.last(), Some(Popup::Confirm(_))));
         app.popups.clear();
 
-        // revert / update / resolve / update-to-rev / switch confirmations
+        // revert / update / update-to-rev / switch confirmations
         for action in [
             ConfirmAction::Revert(vec!["a.txt".into()]),
             ConfirmAction::Update,
-            ConfirmAction::Resolve("a.txt".into()),
             ConfirmAction::UpdateToRevision(4),
             ConfirmAction::Switch("^/branches/x".into()),
             ConfirmAction::Cleanup,
@@ -2962,6 +3328,63 @@ mod tests {
             m2,
             AsyncSvnNotification::Status(..) | AsyncSvnNotification::Log(..)
         ));
+    }
+
+    #[test]
+    fn cancel_operation_only_for_safe_mutations() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        // nothing running
+        app.request_cancel_operation();
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+        app.popups.clear();
+
+        // update is cancellable and goes through a confirmation
+        app.begin_mutation("svn update");
+        app.request_cancel_operation();
+        app.handle_queue_events();
+        assert!(matches!(
+            app.popups.last(),
+            Some(Popup::Confirm(p))
+                if matches!(p.action, Some(ConfirmAction::CancelOperation))
+        ));
+        app.popups.clear();
+
+        // commit must not be killed mid-transaction
+        app.operation = Some(("svn commit".into(), Instant::now()));
+        app.request_cancel_operation();
+        assert!(matches!(app.popups.last(), Some(Popup::Msg(_))));
+    }
+
+    #[test]
+    fn cancelled_operation_error_becomes_an_info_message() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, _rx) = app_with(&repo);
+        app.show_error("svn update: operation cancelled".into());
+        match app.popups.last() {
+            Some(Popup::Msg(p)) => assert!(!p.is_error, "cancel is not an error"),
+            _ => panic!("expected info popup"),
+        }
+    }
+
+    #[test]
+    fn repo_tab_activates_and_applies_list() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (mut app, rx) = app_with(&repo);
+        app.activate_tab(Tab::Repo);
+        app.handle_queue_events();
+        assert!(matches!(
+            recv(&rx),
+            AsyncSvnNotification::RepoList { url, .. } if url == "^/"
+        ));
+        assert!(app.repo.pending);
+        app.handle_async(AsyncSvnNotification::RepoList {
+            url: "^/".into(),
+            result: Ok(vec![("src".into(), true), ("Cargo.toml".into(), false)]),
+        });
+        assert!(!app.repo.pending);
+        assert_eq!(app.repo.visible().len(), 2);
+        assert!(matches!(app.active_tab, Tab::Repo));
     }
 
     #[test]
@@ -3560,6 +3983,7 @@ mod tests {
         app.queue.push(InternalEvent::FileLogLoadMore {
             path: "main.rs".into(),
             before_rev: 11,
+            stop_on_copy: false,
         });
         app.handle_queue_events();
         assert!(matches!(
@@ -4203,6 +4627,7 @@ mod tests {
             tree_conflict: ' ',
             path: "newdir".into(),
             is_dir: true,
+            ..Default::default()
         };
         let file_entry = StatusEntry {
             status: 'A',
@@ -4210,6 +4635,7 @@ mod tests {
             tree_conflict: ' ',
             path: "newdir/file.txt".into(),
             is_dir: false,
+            ..Default::default()
         };
         app.handle_async(AsyncSvnNotification::Status(
             0,
@@ -4249,6 +4675,7 @@ mod tests {
                 tree_conflict: ' ',
                 path: "newdir".into(),
                 is_dir: true,
+                ..Default::default()
             },
             StatusEntry {
                 status: 'A',
@@ -4256,6 +4683,7 @@ mod tests {
                 tree_conflict: ' ',
                 path: "newdir/sub".into(),
                 is_dir: true,
+                ..Default::default()
             },
             StatusEntry {
                 status: 'A',
@@ -4263,6 +4691,7 @@ mod tests {
                 tree_conflict: ' ',
                 path: "newdir/sub/file.txt".into(),
                 is_dir: false,
+                ..Default::default()
             },
         ];
         app.handle_async(AsyncSvnNotification::Status(0, Ok(entries)));
@@ -4453,6 +4882,12 @@ mod tests {
         // requests it (the dedup key compares against the previous one)
         app.status.tree.event(&ts_key(KeyCode::Char('j'))).unwrap();
         assert_eq!(app.status.maybe_request_diff().as_deref(), Some("b.txt"));
+        // b's result completes the single in-flight slot before moving back
+        app.handle_async(AsyncSvnNotification::Diff {
+            path: "b.txt".into(),
+            req: None,
+            result: diff_ok("Index: b.txt\n@@ -1 +1 @@\n-a\n+b\n"),
+        });
         app.status.tree.event(&ts_key(KeyCode::Char('k'))).unwrap();
         assert_eq!(app.status.maybe_request_diff().as_deref(), Some("a.txt"));
     }
@@ -4591,6 +5026,7 @@ mod tests {
             tree_conflict: ' ',
             path: "Cargo.toml".into(),
             is_dir: false,
+            ..Default::default()
         };
         app.handle_async(AsyncSvnNotification::Status(0, Ok(vec![missing])));
         app.status.set_staged(&["Cargo.toml".into()]);
@@ -4641,6 +5077,7 @@ mod tests {
                     tree_conflict: ' ',
                     path: "docs".into(),
                     is_dir: true,
+                    ..Default::default()
                 },
                 StatusEntry {
                     status: '!',
@@ -4648,6 +5085,7 @@ mod tests {
                     tree_conflict: ' ',
                     path: "docs/readme.md".into(),
                     is_dir: false,
+                    ..Default::default()
                 },
             ]),
         ));
@@ -4707,6 +5145,7 @@ mod tests {
                 tree_conflict: ' ',
                 path: "newdir".into(),
                 is_dir: true,
+                ..Default::default()
             }]),
         ));
         app.status

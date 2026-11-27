@@ -165,6 +165,7 @@ pub fn gen_status_entries(n: usize, wide: bool) -> Vec<crate::svn::models::Statu
                 tree_conflict: ' ',
                 path,
                 is_dir: false,
+                ..Default::default()
             }
         })
         .collect()

@@ -39,6 +39,8 @@ fn should_forward(ev: &Event) -> bool {
 struct CliArgs {
     /// Working copy path (defaults to the current directory)
     path: PathBuf,
+    /// Optional diagnostic log file (`--log-file PATH`)
+    log_file: Option<PathBuf>,
 }
 
 enum CliAction {
@@ -49,24 +51,27 @@ enum CliAction {
 
 const USAGE: &str = "svnui — an SVN TUI client inspired by gitui
 
-Usage: svnui [PATH]
+Usage: svnui [OPTIONS] [PATH]
 
 Arguments:
   [PATH]  Working copy path [default: .]
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
-  --             Treat all following arguments as paths";
+  -h, --help             Print help
+  -V, --version          Print version
+  --log-file <PATH>      Write a diagnostic log (svn commands, durations, errors)
+  --                     Treat all following arguments as paths";
 
 /// Parse argv (without the program name). A single optional positional
 /// argument doesn't justify pulling in clap and its derive macro tree.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<CliAction, String> {
     let mut path: Option<PathBuf> = None;
+    let mut log_file: Option<PathBuf> = None;
     // after `--`, everything is a positional argument, so paths that
     // start with `-` can be passed
     let mut positional_only = false;
-    for arg in args {
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
         if !positional_only {
             match arg.as_str() {
                 "--" => {
@@ -75,6 +80,20 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliAction, String> {
                 }
                 "-h" | "--help" => return Ok(CliAction::Help),
                 "-V" | "--version" => return Ok(CliAction::Version),
+                "--log-file" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| "--log-file requires a path".to_string())?;
+                    log_file = Some(PathBuf::from(value));
+                    continue;
+                }
+                _ if let Some(value) = arg.strip_prefix("--log-file=") => {
+                    if value.is_empty() {
+                        return Err("--log-file requires a path".to_string());
+                    }
+                    log_file = Some(PathBuf::from(value));
+                    continue;
+                }
                 _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
                 _ => {}
             }
@@ -86,6 +105,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CliAction, String> {
     }
     Ok(CliAction::Run(CliArgs {
         path: path.unwrap_or_else(|| PathBuf::from(".")),
+        log_file,
     }))
 }
 
@@ -136,6 +156,9 @@ fn main() -> Result<(), String> {
     };
     let cwd = std::fs::canonicalize(&args.path)
         .map_err(|e| format!("invalid path {}: {e}", args.path.display()))?;
+    if let Some(log_file) = &args.log_file {
+        svnui::diag::init(log_file)?;
+    }
 
     // channels
     let (tx_async, rx_async) = crossbeam_channel::unbounded::<svn::AsyncSvnNotification>();
@@ -338,10 +361,27 @@ mod tests {
             panic!("expected Run");
         };
         assert_eq!(args.path, PathBuf::from("."));
+        assert_eq!(args.log_file, None);
         let Ok(CliAction::Run(args)) = parse_args(["/tmp/repo".to_string()].into_iter()) else {
             panic!("expected Run");
         };
         assert_eq!(args.path, PathBuf::from("/tmp/repo"));
+        assert_eq!(args.log_file, None);
+        // --log-file accepts a separate value or --log-file=...
+        let Ok(CliAction::Run(args)) =
+            parse_args(["--log-file".to_string(), "/tmp/a.log".to_string()].into_iter())
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(args.log_file, Some(PathBuf::from("/tmp/a.log")));
+        let Ok(CliAction::Run(args)) =
+            parse_args(["--log-file=/tmp/b.log".to_string()].into_iter())
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(args.log_file, Some(PathBuf::from("/tmp/b.log")));
+        assert!(parse_args(["--log-file".to_string()].into_iter()).is_err());
+        assert!(parse_args(["--log-file=".to_string()].into_iter()).is_err());
         // help / version
         assert!(matches!(
             parse_args(["--help".to_string()].into_iter()),
@@ -497,6 +537,7 @@ mod tests {
                 tree_conflict: ' ',
                 path: "Cargo.toml".to_string(),
                 is_dir: false,
+                ..Default::default()
             }]),
         ));
         app.handle_async(svn::AsyncSvnNotification::Log(0, Ok(vec![])));

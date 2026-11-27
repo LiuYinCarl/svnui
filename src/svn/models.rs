@@ -44,11 +44,36 @@ pub struct StatusEntry {
     pub props_status: char,
     /// Tree conflict marker (seventh column), 'C' when present
     pub tree_conflict: char,
+    /// Directory-lock column (third): 'L' when the item is locked.
+    pub locked: char,
+    /// File-lock column (sixth): 'K' locked, 'O' other lock, 'T' stolen
+    /// lock, 'B' broken lock; ' ' when unlocked.
+    pub lock: char,
+    /// Copied-with-history marker (fourth column), '+' when present.
+    pub copied: char,
+    /// Switched marker (fifth column), 'S' when present.
+    pub switched: char,
     /// Path relative to the working-copy root (the app re-roots itself
     /// there after `svn info`)
     pub path: String,
     /// Whether the path is a directory on disk
     pub is_dir: bool,
+}
+
+impl Default for StatusEntry {
+    fn default() -> Self {
+        Self {
+            status: ' ',
+            props_status: ' ',
+            tree_conflict: ' ',
+            locked: ' ',
+            lock: ' ',
+            copied: ' ',
+            switched: ' ',
+            path: String::new(),
+            is_dir: false,
+        }
+    }
 }
 
 impl StatusEntry {
@@ -194,6 +219,71 @@ pub struct TreeItem {
     pub kind: TreeItemKind,
 }
 
+/// Details of a working-copy conflict, parsed from `svn info`.
+///
+/// svnui deliberately does not resolve conflicts; this is display-only
+/// information so the user can see what kind of conflict they have and
+/// take it to their editor / merge tool / `svn resolve`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConflictDetails {
+    /// Working-copy-relative path (or the path the user asked about)
+    pub path: String,
+    /// Property names reported by "Conflicted Properties:"
+    pub properties: Vec<String>,
+    /// Conflict descriptions, e.g. "Conflict Details: incoming file edit
+    /// upon update" or "Tree conflict: local edit, incoming delete..."
+    pub summary: Vec<String>,
+    /// Source revision lines ("Source left: ...", "Source right: ...")
+    pub sources: Vec<String>,
+}
+
+impl ConflictDetails {
+    pub fn is_empty(&self) -> bool {
+        self.properties.is_empty() && self.summary.is_empty() && self.sources.is_empty()
+    }
+}
+
+/// One entry from `svn status -u --xml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteStatusEntry {
+    /// Working-copy-relative path (XML-unescaped)
+    pub path: String,
+    /// `wc-status item` (normal/modified/added/deleted/missing/...)
+    pub local_item: String,
+    /// `wc-status props` (none/modified/conflicted)
+    pub local_props: String,
+    /// `repos-status item` when the server has a change
+    pub remote_item: Option<String>,
+    /// `repos-status props`
+    pub remote_props: Option<String>,
+}
+
+/// Result of `svn status -u --xml`: what an update would bring in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteStatus {
+    /// HEAD revision, when `svn info -r HEAD` succeeded.
+    pub head_revision: Option<u64>,
+    pub entries: Vec<RemoteStatusEntry>,
+}
+
+impl RemoteStatus {
+    /// Entries the server reports as changed (added/modified/deleted/...).
+    pub fn incoming(&self) -> impl Iterator<Item = &RemoteStatusEntry> {
+        self.entries.iter().filter(|e| {
+            e.remote_item.is_some()
+                || !matches!(e.remote_props.as_deref(), None | Some("none") | Some(""))
+        })
+    }
+
+    /// Entries with local changes (modified/added/deleted/missing/...).
+    pub fn local(&self) -> impl Iterator<Item = &RemoteStatusEntry> {
+        self.entries.iter().filter(|e| {
+            !matches!(e.local_item.as_str(), "normal" | "none" | "")
+                || !matches!(e.local_props.as_str(), "none" | "")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +319,7 @@ mod tests {
             tree_conflict: ' ',
             path: "a".into(),
             is_dir: false,
+            ..Default::default()
         };
         assert!(!e.is_conflicted());
         e.status = 'C';
@@ -248,6 +339,7 @@ mod tests {
             tree_conflict: ' ',
             path: "f.txt".into(),
             is_dir: false,
+            ..Default::default()
         };
         assert!(e.is_conflicted());
     }

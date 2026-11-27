@@ -37,6 +37,9 @@ pub struct FileLogPopup {
     /// The oldest loaded revision is the start of the file's history
     /// (svn E195012 on the last page): stop paginating
     history_exhausted: bool,
+    /// `--stop-on-copy`: start at the branch/copy point instead of walking
+    /// into the source branch's older history.
+    pub stop_on_copy: bool,
 }
 
 impl FileLogPopup {
@@ -51,6 +54,7 @@ impl FileLogPopup {
             detail_scroll: Cell::new(0),
             loading_more: false,
             history_exhausted: false,
+            stop_on_copy: false,
         }
     }
 
@@ -107,6 +111,7 @@ impl FileLogPopup {
             self.ctx.queue.push(InternalEvent::FileLogLoadMore {
                 path: self.path.clone(),
                 before_rev: oldest,
+                stop_on_copy: self.stop_on_copy,
             });
         }
     }
@@ -152,6 +157,9 @@ impl DrawableComponent for FileLogPopup {
         }
         if self.loading_more {
             title.push_str("  (loading older…)");
+        }
+        if self.stop_on_copy {
+            title.push_str("  [stop-on-copy]");
         }
         let block = Block::default()
             .borders(Borders::ALL)
@@ -226,6 +234,17 @@ impl DrawableComponent for FileLogPopup {
         };
         if key_match(k, KeyAction::ClosePopup) || key_match(k, KeyAction::Quit) {
             self.ctx.queue.push(InternalEvent::ClosePopup);
+        } else if key_match(k, KeyAction::ToggleStopOnCopy) {
+            self.stop_on_copy = !self.stop_on_copy;
+            self.entries.clear();
+            self.pending = true;
+            self.loading_more = false;
+            self.history_exhausted = false;
+            self.selection = 0;
+            self.ctx.queue.push(InternalEvent::ReloadFileLog {
+                path: self.path.clone(),
+                stop_on_copy: self.stop_on_copy,
+            });
         } else if key_match(k, KeyAction::MoveDown) {
             self.move_selection(1);
             self.maybe_load_more();
@@ -442,7 +461,11 @@ mod tests {
         p.event(&ts::key(crossterm::event::KeyCode::End)).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::FileLogLoadMore { path, before_rev })
+            Some(InternalEvent::FileLogLoadMore {
+                path,
+                before_rev,
+                ..
+            })
                 if path == "src/main.rs" && before_rev == 11
         ));
         // one request in flight at a time
@@ -489,6 +512,37 @@ mod tests {
         assert!(matches!(
             q.pop(),
             Some(InternalEvent::FileLogLoadMore { before_rev: 11, .. })
+        ));
+    }
+
+    #[test]
+    fn stop_on_copy_toggle_reloads_history() {
+        let q = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q.clone(),
+            theme: Theme::default(),
+        };
+        let mut p = FileLogPopup::new(&ctx, "src/main.rs");
+        assert!(!p.stop_on_copy);
+        p.event(&ts::key(crossterm::event::KeyCode::Char('c')))
+            .unwrap();
+        assert!(p.stop_on_copy);
+        assert!(p.pending);
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::ReloadFileLog { path, stop_on_copy: true })
+                if path == "src/main.rs"
+        ));
+        // second toggle asks for the normal, full history again
+        p.event(&ts::key(crossterm::event::KeyCode::Char('c')))
+            .unwrap();
+        assert!(!p.stop_on_copy);
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::ReloadFileLog {
+                stop_on_copy: false,
+                ..
+            })
         ));
     }
 
