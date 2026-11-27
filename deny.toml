@@ -1,0 +1,36 @@
+# Dependency policy for svnui.
+#
+# Local:  cargo deny check
+# CI:     .github/workflows/ci.yml (job "deny")
+# Docs:   https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# No advisory suppressions. If a transitive dependency receives a RUSTSEC
+# advisory that cannot be fixed yet, add it here with a reason (and an
+# upstream link) rather than turning the check off.
+ignore = []
+
+[licenses]
+# Permissive licenses only. This list covers the current dependency graph;
+# anything new must be reviewed before being added here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are reported but do not fail the build: they usually
+# come from transitive dependencies and cannot be fixed downstream.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io is trusted; no git or alternative-registry dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

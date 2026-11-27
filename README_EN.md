@@ -132,7 +132,7 @@ Prebuilt binaries for Linux (x86_64), macOS (arm64) and Windows (x86_64) are att
 
 `.github/workflows/` contains three pipelines:
 
-- **ci.yml** — runs on push / PR: fmt, clippy (zero-warning gate), full tests on Linux/macOS, coverage gate (≥ 80%), release builds on three platforms, and headless stress tests: a parallel matrix of 13 popular open-source repos across languages — redis / tmux (C), clap (Rust), slugify (JS), ts-node (TS), requests (Python), gin (Go), nlohmann/json (C++), gson (Java), jekyll (Ruby), composer (PHP), elixir (Elixir), ohmyzsh (Shell) — each shallow-cloned at depth 500, converted to SVN with git2svn, and driven through 60 randomized rounds (15-minute cap per leg); the source commit is logged so failures can be reproduced.
+- **ci.yml** — runs on push / PR: fmt, clippy (zero-warning gate), **cargo-deny dependency audit** (RUSTSEC advisories, license allow-list, dependency sources and duplicate versions, policy in `deny.toml`), full tests on Linux/macOS, coverage gate (≥ 80%), release builds on three platforms, and headless stress tests: a parallel matrix of 13 popular open-source repos across languages — redis / tmux (C), clap (Rust), slugify (JS), ts-node (TS), requests (Python), gin (Go), nlohmann/json (C++), gson (Java), jekyll (Ruby), composer (PHP), elixir (Elixir), ohmyzsh (Shell) — each shallow-cloned at depth 500, converted to SVN with git2svn, and driven through 60 randomized rounds (15-minute cap per leg); the source commit is logged so failures can be reproduced.
 - **bump.yml** — runs on every push to master/main: bumps the patch version in `Cargo.toml`, commits it (message carries `[skip ci]` so it doesn't trigger itself), tags `vX.Y.Z`, pushes, then calls release.yml to publish. Multiple pushes to the same branch are serialized; a queued run first syncs the branch tip so it never computes a stale version.
 - **release.yml** — runs on `v*` tags (also called by bump.yml): verifies the tag matches the `Cargo.toml` version, builds release binaries on Linux (x86_64), macOS (arm64) and Windows (x86_64), and creates a GitHub Release.
 
@@ -184,6 +184,7 @@ SVN has no staging area like git, so "staging" is implemented as a **commit set*
 cargo test                 # unit/integration tests (some create real temporary SVN repos)
 cargo llvm-cov             # coverage report (needs cargo-llvm-cov + llvm-tools-preview)
 cargo clippy --all-targets # zero warnings
+cargo deny check           # dependency audit: RUSTSEC advisories / licenses / sources / duplicates (needs cargo-deny)
 ```
 
 Test strategy:

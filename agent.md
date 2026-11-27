@@ -76,7 +76,8 @@ src/
 ├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff 弹窗（enum Popup 分发，无 downcast）
 ├── ui/               渲染辅助（滚动、行绘制、弹窗矩形）+ 主题
 └── test_support.rs   测试支撑：临时 SVN 仓库（TestRepo）+ TestBackend 渲染辅助
-.github/workflows/     ci.yml（fmt/clippy/test/coverage/build/stress——压测 job 浅克隆轮换的
+deny.toml             依赖策略（cargo-deny：RUSTSEC 漏洞、许可证白名单、来源与重复版本）
+.github/workflows/     ci.yml（fmt/clippy/deny/test/coverage/build/stress——压测 job 浅克隆轮换的
                        开源仓库经 git2svn 转换后无头驱动）+ bump.yml（push 自动 bump
                        补丁版本并发版）+ release.yml（Tag 触发发布，也供 bump.yml 调用）
 ```
@@ -121,6 +122,7 @@ cargo bench --bench tree    # criterion 性能基准
 cargo test <name>           # 跑单个测试
 cargo llvm-cov --fail-under-lines 80   # 覆盖率门禁（与 CI 一致）
 cargo clippy --all-targets -- -D warnings   # 零警告门禁
+cargo deny check            # 依赖审计门禁（RUSTSEC/许可证/来源/重复版本；需 cargo-deny）
 cargo fmt --all --check     # 格式门禁
 ```
 
@@ -150,7 +152,9 @@ cargo fmt --all --check     # 格式门禁
 - 新增用户可见文本：加到 `strings.rs`。
 - 弹窗加进 `popups/mod.rs` 的 `enum Popup`，不要在 App 里用 downcast。
 - 依赖策略：简单逻辑手写，不引入新 crate；只有复杂且易错的逻辑才引入流行的纯 Rust
-  库——需无 unsafe、无 build script、维护活跃。
+  库——需无 unsafe、无 build script、维护活跃。该策略由 `deny.toml`（cargo-deny）在 CI 中
+  强制执行：新增依赖若带漏洞、非白名单许可证、git/第三方 registry 来源或通配版本号会直接
+  失败；重复版本（`multiple-versions`）只告警。
 - 测试也不要碰进程环境变量（edition 2024 下 `env::set_var` 是 unsafe fn，本仓库禁用
   unsafe）：像 `patch_dir` 这类依赖环境的逻辑要拆出纯函数（如 `resolve_patch_dir`），
   测试直接给纯函数传参。
@@ -334,8 +338,9 @@ crates.io USTC 镜像与重建步骤见 `docs/dev-environment.md`。
 
 ## CI/CD
 
-- **ci.yml**：fmt → clippy(-D warnings) → test(Linux/macOS) → coverage(≥80%) → 三平台 release 构建。
-  修改任何代码都必须让这些 job 全绿。
+- **ci.yml**：fmt → clippy(-D warnings) → deny(cargo-deny) → test(Linux/macOS) → coverage(≥80%) → 三平台 release 构建。
+  修改任何代码都必须让这些 job 全绿。依赖策略见 `deny.toml`；新发布的 RUSTSEC 公告
+  可能让 deny job 在无代码改动时变红——修依赖，或在 `deny.toml` 里带理由 ignore。
 - **bump.yml**：每次 push 到 master/main 自动 bump 补丁版本：改 `Cargo.toml` version +1、
   提交（`[skip ci]` 防自触发）、打 `vX.Y.Z` 标签推送，然后调用 release.yml 发布。
   同分支多次 push 按 concurrency 串行排队，任务开始时 checkout 分支最新 tip 并

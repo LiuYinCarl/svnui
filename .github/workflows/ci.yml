@@ -38,6 +38,19 @@ jobs:
       - name: cargo clippy (all targets, warnings as errors)
         run: cargo clippy --all-targets -- -D warnings
 
+  deny:
+    name: Dependency audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Checks RUSTSEC advisories, the license allow-list, duplicate/banned
+      # crates and allowed registries; policy lives in deny.toml.
+      # A newly published advisory can fail this job without code changes:
+      # fix the dependency, or add a reasoned ignore to deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   test:
     name: Test (${{ matrix.os }})
     strategy:
