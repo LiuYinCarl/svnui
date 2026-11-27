@@ -1475,6 +1475,33 @@ mod tests {
     }
 
     #[test]
+    fn file_log_stop_on_copy_starts_at_the_branch_point() {
+        let Some(repo) = TestRepo::new() else { return };
+        repo.svn(&["mkdir", "^/branches", "-m", "mkdir branches"]);
+        repo.svn(&["cp", "^/src", "^/branches/src", "-m", "branch src"]);
+        repo.svn(&["up"]);
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        let revs = |path: &str, stop: bool| {
+            c.file_log_opts(path, 10, stop);
+            match recv(&rx) {
+                AsyncSvnNotification::FileLog { result, .. } => result
+                    .expect("log")
+                    .iter()
+                    .map(|e| e.revision)
+                    .collect::<Vec<_>>(),
+                other => panic!("unexpected: {other:?}"),
+            }
+        };
+        // without stop-on-copy the history follows the copy into the source
+        let full = revs("branches/src/main.rs", false);
+        assert!(full.len() >= 2, "{full:?}");
+        // with --stop-on-copy it starts at the branch commit
+        let stopped = revs("branches/src/main.rs", true);
+        assert_eq!(stopped, vec![*full.first().expect("newest revision")]);
+    }
+
+    #[test]
     fn repo_browser_reads_list_cat_and_log() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
