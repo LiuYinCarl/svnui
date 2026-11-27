@@ -32,6 +32,7 @@
   命中的条目不展示也不可操作，标题栏显示 `[N hidden by .svnignore]` 提示；`4` 键打开
   内置编辑器标签页（`ignore_editor.rs`），带实时语法检查。
 - 禁止使用 `unsafe`。新代码必须通过 `cargo clippy --all-targets -- -D warnings`（CI 门禁）。
+- **只读边界**：不实现冲突解决（不做 `svn resolve`；`x` 只展示 `svn info` 里的冲突详情）；仓库浏览标签页只允许 `svn list/cat/log`，禁止 copy/delete/mkdir/switch/update 等写操作。
 
 ## 目录结构
 
@@ -61,8 +62,9 @@ src/
 │   ├── log.rs        日志标签页（修订列表滚动分页 + 详情 + 关键字筛选 + 多选合并 diff）
 │   ├── log_search.rs 提交搜索弹窗（输入时实时筛选，回车 svn log --search 全历史搜索）
 │   ├── status_filter.rs 状态文件过滤弹窗（输入时实时筛选，回车保留，Esc 还原；Esc 在状态页清除筛选）
-│   ├── file_log.rs   单文件历史弹窗（svn log -v -- path）
+│   ├── file_log.rs   文件/目录历史弹窗（svn log -v -- path；c 切换 --stop-on-copy）
 │   ├── file_finder.rs  模糊文件搜索弹窗（svn list HEAD + status 修正本地增删，fuzzy-matcher 匹配）
+│   ├── repo.rs        只读仓库浏览标签页（list/cat/log：trunk/branches/tags、文件预览、路径 log）
 │   ├── blame.rs      blame 弹窗（/ 增量搜索 + n/N 跳转 + 光标行 Enter 看该修订中该文件的
 │   │                 diff + h/l 横滚）
 │   ├── patches.rs    补丁标签页（列出 patch 目录、预览/应用/删除补丁；patch_dir() 解析存储目录，
@@ -73,7 +75,7 @@ src/
 │   ├── text_search.rs 可复用的增量搜索状态（diff/blame 弹窗共用）
 │   ├── text_view.rs  可滚动文本视图基座（滚动/横滚/搜索/footer 布局;diff/blame 共用）
 │   └── help.rs       帮助弹窗
-├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff 弹窗（enum Popup 分发，无 downcast）
+├── popups/           确认 / 消息 / 输出查看 / 全屏 Diff / 变更路径选择弹窗（enum Popup 分发，无 downcast）
 ├── ui/               渲染辅助（滚动、行绘制、弹窗矩形）+ 主题
 └── test_support.rs   测试支撑：临时 SVN 仓库（TestRepo）+ TestBackend 渲染辅助
 deny.toml             依赖策略（cargo-deny：RUSTSEC 漏洞、许可证白名单、来源与重复版本）
@@ -123,6 +125,8 @@ cargo test <name>           # 跑单个测试
 cargo llvm-cov --fail-under-lines 80   # 覆盖率门禁（与 CI 一致）
 cargo clippy --all-targets -- -D warnings   # 零警告门禁
 cargo deny check            # 依赖审计门禁（RUSTSEC/许可证/来源/重复版本；需 cargo-deny）
+svnui --log-file /tmp/svnui.log   # 诊断日志：svn 子命令/耗时/错误（不含提交信息/密码）
+# 运行中的 update/switch/cleanup 可用 Ctrl+x 取消（确认后 kill svn；commit 不允许取消）
 cargo fmt --all --check     # 格式门禁
 ```
 
@@ -238,7 +242,7 @@ cargo fmt --all --check     # 格式门禁
   svn 的 E155004/E155037（"locked; try performing 'svn cleanup'"）在 `App::show_error`
   统一追加"按 `C` 清理"提示——所有 svn 错误路径都过这一个漏斗。`C` 是**全局键**
   （不是状态页键）：锁是在哪个标签页的操作上冒出来的无法预料，弹窗/文本输入会先消费按键。
-- 文件名含 `@`（如 systemd 的 `foo@.service`）：log/blame/info/add/revert/resolve/commit
+- 文件名含 `@`（如 systemd 的 `foo@.service`）：log/blame/info/add/revert/commit
   都必须给路径追加空 peg（`path@`，见 `Svn::peg`），否则报 E205000/E200009；
   **工作副本 `svn diff` 例外**——它根本不接受带 peg 的 wc 目标（E155010），但不带 peg 时会把
   无效的 `@xxx` 后缀当普通路径处理，所以工作副本 diff 不传 peg；`svn diff -c`（单修订 diff）
@@ -258,7 +262,7 @@ cargo fmt --all --check     # 格式门禁
 - **解析器/模型**：构造输出样本做单元测试。
 - **UI 组件**：`test_support::render` 用 `ratatui::TestBackend` 离屏绘制 + 合成 crossterm 事件。
 - **svn 命令层**：`TestRepo` 用 `svnadmin create` 建临时仓库，真实执行
-  status/diff/log/blame/add/revert/commit/update/resolve（本机无 svn 时测试自动跳过）。
+  status/diff/log/blame/add/revert/commit/update/list/cat（本机无 svn 时测试自动跳过）。
 - **App 状态机**：直接构造 `AsyncSvnNotification` / `InternalEvent` 喂给
   `handle_async` / `handle_queue_events`，覆盖 Ok/Err 全部分支。
 - **事件循环**：`run()` 已泛型化，可用 `TestBackend` 驱动到退出。
@@ -338,7 +342,7 @@ crates.io USTC 镜像与重建步骤见 `docs/dev-environment.md`。
 
 ## CI/CD
 
-- **ci.yml**：fmt → clippy(-D warnings) → deny(cargo-deny) → test(Linux/macOS) → coverage(≥80%) → 三平台 release 构建。
+- **ci.yml**：fmt → clippy(-D warnings) → deny(cargo-deny) → test(Linux/macOS/Windows) → coverage(≥80%) → 三平台 release 构建。
   修改任何代码都必须让这些 job 全绿。依赖策略见 `deny.toml`；新发布的 RUSTSEC 公告
   可能让 deny job 在无代码改动时变红——修依赖，或在 `deny.toml` 里带理由 ignore。
 - **bump.yml**：每次 push 到 master/main 自动 bump 补丁版本：改 `Cargo.toml` version +1、

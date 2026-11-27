@@ -38,8 +38,19 @@ struct Node {
 struct DirCounts {
     staged: usize,
     total: usize,
-    /// (status char, tree-conflicted) of the dir's own status entry
-    own_status: Option<(char, bool)>,
+    /// The dir's own status entry (for its status char and flags).
+    own_status: Option<OwnStatus>,
+}
+
+/// Status badges for a directory's own entry.
+#[derive(Clone, Copy, Default)]
+struct OwnStatus {
+    code: char,
+    tree_conflict: bool,
+    switched: bool,
+    locked: char,
+    lock: char,
+    copied: char,
 }
 
 pub struct StatusTreeComponent {
@@ -719,6 +730,7 @@ impl StatusTreeComponent {
                 tree_conflict: ' ',
                 path,
                 is_dir,
+                ..Default::default()
             });
         }
         out
@@ -884,7 +896,7 @@ impl StatusTreeComponent {
                     "No versioned files to revert".to_string(),
                 ));
             }
-        } else if key_match(k, KeyAction::ResolveConflict) {
+        } else if key_match(k, KeyAction::ShowConflictDetails) {
             // Directories can carry tree conflicts too, but they have no
             // `selection_entry` (only files do). Look the selected path up
             // in the entry list instead.
@@ -894,16 +906,12 @@ impl StatusTreeComponent {
             {
                 self.ctx
                     .queue
-                    .push(InternalEvent::Confirm(ConfirmAction::Resolve(
-                        e.path.clone(),
-                    )));
+                    .push(InternalEvent::ShowConflictDetails(e.path.clone()));
             }
         } else if key_match(k, KeyAction::Commit) {
             self.ctx.queue.push(InternalEvent::OpenCommit);
         } else if key_match(k, KeyAction::UpdateWc) {
-            self.ctx
-                .queue
-                .push(InternalEvent::Confirm(ConfirmAction::Update));
+            self.ctx.queue.push(InternalEvent::RequestUpdatePreview);
         } else if key_match(k, KeyAction::SwitchBranch) {
             self.ctx.queue.push(InternalEvent::OpenSwitch);
         } else if key_match(k, KeyAction::Filter) {
@@ -931,9 +939,8 @@ impl StatusTreeComponent {
                     .push(InternalEvent::RequestBlame(e.path.clone()));
             }
         } else if key_match(k, KeyAction::FileHistory) {
-            if let Some(e) = self.selection_entry()
-                && !e.is_dir
-            {
+            // Files and directories both have history (`svn log -- path`).
+            if self.selection_path().is_some() {
                 self.ctx.queue.push(InternalEvent::RequestFileHistory);
             }
         } else if key_match(k, KeyAction::Refresh) {
@@ -982,7 +989,10 @@ fn under_unversioned_dir(path: &str, dirs: &HashSet<&str>) -> bool {
 /// first. Missing ('!') entries are committable once `svn rm` has
 /// scheduled their deletion, which staging arranges (see ToggleStage).
 fn stageable(e: &StatusEntry) -> bool {
-    !matches!(e.status, '~') && !e.is_conflicted()
+    // switched-only / locked-only entries have no content or property
+    // change; staging them would put a no-op path into the commit set.
+    let has_change = e.status != ' ' || e.props_status != ' ' || e.tree_conflict == 'C';
+    has_change && !matches!(e.status, '~') && !e.is_conflicted()
 }
 
 /// Status char shown for an entry: a tree conflict dominates, then the
@@ -991,10 +1001,46 @@ fn stageable(e: &StatusEntry) -> bool {
 fn display_status(e: &StatusEntry) -> char {
     if e.tree_conflict == 'C' {
         'C'
-    } else if e.status == ' ' {
-        e.props_status
-    } else {
+    } else if e.status != ' ' {
         e.status
+    } else if e.props_status != ' ' {
+        e.props_status
+    } else if e.switched != ' ' {
+        // switched-only entries have no text/props status; they must still
+        // be visible in the tree (a switched subtree otherwise disappears)
+        e.switched
+    } else if e.lock != ' ' {
+        e.lock
+    } else if e.locked != ' ' {
+        e.locked
+    } else if e.copied == '+' {
+        '+'
+    } else {
+        ' '
+    }
+}
+
+/// Extra markers for state that is not already the primary status char.
+fn push_state_flags(
+    spans: &mut Vec<Span<'static>>,
+    code: char,
+    switched: bool,
+    locked: char,
+    lock: char,
+    copied: char,
+    theme: &Theme,
+) {
+    if switched && code != 'S' {
+        spans.push(Span::styled("S ", theme.dim));
+    }
+    if locked != ' ' && code != locked {
+        spans.push(Span::styled(format!("{locked} "), theme.status_modified));
+    }
+    if lock != ' ' && code != lock {
+        spans.push(Span::styled(format!("{lock} "), theme.status_modified));
+    }
+    if copied == '+' && code != '+' {
+        spans.push(Span::styled("+ ", theme.dim));
     }
 }
 
@@ -1111,12 +1157,24 @@ impl StatusTreeComponent {
                 // or deleted) shows that entry's status char in the same
                 // column and colors as file lines; dirs without one keep
                 // the bare tree glyph.
-                if let Some((code, tree_conflict)) = info.own_status {
-                    spans.push(Span::styled(code.to_string(), theme.status_style(code)));
+                if let Some(st) = info.own_status {
+                    spans.push(Span::styled(
+                        st.code.to_string(),
+                        theme.status_style(st.code),
+                    ));
                     spans.push(Span::raw(" "));
-                    if tree_conflict {
+                    if st.tree_conflict {
                         spans.push(Span::styled("C ", theme.status_conflicted));
                     }
+                    push_state_flags(
+                        &mut spans,
+                        st.code,
+                        st.switched,
+                        st.locked,
+                        st.lock,
+                        st.copied,
+                        theme,
+                    );
                 }
                 let sym = if *expanded { "▼ " } else { "▶ " };
                 spans.push(Span::styled(sym, theme.text.add_modifier(Modifier::BOLD)));
@@ -1139,6 +1197,15 @@ impl StatusTreeComponent {
                     if e.tree_conflict == 'C' {
                         spans.push(Span::styled("C ", theme.status_conflicted));
                     }
+                    push_state_flags(
+                        &mut spans,
+                        code,
+                        e.switched != ' ',
+                        e.locked,
+                        e.lock,
+                        e.copied,
+                        theme,
+                    );
                 } else {
                     spans.push(Span::raw("  "));
                 }
@@ -1204,7 +1271,14 @@ impl StatusTreeComponent {
                     if self.staged.contains(&e.path) {
                         c.staged += 1;
                     }
-                    c.own_status = Some((display_status(e), e.tree_conflict == 'C'));
+                    c.own_status = Some(OwnStatus {
+                        code: display_status(e),
+                        tree_conflict: e.tree_conflict == 'C',
+                        switched: e.switched != ' ',
+                        locked: e.locked,
+                        lock: e.lock,
+                        copied: e.copied,
+                    });
                 }
                 if e.is_dir {
                     continue;
@@ -1366,6 +1440,7 @@ mod tests {
             tree_conflict: ' ',
             path: path.to_string(),
             is_dir,
+            ..Default::default()
         }
     }
 
@@ -1451,6 +1526,7 @@ mod interaction_tests {
             tree_conflict: ' ',
             path: path.to_string(),
             is_dir: std::path::Path::new(path).is_dir(),
+            ..Default::default()
         }
     }
 
@@ -1684,20 +1760,16 @@ mod interaction_tests {
     }
 
     #[test]
-    fn commit_update_resolve_keys() {
+    fn commit_update_conflict_details_keys() {
         let (mut c, q) = comp_with(vec![entry('C', "c.txt")]);
         c.event(&key(KeyCode::Char('c'))).unwrap();
         assert!(matches!(q.pop(), Some(InternalEvent::OpenCommit)));
         c.event(&key(KeyCode::Char('u'))).unwrap();
-        assert!(matches!(
-            q.pop(),
-            Some(InternalEvent::Confirm(crate::queue::ConfirmAction::Update))
-        ));
+        assert!(matches!(q.pop(), Some(InternalEvent::RequestUpdatePreview)));
         c.event(&key(KeyCode::Char('x'))).unwrap();
         assert!(matches!(
             q.pop(),
-            Some(InternalEvent::Confirm(crate::queue::ConfirmAction::Resolve(p)))
-                if p == "c.txt"
+            Some(InternalEvent::ShowConflictDetails(p)) if p == "c.txt"
         ));
         // 'x' on non-conflicted file is a no-op
         let (mut c2, q2) = comp_with(vec![entry('M', "m.txt")]);
@@ -1720,14 +1792,40 @@ mod interaction_tests {
         .unwrap();
         assert!(q2.pop().is_none());
         // Directories can carry tree conflicts too; they have no
-        // selection_entry(), but must still be resolvable.
+        // selection_entry(), but must still show their conflict details.
         let (mut c3, q3) = comp_with(vec![dir_entry('C', "conflict-dir")]);
         c3.event(&key(KeyCode::Char('x'))).unwrap();
         assert!(matches!(
             q3.pop(),
-            Some(InternalEvent::Confirm(crate::queue::ConfirmAction::Resolve(p)))
-                if p == "conflict-dir"
+            Some(InternalEvent::ShowConflictDetails(p)) if p == "conflict-dir"
         ));
+    }
+
+    #[test]
+    fn switched_and_locked_only_entries_are_visible() {
+        // A switched dir has no text/props status; it used to be dropped by
+        // the parser. It must render with an `S` marker.
+        let mut switched = entry(' ', "switched");
+        switched.switched = 'S';
+        switched.is_dir = true;
+        // Neither state is a content change: don't let it enter the commit set.
+        assert!(!stageable(&switched));
+        let (c, _q) = comp_with(vec![switched]);
+        let t = ts::render(60, 8, |f| {
+            c.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
+        });
+        assert!(row_line(&t, 1).starts_with("S "), "{}", row_line(&t, 1));
+        assert!(row_line(&t, 1).contains("switched/"), "{}", row_line(&t, 1));
+
+        // A locked-but-unmodified file likewise only has column 6 set.
+        let mut locked = entry(' ', "a.txt");
+        locked.lock = 'K';
+        assert!(!stageable(&locked));
+        let (c2, _q2) = comp_with(vec![locked]);
+        let t2 = ts::render(60, 8, |f| {
+            c2.draw(f, Rect::new(0, 0, 60, 8)).unwrap();
+        });
+        assert!(row_line(&t2, 1).starts_with("K "), "{}", row_line(&t2, 1));
     }
 
     #[test]
@@ -2074,6 +2172,7 @@ mod interaction_tests {
             tree_conflict: ' ',
             path: path.to_string(),
             is_dir: true,
+            ..Default::default()
         }
     }
 

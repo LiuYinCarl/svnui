@@ -19,7 +19,7 @@ pub enum PaneFocus {
 }
 
 /// Status-bar shortcut hints shown while the status tab is active.
-pub const HINTS: &str = "spc stage  c commit  r revert  u update  s switch  b blame  / filter  f flat  P patch  F5 refresh";
+pub const HINTS: &str = "spc stage  c commit  r revert  x conflict  u update  s switch  b blame  / filter  f flat  P patch  F5 refresh";
 
 pub struct StatusTab {
     pub tree: StatusTreeComponent,
@@ -111,8 +111,10 @@ impl StatusTab {
         };
         self.tree.set_svnignore_hidden(hidden);
         self.tree.update_with_filter(entries, ignore.cloned());
-        // force the diff to reload after status changes
+        // force the diff to reload after status changes; an in-flight
+        // preview for the old selection is stale now
         self.last_diff_requested = None;
+        self.diff.pending = false;
         self.update_commit_hint();
         if self.tree.is_empty() && self.tree.selection_entry().is_none() {
             let reason = if self.tree.is_flat() {
@@ -136,6 +138,12 @@ impl StatusTab {
     pub fn apply_diff(&mut self, path: &str, prepared: PreparedDiff) {
         if self.tree.selection_path().as_deref() == Some(path) {
             self.diff.set_prepared(path.to_string(), prepared);
+        } else if self.last_diff_requested.as_deref() == Some(path) {
+            // stale preview: the user moved on while svn was running.
+            // Release the single in-flight slot; the event loop's next
+            // maybe_request_diff() asks for the current selection.
+            self.last_diff_requested = None;
+            self.diff.pending = false;
         }
     }
 
@@ -150,8 +158,14 @@ impl StatusTab {
     /// refresh re-arms it via `update_status`.
     pub fn diff_failed(&mut self, path: &str) {
         if self.diff.pending && self.diff.title == path {
-            self.diff
-                .set_hint(path.to_string(), "Failed to load the diff".to_string());
+            if self.tree.selection_path().as_deref() == Some(path) {
+                self.diff
+                    .set_hint(path.to_string(), "Failed to load the diff".to_string());
+            } else {
+                // stale failure: release the slot for the current selection
+                self.last_diff_requested = None;
+                self.diff.pending = false;
+            }
         }
     }
 
@@ -182,6 +196,13 @@ impl StatusTab {
         }
         let path = sel?;
         if self.last_diff_requested.as_deref() == Some(path.as_str()) {
+            return None;
+        }
+        // Coalesce rapid cursor movement: while one preview is in flight,
+        // don't spawn a process per intermediate selection. When its
+        // (possibly stale) result arrives, apply_diff releases the slot and
+        // the event loop requests the latest selection once.
+        if self.diff.pending {
             return None;
         }
         self.last_diff_requested = Some(path.clone());
@@ -294,6 +315,7 @@ mod tests {
             tree_conflict: ' ',
             path: path.to_string(),
             is_dir: std::path::Path::new(path).is_dir(),
+            ..Default::default()
         }
     }
 
@@ -447,6 +469,29 @@ mod tests {
         // status change forces a new request
         t.update_status(vec![entry('M', "a.txt")], None);
         assert_eq!(t.maybe_request_diff().as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn diff_requests_coalesce_while_one_is_in_flight() {
+        let (mut t, _q) = tab();
+        t.update_status(vec![entry('M', "a.txt"), entry('M', "b.txt")], None);
+        assert_eq!(t.maybe_request_diff().as_deref(), Some("a.txt"));
+        // move to b while a is loading: do not spawn a second svn diff
+        t.tree
+            .event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')),
+            ))
+            .unwrap();
+        assert_eq!(t.maybe_request_diff(), None);
+        // a's stale result releases the slot...
+        t.apply_diff(
+            "a.txt",
+            parse_diff_content("Index: a.txt\n@@ -1 +1 @@\n-a\n+b\n"),
+        );
+        assert!(!t.diff.pending);
+        // ...and the latest selection is requested exactly once
+        assert_eq!(t.maybe_request_diff().as_deref(), Some("b.txt"));
+        assert_eq!(t.maybe_request_diff(), None);
     }
 
     #[test]

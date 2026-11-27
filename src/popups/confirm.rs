@@ -10,11 +10,14 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use std::cell::Cell;
 
 pub struct ConfirmPopup {
     ctx: Context,
     pub action: Option<ConfirmAction>,
     pub message: String,
+    /// First visible message line (long previews are scrollable)
+    scroll: Cell<usize>,
 }
 
 impl ConfirmPopup {
@@ -23,6 +26,7 @@ impl ConfirmPopup {
             ctx: ctx.clone(),
             action: Some(action),
             message,
+            scroll: Cell::new(0),
         }
     }
 }
@@ -50,8 +54,11 @@ impl DrawableComponent for ConfirmPopup {
             .lines()
             .map(|l| Line::from(Span::styled(l.to_string(), theme.text)))
             .collect();
+        let max_scroll = msg_lines.len().saturating_sub(chunks[0].height as usize);
+        let scroll = self.scroll.get().min(max_scroll);
+        self.scroll.set(scroll);
         f.render_widget(
-            Paragraph::new(msg_lines).wrap(Wrap { trim: false }),
+            Paragraph::new(msg_lines[scroll..].to_vec()).wrap(Wrap { trim: false }),
             chunks[0],
         );
 
@@ -72,6 +79,28 @@ impl DrawableComponent for ConfirmPopup {
         let Event::Key(k) = ev else {
             return Ok(EventState::not_consumed());
         };
+        // long previews (update status, file lists) scroll before y/n
+        if !self.message.is_empty() {
+            let mut scroll = self.scroll.get();
+            let old = scroll;
+            if key_match(k, KeyAction::MoveDown) {
+                scroll = scroll.saturating_add(1);
+            } else if key_match(k, KeyAction::MoveUp) {
+                scroll = scroll.saturating_sub(1);
+            } else if key_match(k, KeyAction::PageDown) {
+                scroll = scroll.saturating_add(20);
+            } else if key_match(k, KeyAction::PageUp) {
+                scroll = scroll.saturating_sub(20);
+            } else if key_match(k, KeyAction::Home) {
+                scroll = 0;
+            } else if key_match(k, KeyAction::End) {
+                scroll = self.message.lines().count();
+            }
+            if scroll != old {
+                self.scroll.set(scroll);
+                return Ok(EventState::consumed());
+            }
+        }
         if key_match(k, KeyAction::Confirm) {
             // close the dialog *before* performing the action: synchronous
             // actions (e.g. deleting a patch file) show their feedback
@@ -152,6 +181,32 @@ mod tests {
         assert!(state.consumed);
         assert!(matches!(q2.pop(), Some(InternalEvent::ClosePopup)));
         assert!(q2.pop().is_none(), "N must not confirm");
+    }
+
+    #[test]
+    fn scrolls_long_messages_before_confirming() {
+        let (c, q) = ctx();
+        let mut p = ConfirmPopup::new(
+            &c,
+            "line1\nline2\nline3\nline4".to_string(),
+            ConfirmAction::Update,
+        );
+        p.event(&ts::key(crossterm::event::KeyCode::Char('j')))
+            .unwrap();
+        assert_eq!(p.scroll.get(), 1);
+        assert!(q.pop().is_none(), "j must not confirm");
+        p.event(&ts::key(crossterm::event::KeyCode::PageDown))
+            .unwrap();
+        assert_eq!(p.scroll.get(), 21);
+        p.event(&ts::key(crossterm::event::KeyCode::Home)).unwrap();
+        assert_eq!(p.scroll.get(), 0);
+        p.event(&ts::key(crossterm::event::KeyCode::Char('y')))
+            .unwrap();
+        assert!(matches!(q.pop(), Some(InternalEvent::ClosePopup)));
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::Confirmed(ConfirmAction::Update))
+        ));
     }
 
     #[test]

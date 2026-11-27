@@ -8,13 +8,17 @@ pub mod models;
 pub mod parser;
 
 use crossbeam_channel::Sender;
-use models::{BlameLine, LogEntry, PreparedDiff, StatusEntry, SvnInfo};
+use models::{
+    BlameLine, ConflictDetails, LogEntry, PreparedDiff, RemoteStatus, StatusEntry, SvnInfo,
+};
 use parser::parse_diff_content;
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// One queued working-copy mutation, executed by the mutation worker.
 type MutationJob = Box<dyn FnOnce() + Send + 'static>;
@@ -27,6 +31,19 @@ pub const MIN_SVN_VERSION: (u32, u32, u32) = (1, 8, 0);
 /// The exact value only avoids temp files for routine small operations;
 /// the important property is that huge stage-all lists stay below ARG_MAX.
 const TARGETS_THRESHOLD: usize = 128;
+
+/// PID of the svn process currently running for a mutation (0 = none).
+/// A global is safe here: mutations are serialized on one worker.
+static ACTIVE_SVN_PID: AtomicU32 = AtomicU32::new(0);
+/// Set by `Svn::cancel`; the mutation runner turns the killed child into a
+/// clean "operation cancelled" error instead of a generic svn failure.
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// True while a `spawn_mutating` job runs on this thread; only those
+    /// commands register their PID for cancellation.
+    static TRACK_MUTATION: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Result of a finished SVN background operation.
 #[derive(Clone, Debug)]
@@ -42,6 +59,8 @@ pub enum AsyncSvnNotification {
     /// allocated monotonically at issue time, so the app layer can drop
     /// stale results that arrive out of order.
     Status(u64, Result<Vec<StatusEntry>, String>),
+    /// `svn status -u --xml` (remote status) used by the update preview.
+    RemoteStatus(Result<RemoteStatus, String>),
     Diff {
         path: String,
         /// Fullscreen-request token: `Some(id)` when the request came from
@@ -67,6 +86,21 @@ pub enum AsyncSvnNotification {
     },
     /// All versioned files in the working copy (`svn list -R`)
     ListFiles(Result<Vec<String>, String>),
+    /// One directory of the repository browser (read-only, at HEAD)
+    RepoList {
+        url: String,
+        result: Result<Vec<(String, bool)>, String>,
+    },
+    /// File content for the repository browser's preview
+    RepoFile {
+        url: String,
+        result: Result<String, String>,
+    },
+    /// Raw `svn log` output for a repository path (read-only popup)
+    RepoLog {
+        url: String,
+        result: Result<String, String>,
+    },
     RevisionDiff {
         revision: u64,
         /// Fullscreen-request token (as on `Diff`)
@@ -93,7 +127,12 @@ pub enum AsyncSvnNotification {
     /// `svn rm` of missing (`!`) paths: schedules their deletion
     Remove(Result<Vec<String>, String>),
     Revert(Result<Vec<String>, String>),
-    Resolve(Result<String, String>),
+    /// Read-only conflict details from `svn info`; `None` when the path
+    /// has no conflict markers (it may have been resolved meanwhile).
+    ConflictDetails {
+        path: String,
+        result: Result<Option<ConflictDetails>, String>,
+    },
     /// `svn cleanup`: no text on success (svn prints nothing)
     Cleanup(Result<(), String>),
     /// Whole file for the diff view's `f`: parsed on the worker thread
@@ -140,8 +179,8 @@ pub struct Svn {
     cwd: PathBuf,
     tx: Sender<AsyncSvnNotification>,
     /// FIFO queue feeding a single dedicated mutation worker thread.
-    /// Working copy mutations (`add`, `commit`, `revert`, `resolve`,
-    /// `update`, `switch`, `cleanup`, `apply_patch`) must run one at a time
+    /// Working copy mutations (`add`, `commit`, `revert`, `update`,
+    /// `switch`, `cleanup`, `apply_patch`) must run one at a time
     /// AND in issue order — e.g. an auto-staging `svn add` must finish
     /// before the following `svn commit`, or svn fails with
     /// E155004/E155010 for a legitimate action sequence. A mutex alone
@@ -246,7 +285,13 @@ impl Svn {
         E: FnOnce(String) -> AsyncSvnNotification + Send + Clone + 'static,
     {
         let tx = self.tx.clone();
-        let job: MutationJob = Box::new(move || Self::execute(f, on_err, &tx));
+        let job: MutationJob = Box::new(move || {
+            TRACK_MUTATION.with(|track| track.set(true));
+            CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+            Self::execute(f, on_err, &tx);
+            ACTIVE_SVN_PID.store(0, Ordering::SeqCst);
+            TRACK_MUTATION.with(|track| track.set(false));
+        });
         match self.mutation_queue.send(job) {
             Ok(()) => {}
             // the mutation worker was never started (thread spawn failed
@@ -314,6 +359,30 @@ impl Svn {
                 AsyncSvnNotification::Status(id, result)
             },
             move |e| AsyncSvnNotification::Status(id, Err(e)),
+        );
+    }
+
+    /// Remote status for the update preview (`u`).
+    ///
+    /// `svn status -u --xml` reports both local changes and incoming
+    /// server changes without touching the working copy. `svn info -r
+    /// HEAD` is best-effort: an offline/auth failure only loses the
+    /// revision count, not the file list.
+    pub fn remote_status(&self) {
+        let cwd = self.cwd.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["status", "-u", "--xml"]).map(|xml| {
+                    let mut status = parser::parse_remote_status_xml(&xml);
+                    status.head_revision = Self::run_in(&cwd, &["info", "-r", "HEAD"])
+                        .ok()
+                        .map(|text| parser::parse_info(&text).revision)
+                        .filter(|rev| *rev > 0);
+                    status
+                });
+                AsyncSvnNotification::RemoteStatus(result)
+            },
+            |e| AsyncSvnNotification::RemoteStatus(Err(e)),
         );
     }
 
@@ -400,26 +469,27 @@ impl Svn {
     /// `svn log` restricted to a single file (its history), newest page
     /// first. Older pages are fetched by [`Svn::file_log_more`].
     pub fn file_log(&self, path: &str, limit: usize) {
+        self.file_log_opts(path, limit, false);
+    }
+
+    /// File/directory history with an optional `--stop-on-copy`, so the
+    /// list starts at the branch point instead of walking into the source
+    /// branch's older revisions.
+    pub fn file_log_opts(&self, path: &str, limit: usize, stop_on_copy: bool) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
         let err_path = path.clone();
         self.spawn(
             move || {
                 let pegged = Self::peg(&path);
-                let result = Self::run_in(
-                    &cwd,
-                    &[
-                        "log",
-                        "-v",
-                        "-r",
-                        "HEAD:0",
-                        "-l",
-                        &limit.to_string(),
-                        "--",
-                        &pegged,
-                    ],
-                )
-                .map(|out| parser::parse_log(&out));
+                let limit = limit.to_string();
+                let mut args = vec!["log", "-v", "-r", "HEAD:0", "-l", &limit];
+                if stop_on_copy {
+                    args.push("--stop-on-copy");
+                }
+                args.push("--");
+                args.push(&pegged);
+                let result = Self::run_in(&cwd, &args).map(|out| parser::parse_log(&out));
                 AsyncSvnNotification::FileLog { path, result }
             },
             move |e| AsyncSvnNotification::FileLog {
@@ -432,6 +502,16 @@ impl Svn {
     /// Older revisions of a single file's history (pagination for the
     /// file-history popup): everything below `before_rev`.
     pub fn file_log_more(&self, path: &str, before_rev: u64, limit: usize) {
+        self.file_log_more_opts(path, before_rev, limit, false);
+    }
+
+    pub fn file_log_more_opts(
+        &self,
+        path: &str,
+        before_rev: u64,
+        limit: usize,
+        stop_on_copy: bool,
+    ) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
         let err_path = path.clone();
@@ -440,20 +520,14 @@ impl Svn {
                 let pegged = Self::peg(&path);
                 // saturating like log_more: before_rev 0/1 mean "0:0"
                 let range = format!("{}:0", before_rev.saturating_sub(1));
-                let result = Self::run_in(
-                    &cwd,
-                    &[
-                        "log",
-                        "-v",
-                        "-r",
-                        &range,
-                        "-l",
-                        &limit.to_string(),
-                        "--",
-                        &pegged,
-                    ],
-                )
-                .map(|out| parser::parse_log(&out));
+                let limit = limit.to_string();
+                let mut args = vec!["log", "-v", "-r", &range, "-l", &limit];
+                if stop_on_copy {
+                    args.push("--stop-on-copy");
+                }
+                args.push("--");
+                args.push(&pegged);
+                let result = Self::run_in(&cwd, &args).map(|out| parser::parse_log(&out));
                 AsyncSvnNotification::FileLogAppend {
                     path,
                     before_rev,
@@ -608,6 +682,93 @@ impl Svn {
     /// suffix is required here: `svn diff -c` parses `foo@bar` as
     /// `path@peg`, unlike a plain working-copy `svn diff` (which rejects
     /// pegged wc targets and accepts the literal `@` suffix).
+    /// Repository browser: list one directory at HEAD.
+    ///
+    /// Read-only by design: no checkout/switch/copy/delete/mkdir happens
+    /// from this view. `^/` is caret notation resolved against the
+    /// working copy.
+    pub fn repo_list(&self, url: &str) {
+        let cwd = self.cwd.clone();
+        let url = url.to_string();
+        let err_url = url.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(&cwd, &["list", &format!("{url}@HEAD")])
+                    .map(|out| parser::parse_ls_entries(&out));
+                AsyncSvnNotification::RepoList {
+                    url: err_url,
+                    result,
+                }
+            },
+            |e| AsyncSvnNotification::RepoList {
+                url: String::new(),
+                result: Err(e),
+            },
+        );
+    }
+
+    /// Repository browser: file content at HEAD (read-only).
+    pub fn repo_cat(&self, url: &str) {
+        let cwd = self.cwd.clone();
+        let url = url.to_string();
+        let err_url = url.clone();
+        self.spawn(
+            move || {
+                let result = (|| {
+                    let bytes = Self::run_in_raw(&cwd, &["cat", &format!("{url}@HEAD")])?;
+                    if bytes.len() as u64 > MAX_FILE_VIEW_BYTES {
+                        return Err(format!(
+                            "{url}: file is too large to display ({:.1} MiB)",
+                            bytes.len() as f64 / (1024.0 * 1024.0)
+                        ));
+                    }
+                    String::from_utf8(bytes)
+                        .map_err(|_| format!("{url}: binary file — not displayed"))
+                })();
+                AsyncSvnNotification::RepoFile {
+                    url: err_url,
+                    result,
+                }
+            },
+            |e| AsyncSvnNotification::RepoFile {
+                url: String::new(),
+                result: Err(e),
+            },
+        );
+    }
+
+    /// Repository browser: recent revisions of a URL (read-only).
+    pub fn repo_log(&self, url: &str) {
+        let cwd = self.cwd.clone();
+        let url = url.to_string();
+        let err_url = url.clone();
+        self.spawn(
+            move || {
+                let result = Self::run_in(
+                    &cwd,
+                    &[
+                        "log",
+                        "-v",
+                        "-r",
+                        "HEAD:0",
+                        "-l",
+                        "50",
+                        "--",
+                        &format!("{url}@HEAD"),
+                    ],
+                );
+                AsyncSvnNotification::RepoLog {
+                    url: err_url,
+                    result,
+                }
+            },
+            |e| AsyncSvnNotification::RepoLog {
+                url: String::new(),
+                result: Err(e),
+            },
+        );
+    }
+
     pub fn revision_diff(&self, revision: u64, path: Option<&str>, req: Option<u64>) {
         let cwd = self.cwd.clone();
         let path = path.map(str::to_string);
@@ -758,18 +919,28 @@ impl Svn {
         );
     }
 
-    pub fn resolve(&self, path: &str) {
+    /// Read-only conflict details for a path (`x` on a conflicted entry).
+    ///
+    /// svnui does not resolve conflicts. `svn info` prints the conflict
+    /// type/description and source revisions; the parser turns them into a
+    /// displayable summary the user can act on in their editor/merge tool.
+    pub fn conflict_details(&self, path: &str) {
         let cwd = self.cwd.clone();
         let path = path.to_string();
-        self.spawn_mutating(
+        let err_path = path.clone();
+        self.spawn(
             move || {
-                let result = Self::run_in(
-                    &cwd,
-                    &["resolve", "--accept=working", "-R", "--", &Self::peg(&path)],
-                );
-                AsyncSvnNotification::Resolve(result.map(|_| path.clone()))
+                let result = Self::run_in(&cwd, &["info", "--", &Self::peg(&path)])
+                    .map(|text| parser::parse_conflict_details(&text, &path));
+                AsyncSvnNotification::ConflictDetails {
+                    path: err_path,
+                    result,
+                }
             },
-            |e| AsyncSvnNotification::Resolve(Err(e)),
+            |e| AsyncSvnNotification::ConflictDetails {
+                path: String::new(),
+                result: Err(e),
+            },
         );
     }
 
@@ -1081,6 +1252,39 @@ impl Svn {
         result
     }
 
+    /// Ask the running mutation's svn process to stop.
+    ///
+    /// Uses an external `kill`/`taskkill` instead of unsafe libc code. Only
+    /// the current mutation worker's command is tracked; read-only
+    /// operations keep running. Returns false when nothing is running (for
+    /// example a queued but not-yet-started job).
+    pub fn cancel(&self) -> bool {
+        let pid = ACTIVE_SVN_PID.load(Ordering::SeqCst);
+        if pid == 0 {
+            return false;
+        }
+        CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+        let pid = pid.to_string();
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(&pid)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid, "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        true
+    }
+
     fn run_in(cwd: &Path, args: &[&str]) -> Result<String, String> {
         Self::run_in_raw(cwd, args).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
@@ -1090,7 +1294,10 @@ impl Svn {
     /// multi-byte UTF-8 char in half — decoding the whole output first
     /// would inflate the line with U+FFFD and shift the fixed columns.
     fn run_in_raw(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-        let out = Command::new("svn")
+        let started = Instant::now();
+        let op = args.first().copied().unwrap_or("?");
+        let mut command = Command::new("svn");
+        command
             .arg("--non-interactive")
             // Keep svn's messages English (the parsers match "Changed
             // paths:", "Index:", the status columns, ...) without forcing
@@ -1103,14 +1310,55 @@ impl Svn {
             .env_remove("LC_ALL")
             .env("LC_MESSAGES", "C")
             .args(args)
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("failed to run svn: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
+            .current_dir(cwd);
+        let tracked = TRACK_MUTATION.with(|track| track.get());
+        if tracked && CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return Err("operation cancelled".to_string());
+        }
+        let out = if tracked {
+            match command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => {
+                    ACTIVE_SVN_PID.store(child.id(), Ordering::SeqCst);
+                    let result = child.wait_with_output();
+                    ACTIVE_SVN_PID.store(0, Ordering::SeqCst);
+                    result
+                }
+                Err(e) => Err(e),
+            }
         } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            Err(err.trim().to_string())
+            command.output()
+        };
+        let ms = started.elapsed().as_millis();
+        if tracked && CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            crate::diag::log_line(&format!("svn {op} cancelled {ms}ms cwd={}", cwd.display()));
+            return Err("operation cancelled".to_string());
+        }
+        match out {
+            Ok(out) if out.status.success() => {
+                crate::diag::log_line(&format!("svn {op} ok {ms}ms cwd={}", cwd.display()));
+                Ok(out.stdout)
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let err = err.trim().to_string();
+                crate::diag::log_line(&format!(
+                    "svn {op} err {ms}ms cwd={}: {}",
+                    cwd.display(),
+                    err.lines().next().unwrap_or("")
+                ));
+                Err(err)
+            }
+            Err(e) => {
+                crate::diag::log_line(&format!(
+                    "svn {op} spawn-failed {ms}ms cwd={}: {e}",
+                    cwd.display()
+                ));
+                Err(format!("failed to run svn: {e}"))
+            }
         }
     }
 }
@@ -1194,6 +1442,77 @@ mod tests {
                 // a local file:// repo answers the HEAD query
                 let head = head.expect("head info for file:// repo");
                 assert!(head.revision >= local.revision, "{local:?} {head:?}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_is_a_noop_when_nothing_is_running() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, _rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+        assert!(!c.cancel());
+    }
+
+    #[test]
+    fn repo_browser_reads_list_cat_and_log() {
+        let Some(repo) = TestRepo::new() else { return };
+        let (tx, rx) = unbounded();
+        let c = Svn::new(repo.wc.clone(), tx);
+
+        c.repo_list("^/");
+        match recv(&rx) {
+            AsyncSvnNotification::RepoList { url, result } => {
+                assert_eq!(url, "^/");
+                let entries = result.expect("list");
+                let dirs: Vec<&str> = entries
+                    .iter()
+                    .filter(|(_, is_dir)| *is_dir)
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                assert!(dirs.contains(&"src"), "{entries:?}");
+                assert!(dirs.contains(&"docs"), "{entries:?}");
+                assert!(entries.iter().any(|(n, d)| n == "Cargo.toml" && !*d));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        c.repo_cat("^/Cargo.toml");
+        match recv(&rx) {
+            AsyncSvnNotification::RepoFile { url, result } => {
+                assert_eq!(url, "^/Cargo.toml");
+                assert!(result.expect("cat").contains("version = 1"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        c.repo_log("^/");
+        match recv(&rx) {
+            AsyncSvnNotification::RepoLog { url, result } => {
+                assert_eq!(url, "^/");
+                assert!(result.expect("log").contains("initial commit"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_status_reports_incoming_and_local_changes() {
+        let Some(repo) = TestRepo::new() else { return };
+        // remote-only change (the working copy stays behind)
+        repo.svn(&["mkdir", "^/newdir", "-m", "add remote dir"]);
+        // local-only change
+        test_support::write_file(&repo.wc.join("Cargo.toml"), "version = 3\n");
+        let (tx, rx) = unbounded();
+        Svn::new(repo.wc.clone(), tx).remote_status();
+        match recv(&rx) {
+            AsyncSvnNotification::RemoteStatus(Ok(status)) => {
+                let paths: Vec<&str> = status.incoming().map(|e| e.path.as_str()).collect();
+                assert!(paths.contains(&"newdir"), "{paths:?}");
+                let local: Vec<&str> = status.local().map(|e| e.path.as_str()).collect();
+                assert!(local.contains(&"Cargo.toml"), "{local:?}");
+                assert!(status.head_revision.unwrap_or(0) >= 2, "{status:?}");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1333,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn add_revert_resolve_commit_update_flow() {
+    fn add_revert_commit_update_flow() {
         let Some(repo) = TestRepo::new() else { return };
         let (tx, rx) = unbounded();
         let c = Svn::new(repo.wc.clone(), tx);
@@ -1399,13 +1718,6 @@ mod tests {
             recv(&rx),
             AsyncSvnNotification::UpdateToRevision(Ok(_))
         ));
-
-        // resolve on a non-conflicted file still exits 0
-        c.resolve("Cargo.toml");
-        match recv(&rx) {
-            AsyncSvnNotification::Resolve(Ok(path)) => assert_eq!(path, "Cargo.toml"),
-            other => panic!("unexpected: {other:?}"),
-        }
 
         // cleanup succeeds on a healthy working copy (and prints nothing,
         // hence the empty payload); the wc-root target form and the

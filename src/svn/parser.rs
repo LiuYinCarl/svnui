@@ -1,7 +1,8 @@
 //! Parsers for `svn status` / `svn log` / `svn blame` / `svn diff` output.
 
 use super::models::{
-    BlameLine, DiffLine, DiffLineKind, LogEntry, ParsedDiff, PreparedDiff, StatusEntry, SvnInfo,
+    BlameLine, ConflictDetails, DiffLine, DiffLineKind, LogEntry, ParsedDiff, PreparedDiff,
+    RemoteStatus, RemoteStatusEntry, StatusEntry, SvnInfo,
 };
 
 /// Directory names from `svn list` output.
@@ -16,6 +17,22 @@ pub fn parse_ls_dirs(output: &str) -> Vec<String> {
         .filter_map(|l| l.strip_suffix('/'))
         .filter(|l| !l.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// Entries from `svn list` output: `(name, is_dir)`.
+///
+/// Directories carry a trailing `/`; files do not. CRLF, blank lines and
+/// the `.`/`..` pseudo-entries are tolerated.
+pub fn parse_ls_entries(output: &str) -> Vec<(String, bool)> {
+    output
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.is_empty() && *l != "." && *l != "..")
+        .map(|l| match l.strip_suffix('/') {
+            Some(name) => (name.to_string(), true),
+            None => (l.to_string(), false),
+        })
         .collect()
 }
 
@@ -91,6 +108,58 @@ pub fn parse_info(output: &str) -> SvnInfo {
     }
 }
 
+/// Extract the conflict section from `svn info` output.
+///
+/// svnui only displays conflicts; resolution stays with the user's editor
+/// or `svn resolve`. The app forces `LC_MESSAGES=C`, so these labels are
+/// stable:
+///
+/// ```text
+/// Conflicted Properties: myprop
+/// Conflict Details: incoming file edit upon update
+/// Tree conflict: local file edit, incoming file delete or move upon update
+///   Source  left: (file) ^/a@1
+///   Source right: (none) ^/a@2
+/// ```
+pub fn parse_conflict_details(output: &str, path: &str) -> Option<ConflictDetails> {
+    let mut details = ConflictDetails {
+        path: path.to_string(),
+        ..ConflictDetails::default()
+    };
+    for raw in output.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(v) = line.strip_prefix("Conflicted Properties:") {
+            for name in v.split(',') {
+                let name = name.trim();
+                if !name.is_empty() && !details.properties.iter().any(|p| p == name) {
+                    details.properties.push(name.to_string());
+                }
+            }
+        } else if let Some(v) = line.strip_prefix("Conflict Details:") {
+            let v = v.trim();
+            if !v.is_empty() {
+                details.summary.push(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("Tree conflict:") {
+            let v = v.trim();
+            if !v.is_empty() {
+                details.summary.push(format!("Tree conflict: {v}"));
+            }
+        } else if line.trim_start().starts_with("Source") {
+            // "Source  left:" / "Source right:" (svn aligns the labels)
+            let v = line.trim();
+            if v.starts_with("Source") && v.contains(':') {
+                details.sources.push(v.to_string());
+            }
+        }
+    }
+    if details.is_empty() {
+        None
+    } else {
+        Some(details)
+    }
+}
+
 /// Parse the plain-text output of `svn status`.
 ///
 /// Layout (verified against svn 1.14): seven single-character columns
@@ -145,8 +214,16 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
         cols.copy_from_slice(&bytes[..7]);
         let text = cols[0] as char;
         let props = cols[1] as char;
+        let locked = cols[2] as char;
+        let copied = cols[3] as char;
+        let switched = cols[4] as char;
+        let lock = cols[5] as char;
         let tree_conflict = cols[6] as char;
-        if text == ' ' && props == ' ' && tree_conflict == ' ' {
+        // A line is only blank when *all seven* columns are blank. In
+        // particular switched-only (`    S   dir`) and locked-only
+        // (`     K  file`) entries carry no text/props/tree status but are
+        // still real working-copy state.
+        if cols.iter().all(|c| *c == b' ') {
             continue;
         }
         // svn prints local-style paths on Windows (`dir\file`), while all
@@ -164,12 +241,67 @@ pub fn parse_status(output: &str, root: &std::path::Path) -> Vec<StatusEntry> {
         entries.push(StatusEntry {
             status: text,
             props_status: props,
+            locked,
+            lock,
+            copied,
+            switched,
             tree_conflict,
             path,
             is_dir,
         });
     }
     entries
+}
+
+/// Read one XML attribute from an opening tag slice.
+fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let pat = format!("{name}=\"");
+    let start = tag.find(&pat)? + pat.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Parse the XML opening tag that starts at `needle` (e.g. `<wc-status`).
+fn xml_tag<'a>(chunk: &'a str, needle: &str) -> Option<&'a str> {
+    let (_, rest) = chunk.split_once(needle)?;
+    let end = rest.find('>')?;
+    Some(&rest[..end])
+}
+
+/// Parse `svn status -u --xml`.
+///
+/// The XML form is used instead of the fixed-column text output because a
+/// remote status has extra columns (the `*` marker and the working
+/// revision) and paths may contain spaces. Only entries with a local or a
+/// remote change are returned.
+pub fn parse_remote_status_xml(xml: &str) -> RemoteStatus {
+    let mut out = RemoteStatus::default();
+    for chunk in xml.split("<entry").skip(1) {
+        let chunk = chunk.split("</entry>").next().unwrap_or(chunk);
+        let Some(path) = xml_attr(chunk, "path") else {
+            continue;
+        };
+        let wc = xml_tag(chunk, "<wc-status").unwrap_or("");
+        let repos = xml_tag(chunk, "<repos-status");
+        let local_item = xml_attr(wc, "item").unwrap_or("none").to_string();
+        let local_props = xml_attr(wc, "props").unwrap_or("none").to_string();
+        let remote_item = repos.and_then(|t| xml_attr(t, "item")).map(str::to_string);
+        let remote_props = repos.and_then(|t| xml_attr(t, "props")).map(str::to_string);
+        let has_local = !matches!(local_item.as_str(), "normal" | "none")
+            || !matches!(local_props.as_str(), "none");
+        if !has_local && remote_item.is_none() && remote_props.is_none() {
+            continue;
+        }
+        out.entries.push(RemoteStatusEntry {
+            path: xml_unescape(path),
+            local_item,
+            local_props,
+            remote_item,
+            remote_props,
+        });
+    }
+    out
 }
 
 /// Parse `svn log -v` output.
@@ -674,6 +806,20 @@ mod tests {
         assert_eq!(parse_ls_dirs(out), vec!["trunk", "branches", "feat a"]);
         assert!(parse_ls_dirs("").is_empty());
         assert!(parse_ls_dirs("file.txt\n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_ls_entries() {
+        let out = "trunk/\r\nREADME.md\r\nsub dir/\r\n";
+        let entries = parse_ls_entries(out);
+        assert_eq!(
+            entries,
+            vec![
+                ("trunk".to_string(), true),
+                ("README.md".to_string(), false),
+                ("sub dir".to_string(), true),
+            ]
+        );
     }
 
     #[test]
@@ -1189,6 +1335,73 @@ Index: a.txt
     }
 
     #[test]
+    fn test_parse_status_switched_only_entry_is_kept() {
+        // `    S   dir` has blank text/props/tree columns; the fifth
+        // column is the only status and must not be dropped.
+        let entries = parse_status("    S   trunk/sub\n", no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, "trunk/sub");
+        assert_eq!(entries[0].switched, 'S');
+        assert_eq!(entries[0].status, ' ');
+    }
+
+    #[test]
+    fn test_parse_status_locked_only_entry_is_kept() {
+        // `     K  a` is a locked but otherwise unmodified file.
+        let entries = parse_status("     K  a\n", no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, "a");
+        assert_eq!(entries[0].lock, 'K');
+    }
+
+    #[test]
+    fn test_parse_status_copied_marker_is_kept() {
+        let entries = parse_status("A  +    copied.txt\n", no_root());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].status, 'A');
+        assert_eq!(entries[0].copied, '+');
+    }
+
+    #[test]
+    fn test_parse_remote_status_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target path=".">
+<entry path="a">
+<wc-status props="none" item="normal" revision="1"/>
+<repos-status item="modified" props="none"/>
+</entry>
+<entry path="b">
+<wc-status item="modified" revision="2" props="none"/>
+</entry>
+<entry path="c">
+<wc-status item="none" props="none"/>
+<repos-status props="modified" item="added"/>
+</entry>
+<entry path="untouched">
+<wc-status item="normal" props="none"/>
+</entry>
+</target>
+</status>"#;
+        let status = parse_remote_status_xml(xml);
+        assert_eq!(status.entries.len(), 3, "{status:?}");
+        assert_eq!(status.entries[0].path, "a");
+        assert_eq!(status.entries[0].remote_item.as_deref(), Some("modified"));
+        assert_eq!(status.entries[1].path, "b");
+        assert_eq!(status.entries[1].local_item, "modified");
+        assert_eq!(status.entries[2].remote_props.as_deref(), Some("modified"));
+    }
+
+    #[test]
+    fn test_parse_remote_status_xml_empty_and_escaped() {
+        let empty = parse_remote_status_xml("<status><target path=\".\"></target></status>");
+        assert!(empty.entries.is_empty());
+        let xml = "<entry path=\"a &amp; b\"><wc-status item=\"modified\" props=\"none\"/></entry>";
+        let status = parse_remote_status_xml(xml);
+        assert_eq!(status.entries[0].path, "a & b");
+    }
+
+    #[test]
     fn test_parse_log_entry_without_message() {
         // an empty commit message ("0 lines") yields an empty message, not
         // a swallowed entry
@@ -1379,6 +1592,71 @@ Added: Id
         }
         assert_eq!(d.lines[12].content, "x");
         assert_eq!(d.lines[13].content, "\\ No newline at end of property");
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+
+    #[test]
+    fn parses_text_conflict() {
+        let out = "\
+Path: a
+URL: file:///repo/a
+Conflict Details: incoming file edit upon update
+  Source  left: (file) ^/a@1
+  Source right: (file) ^/a@2
+";
+        let d = parse_conflict_details(out, "a").expect("conflict");
+        assert_eq!(d.path, "a");
+        assert_eq!(d.properties, Vec::<String>::new());
+        assert_eq!(d.summary, vec!["incoming file edit upon update"]);
+        assert_eq!(d.sources.len(), 2);
+        assert!(d.sources[0].contains("^/a@1"), "{:?}", d.sources);
+    }
+
+    #[test]
+    fn parses_property_conflict_names() {
+        let out = "\
+Conflicted Properties: myprop, other
+Conflict Details: incoming file edit upon update
+";
+        let d = parse_conflict_details(out, "f").expect("conflict");
+        assert_eq!(d.properties, vec!["myprop", "other"]);
+    }
+
+    #[test]
+    fn parses_tree_conflict() {
+        let out = "\
+Tree conflict: local file edit, incoming file delete or move upon update
+  Source  left: (file) ^/a@1
+  Source right: (none) ^/a@2
+";
+        let d = parse_conflict_details(out, "a").expect("tree conflict");
+        assert_eq!(
+            d.summary,
+            vec!["Tree conflict: local file edit, incoming file delete or move upon update"]
+        );
+        assert_eq!(d.sources.len(), 2);
+    }
+
+    #[test]
+    fn non_conflict_info_yields_none() {
+        let out = "\
+Path: a
+URL: file:///repo/a
+Revision: 2
+";
+        assert!(parse_conflict_details(out, "a").is_none());
+    }
+
+    #[test]
+    fn source_lines_without_conflict_summary_are_enough() {
+        // Defensive: if svn reports only source lines, still show them.
+        let d =
+            parse_conflict_details("  Source  left: (file) ^/a@1\n", "a").expect("sources alone");
+        assert_eq!(d.sources.len(), 1);
     }
 }
 

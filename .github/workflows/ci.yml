@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: "-D warnings"
@@ -71,8 +71,10 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y subversion
-          else
+          elif [ "$RUNNER_OS" = "macOS" ]; then
             brew install subversion
+          else
+            choco install svn --no-progress -y
           fi
         shell: bash
       - name: cargo test

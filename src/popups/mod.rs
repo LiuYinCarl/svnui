@@ -2,6 +2,7 @@
 //!
 //! The popup stack is a `Vec<Popup>`; the enum avoids downcasting.
 
+pub mod changed_paths;
 pub mod confirm;
 pub mod diff;
 pub mod msg;
@@ -14,6 +15,7 @@ use crossterm::event::Event;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
+pub use changed_paths::ChangedPathsPopup;
 pub use confirm::ConfirmPopup;
 pub use diff::DiffPopup;
 pub use msg::MsgPopup;
@@ -51,6 +53,7 @@ pub enum Popup {
     LogSearch(super::components::log_search::LogSearchPopup),
     StatusFilter(super::components::status_filter::StatusFilterPopup),
     Switch(SwitchPopup),
+    ChangedPaths(ChangedPathsPopup),
 }
 
 impl Popup {
@@ -68,6 +71,7 @@ impl Popup {
             Popup::LogSearch(_) => ui::popup_area(area, 60, 20),
             Popup::StatusFilter(_) => ui::popup_area(area, 60, 20),
             Popup::Switch(_) => ui::popup_area(area, 65, 50),
+            Popup::ChangedPaths(_) => ui::popup_area(area, 70, 60),
         }
     }
 }
@@ -86,6 +90,7 @@ impl DrawableComponent for Popup {
             Popup::LogSearch(p) => p.draw(f, area),
             Popup::StatusFilter(p) => p.draw(f, area),
             Popup::Switch(p) => p.draw(f, area),
+            Popup::ChangedPaths(p) => p.draw(f, area),
         }
     }
 
@@ -102,6 +107,7 @@ impl DrawableComponent for Popup {
             Popup::LogSearch(p) => p.event(ev),
             Popup::StatusFilter(p) => p.event(ev),
             Popup::Switch(p) => p.event(ev),
+            Popup::ChangedPaths(p) => p.event(ev),
         }
     }
 }
@@ -133,6 +139,9 @@ impl Popup {
         Popup::LogSearch(super::components::log_search::LogSearchPopup::new(
             ctx, initial,
         ))
+    }
+    pub fn changed_paths(ctx: &Context, revision: u64, paths: Vec<(char, String)>) -> Self {
+        Popup::ChangedPaths(ChangedPathsPopup::new(ctx, revision, paths))
     }
     pub fn status_filter(ctx: &Context, initial: &str) -> Self {
         Popup::StatusFilter(super::components::status_filter::StatusFilterPopup::new(
@@ -220,8 +229,8 @@ mod tests {
         ));
 
         let h = Popup::help(&c);
-        let t3 = ts::render(60, 20, |f| {
-            h.draw(f, Rect::new(0, 0, 60, 20)).unwrap();
+        let t3 = ts::render(60, 30, |f| {
+            h.draw(f, Rect::new(0, 0, 60, 30)).unwrap();
         });
         assert!(ts::dump(&t3).contains("Quit svnui"));
 

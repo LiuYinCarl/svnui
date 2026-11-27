@@ -15,7 +15,8 @@ use ratatui::widgets::{Block, Borders};
 use std::cell::Cell;
 
 /// Status-bar shortcut hints shown while the log tab is active.
-pub const HINTS: &str = "enter/d diff  spc mark  v info  o update-to  / search  tab pane  F5";
+pub const HINTS: &str =
+    "enter/d diff  spc mark  v info  p paths  o update-to  / search  tab pane  F5";
 
 /// Which log-tab pane has keyboard focus (Tab toggles).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +297,15 @@ impl LogComponent {
             if let Some(e) = self.selection_entry() {
                 let entry = e.clone();
                 self.ctx.queue.push(InternalEvent::ShowCommitInfo(entry));
+            }
+        } else if key_match(k, KeyAction::OpenChangedPaths) {
+            if let Some(e) = self.selection_entry()
+                && !e.changed.is_empty()
+            {
+                self.ctx.queue.push(InternalEvent::OpenChangedPaths(
+                    e.revision,
+                    e.changed.clone(),
+                ));
             }
         } else if key_match(k, KeyAction::OpenRevisionDiff) {
             self.request_diff();
@@ -615,6 +625,32 @@ mod tests {
             .event(&ts::key(crossterm::event::KeyCode::Char('v')))
             .unwrap();
         assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn changed_paths_key_pushes_selected_revision() {
+        let (mut c, q) = comp();
+        c.event(&ts::key(crossterm::event::KeyCode::Char('p')))
+            .unwrap();
+        assert!(matches!(
+            q.pop(),
+            Some(InternalEvent::OpenChangedPaths(3, paths))
+                if paths == vec![('M', "src/main.rs".to_string())]
+        ));
+        // empty changed list: no popup
+        let q2 = crate::queue::Queue::new();
+        let ctx = Context {
+            queue: q2.clone(),
+            theme: Theme::default(),
+        };
+        let mut empty = LogComponent::new(&ctx);
+        let mut e = entry(1, "a", "msg");
+        e.changed.clear();
+        empty.update(vec![e]);
+        empty
+            .event(&ts::key(crossterm::event::KeyCode::Char('p')))
+            .unwrap();
+        assert!(q2.pop().is_none());
     }
 
     #[test]
