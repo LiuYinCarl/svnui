@@ -12,7 +12,7 @@ use models::{
     BlameLine, ConflictDetails, LogEntry, PreparedDiff, RemoteStatus, StatusEntry, SvnInfo,
 };
 use parser::parse_diff_content;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,17 +32,24 @@ pub const MIN_SVN_VERSION: (u32, u32, u32) = (1, 8, 0);
 /// the important property is that huge stage-all lists stay below ARG_MAX.
 const TARGETS_THRESHOLD: usize = 128;
 
-/// PID of the svn process currently running for a mutation (0 = none).
-/// A global is safe here: mutations are serialized on one worker.
-static ACTIVE_SVN_PID: AtomicU32 = AtomicU32::new(0);
-/// Set by `Svn::cancel`; the mutation runner turns the killed child into a
-/// clean "operation cancelled" error instead of a generic svn failure.
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Cancellation state shared by one `Svn` client (and its clones).
+///
+/// Kept per client rather than in globals: tests, benchmarks and future
+/// multi-working-copy sessions can run mutations concurrently, and one
+/// client's Ctrl+x must never kill another client's svn process.
+#[derive(Default)]
+struct CancelState {
+    /// PID of the svn process running for this client's mutation (0 = none).
+    pid: AtomicU32,
+    /// Set by `Svn::cancel`; the mutation runner turns the killed child into
+    /// a clean "operation cancelled" error instead of a generic svn failure.
+    requested: AtomicBool,
+}
 
 thread_local! {
-    /// True while a `spawn_mutating` job runs on this thread; only those
-    /// commands register their PID for cancellation.
-    static TRACK_MUTATION: Cell<bool> = const { Cell::new(false) };
+    /// The client whose mutation is running on this worker thread; only
+    /// those commands register their PID for cancellation.
+    static CANCEL_STATE: RefCell<Option<Arc<CancelState>>> = const { RefCell::new(None) };
 }
 
 /// Result of a finished SVN background operation.
@@ -193,6 +200,8 @@ pub struct Svn {
     /// monotonically increasing across both the read-only worker threads
     /// and the single mutation worker (same counter).
     request_seq: Arc<AtomicU64>,
+    /// Cancellation state for the current mutation (shared by clones).
+    cancel: Arc<CancelState>,
 }
 
 impl Svn {
@@ -217,6 +226,7 @@ impl Svn {
             tx,
             mutation_queue: job_tx,
             request_seq: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(CancelState::default()),
         }
     }
 
@@ -285,12 +295,13 @@ impl Svn {
         E: FnOnce(String) -> AsyncSvnNotification + Send + Clone + 'static,
     {
         let tx = self.tx.clone();
+        let cancel = self.cancel.clone();
         let job: MutationJob = Box::new(move || {
-            TRACK_MUTATION.with(|track| track.set(true));
-            CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+            cancel.requested.store(false, Ordering::SeqCst);
+            CANCEL_STATE.with(|state| *state.borrow_mut() = Some(cancel.clone()));
             Self::execute(f, on_err, &tx);
-            ACTIVE_SVN_PID.store(0, Ordering::SeqCst);
-            TRACK_MUTATION.with(|track| track.set(false));
+            cancel.pid.store(0, Ordering::SeqCst);
+            CANCEL_STATE.with(|state| *state.borrow_mut() = None);
         });
         match self.mutation_queue.send(job) {
             Ok(()) => {}
@@ -1259,11 +1270,11 @@ impl Svn {
     /// operations keep running. Returns false when nothing is running (for
     /// example a queued but not-yet-started job).
     pub fn cancel(&self) -> bool {
-        let pid = ACTIVE_SVN_PID.load(Ordering::SeqCst);
+        let pid = self.cancel.pid.load(Ordering::SeqCst);
         if pid == 0 {
             return false;
         }
-        CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+        self.cancel.requested.store(true, Ordering::SeqCst);
         let pid = pid.to_string();
         #[cfg(unix)]
         {
@@ -1311,20 +1322,25 @@ impl Svn {
             .env("LC_MESSAGES", "C")
             .args(args)
             .current_dir(cwd);
-        let tracked = TRACK_MUTATION.with(|track| track.get());
-        if tracked && CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        let cancel_state = CANCEL_STATE.with(|state| state.borrow().clone());
+        if let Some(state) = &cancel_state
+            && state.requested.load(Ordering::SeqCst)
+        {
             return Err("operation cancelled".to_string());
         }
-        let out = if tracked {
+        let out = if let Some(state) = &cancel_state {
+            if state.requested.load(Ordering::SeqCst) {
+                return Err("operation cancelled".to_string());
+            }
             match command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
             {
                 Ok(child) => {
-                    ACTIVE_SVN_PID.store(child.id(), Ordering::SeqCst);
+                    state.pid.store(child.id(), Ordering::SeqCst);
                     let result = child.wait_with_output();
-                    ACTIVE_SVN_PID.store(0, Ordering::SeqCst);
+                    state.pid.store(0, Ordering::SeqCst);
                     result
                 }
                 Err(e) => Err(e),
@@ -1333,7 +1349,10 @@ impl Svn {
             command.output()
         };
         let ms = started.elapsed().as_millis();
-        if tracked && CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        if cancel_state
+            .as_ref()
+            .is_some_and(|state| state.requested.load(Ordering::SeqCst))
+        {
             crate::diag::log_line(&format!("svn {op} cancelled {ms}ms cwd={}", cwd.display()));
             return Err("operation cancelled".to_string());
         }
